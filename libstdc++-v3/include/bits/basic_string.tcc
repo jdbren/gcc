@@ -210,7 +210,8 @@ _GLIBCXX_BEGIN_NAMESPACE_VERSION
 		_M_data(__another);
 		_M_capacity(__capacity);
 	      }
-	    traits_type::assign(_M_data()[__len++], *__beg);
+	    traits_type::assign(_M_data()[__len++],
+				static_cast<_CharT>(*__beg));
 	    ++__beg;
 	  }
 
@@ -279,11 +280,11 @@ _GLIBCXX_BEGIN_NAMESPACE_VERSION
   // Length of string constructed is easier to propagate inter-procedurally
   // than difference between iterators.
   template<typename _CharT, typename _Traits, typename _Alloc>
-     template<bool _Terminated>
+    template<bool _Terminated>
     _GLIBCXX20_CONSTEXPR 
     void
     basic_string<_CharT, _Traits, _Alloc>::
-    _M_construct(const _CharT *__str, size_type __n)
+    _M_construct(const _CharT* __str, size_type __n)
     {
       if (__n > size_type(_S_local_capacity))
 	{

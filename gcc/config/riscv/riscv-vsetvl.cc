@@ -100,31 +100,28 @@ using namespace riscv_vector;
 static void
 bitmap_union_of_preds_with_entry (sbitmap dst, sbitmap *src, basic_block b)
 {
-  unsigned int set_size = dst->size;
-  edge e;
-  unsigned ix;
-
-  for (ix = 0; ix < EDGE_COUNT (b->preds); ix++)
+  /* Handle case with no predecessors (including ENTRY block).  */
+  if (EDGE_COUNT (b->preds) == 0)
     {
-      e = EDGE_PRED (b, ix);
-      bitmap_copy (dst, src[e->src->index]);
-      break;
+      bitmap_clear (dst);
+      return;
     }
 
-  if (ix == EDGE_COUNT (b->preds))
-    bitmap_clear (dst);
-  else
-    for (ix++; ix < EDGE_COUNT (b->preds); ix++)
-      {
-	unsigned int i;
-	SBITMAP_ELT_TYPE *p, *r;
+  edge e;
+  edge_iterator ei;
+  /* Union remaining predecessors' bitmaps.  */
+  FOR_EACH_EDGE (e, ei, b->preds)
+    {
+      /* Initialize with first predecessor's bitmap.  */
+      if (ei.index == 0)
+	{
+	  bitmap_copy (dst, src[e->src->index]);
+	  continue;
+	}
 
-	e = EDGE_PRED (b, ix);
-	p = src[e->src->index]->elms;
-	r = dst->elms;
-	for (i = 0; i < set_size; i++)
-	  *r++ |= *p++;
-      }
+      /* Perform bitmap OR operation element-wise.  */
+      bitmap_ior (dst, dst, src[e->src->index]);
+    }
 }
 
 /* Compute the reaching definition in and out based on the gen and KILL
@@ -685,7 +682,7 @@ invalid_opt_bb_p (basic_block cfg_bb)
   /* We only do LCM optimizations on blocks that are post dominated by
      EXIT block, that is, we don't do LCM optimizations on infinite loop.  */
   FOR_EACH_EDGE (e, ei, cfg_bb->succs)
-    if (e->flags & EDGE_FAKE)
+    if ((e->flags & EDGE_FAKE) || (e->flags & EDGE_ABNORMAL))
       return true;
 
   return false;
@@ -2698,6 +2695,7 @@ pre_vsetvl::compute_lcm_local_properties ()
   m_avout = sbitmap_vector_alloc (last_basic_block_for_fn (cfun), num_exprs);
 
   bitmap_vector_clear (m_avloc, last_basic_block_for_fn (cfun));
+  bitmap_vector_clear (m_kill, last_basic_block_for_fn (cfun));
   bitmap_vector_clear (m_antloc, last_basic_block_for_fn (cfun));
   bitmap_vector_ones (m_transp, last_basic_block_for_fn (cfun));
 
@@ -2749,6 +2747,10 @@ pre_vsetvl::compute_lcm_local_properties ()
 
       if (invalid_opt_bb_p (bb->cfg_bb ()))
 	{
+	  if (dump_file && (dump_flags & TDF_DETAILS))
+	    fprintf (dump_file, "\n --- skipping bb %u due to weird edge",
+		     bb->index ());
+
 	  bitmap_clear (m_antloc[bb_index]);
 	  bitmap_clear (m_transp[bb_index]);
 	}
@@ -3021,6 +3023,18 @@ pre_vsetvl::earliest_fuse_vsetvl_info (int iter)
 		    }
 		  continue;
 		}
+
+	      /* We cannot lift a vsetvl into the source block if the block is
+		 not transparent WRT to it.
+		 This is too restrictive for blocks where a register's use only
+		 feeds into vsetvls and no regular insns.  One example is the
+		 test rvv/vsetvl/avl_single-68.c which is currently XFAILed for
+		 that reason.
+		 In order to support this case we'd need to check the vsetvl's
+		 AVL operand's uses in the source block and make sure they are
+		 only used in other vsetvls.  */
+	      if (!bitmap_bit_p (m_transp[eg->src->index], expr_index))
+		continue;
 
 	      if (dump_file && (dump_flags & TDF_DETAILS))
 		{
@@ -3402,8 +3416,7 @@ pre_vsetvl::emit_vsetvl ()
 	    }
 	  start_sequence ();
 	  insert_vsetvl_insn (EMIT_DIRECT, footer_info);
-	  rtx_insn *rinsn = get_insns ();
-	  end_sequence ();
+	  rtx_insn *rinsn = end_sequence ();
 	  default_rtl_profile ();
 	  insert_insn_on_edge (rinsn, eg);
 	  need_commit = true;
@@ -3434,8 +3447,7 @@ pre_vsetvl::emit_vsetvl ()
       start_sequence ();
 
       insert_vsetvl_insn (EMIT_DIRECT, info);
-      rtx_insn *rinsn = get_insns ();
-      end_sequence ();
+      rtx_insn *rinsn = end_sequence ();
       default_rtl_profile ();
 
       /* We should not get an abnormal edge here.  */

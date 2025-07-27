@@ -31,8 +31,8 @@ along with GCC; see the file COPYING3.  If not see
 #include "common/common-target.h"
 #include "spellcheck.h"
 #include "opt-suggestions.h"
-#include "diagnostic-color.h"
-#include "diagnostic-format.h"
+#include "diagnostics/color.h"
+#include "diagnostics/sink.h"
 #include "version.h"
 #include "selftest.h"
 #include "file-prefix-map.h"
@@ -347,7 +347,7 @@ static void set_debug_level (uint32_t dinfo, int extended,
 			     location_t loc);
 static void set_fast_math_flags (struct gcc_options *opts, int set);
 static void decode_d_option (const char *arg, struct gcc_options *opts,
-			     location_t loc, diagnostic_context *dc);
+			     location_t loc, diagnostics::context *dc);
 static void set_unsafe_math_optimizations_flags (struct gcc_options *opts,
 						 int set);
 static void enable_warning_as_error (const char *arg, int value,
@@ -356,7 +356,7 @@ static void enable_warning_as_error (const char *arg, int value,
 				     struct gcc_options *opts,
 				     struct gcc_options *opts_set,
 				     location_t loc,
-				     diagnostic_context *dc);
+				     diagnostics::context *dc);
 
 /* Handle a back-end option; arguments and return value as for
    handle_option.  */
@@ -368,10 +368,11 @@ target_handle_option (struct gcc_options *opts,
 		      unsigned int lang_mask ATTRIBUTE_UNUSED, int kind,
 		      location_t loc,
 		      const struct cl_option_handlers *handlers ATTRIBUTE_UNUSED,
-		      diagnostic_context *dc, void (*) (void))
+		      diagnostics::context *dc, void (*) (void))
 {
   gcc_assert (dc == global_dc);
-  gcc_assert (kind == DK_UNSPECIFIED);
+  gcc_assert (static_cast<diagnostics::kind> (kind)
+	      == diagnostics::kind::unspecified);
   return targetm_common.handle_option (opts, opts_set, decoded, loc);
 }
 
@@ -469,7 +470,7 @@ maybe_default_option (struct gcc_options *opts,
 		      unsigned int lang_mask,
 		      const struct cl_option_handlers *handlers,
 		      location_t loc,
-		      diagnostic_context *dc)
+		      diagnostics::context *dc)
 {
   const struct cl_option *option = &cl_options[default_opt->opt_index];
   bool enabled;
@@ -535,14 +536,18 @@ maybe_default_option (struct gcc_options *opts,
   if (enabled)
     handle_generated_option (opts, opts_set, default_opt->opt_index,
 			     default_opt->arg, default_opt->value,
-			     lang_mask, DK_UNSPECIFIED, loc,
+			     lang_mask,
+			     static_cast<int> (diagnostics::kind::unspecified),
+			     loc,
 			     handlers, true, dc);
   else if (default_opt->arg == NULL
 	   && !option->cl_reject_negative
 	   && !(option->flags & CL_PARAMS))
     handle_generated_option (opts, opts_set, default_opt->opt_index,
 			     default_opt->arg, !default_opt->value,
-			     lang_mask, DK_UNSPECIFIED, loc,
+			     lang_mask,
+			     static_cast<int> (diagnostics::kind::unspecified),
+			     loc,
 			     handlers, true, dc);
 }
 
@@ -559,7 +564,7 @@ maybe_default_options (struct gcc_options *opts,
 		       unsigned int lang_mask,
 		       const struct cl_option_handlers *handlers,
 		       location_t loc,
-		       diagnostic_context *dc)
+		       diagnostics::context *dc)
 {
   size_t i;
 
@@ -727,7 +732,7 @@ default_options_optimization (struct gcc_options *opts,
 			      location_t loc,
 			      unsigned int lang_mask,
 			      const struct cl_option_handlers *handlers,
-			      diagnostic_context *dc)
+			      diagnostics::context *dc)
 {
   unsigned int i;
   int opt2;
@@ -1037,6 +1042,25 @@ report_conflicting_sanitizer_options (struct gcc_options *opts, location_t loc,
     }
 }
 
+/* Validate from OPTS and OPTS_SET that when -fipa-reorder-for-locality is
+   enabled no explicit -flto-partition is also passed as the locality cloning
+   pass uses its own partitioning scheme.  */
+
+static void
+validate_ipa_reorder_locality_lto_partition (struct gcc_options *opts,
+					     struct gcc_options *opts_set)
+{
+  static bool validated_p = false;
+
+  if (opts_set->x_flag_lto_partition)
+    {
+      if (opts->x_flag_ipa_reorder_for_locality && !validated_p)
+	error ("%<-fipa-reorder-for-locality%> is incompatible with"
+	       " an explicit %qs option", "-flto-partition");
+    }
+  validated_p = true;
+}
+
 /* After all options at LOC have been read into OPTS and OPTS_SET,
    finalize settings of those options and diagnose incompatible
    combinations.  */
@@ -1249,6 +1273,8 @@ finish_options (struct gcc_options *opts, struct gcc_options *opts_set,
   if (opts->x_flag_reorder_blocks_and_partition)
     SET_OPTION_IF_UNSET (opts, opts_set, flag_reorder_functions, 1);
 
+  validate_ipa_reorder_locality_lto_partition (opts, opts_set);
+
   /* The -gsplit-dwarf option requires -ggnu-pubnames.  */
   if (opts->x_dwarf_split_debug_info)
     opts->x_debug_generate_pub_sections = 2;
@@ -1363,16 +1389,8 @@ finish_options (struct gcc_options *opts, struct gcc_options *opts_set,
          || opts->x_flag_peel_loops
          || opts->x_optimize >= 3);
 
-  /* With -fcx-limited-range, we do cheap and quick complex arithmetic.  */
-  if (opts->x_flag_cx_limited_range)
-    opts->x_flag_complex_method = 0;
-  else if (opts_set->x_flag_cx_limited_range)
-    opts->x_flag_complex_method = opts->x_flag_default_complex_method;
-
-  /* With -fcx-fortran-rules, we do something in-between cheap and C99.  */
-  if (opts->x_flag_cx_fortran_rules)
-    opts->x_flag_complex_method = 1;
-  else if (opts_set->x_flag_cx_fortran_rules)
+  /* Use a frontend provided default for the complex eval method.  */
+  if (!opts_set->x_flag_complex_method)
     opts->x_flag_complex_method = opts->x_flag_default_complex_method;
 
   /* Use -fvect-cost-model=cheap instead of -fvect-cost-mode=very-cheap
@@ -1398,11 +1416,14 @@ finish_options (struct gcc_options *opts, struct gcc_options *opts_set,
 	opts->x_debug_info_level = DINFO_LEVEL_NONE;
     }
 
+  /* Also enable markers with -fauto-profile even when debug info is disabled,
+     so we assign same discriminators and can read back the profile info.  */
   if (!opts_set->x_debug_nonbind_markers_p)
     opts->x_debug_nonbind_markers_p
       = (opts->x_optimize
-	 && opts->x_debug_info_level >= DINFO_LEVEL_NORMAL
-	 && (dwarf_debuginfo_p (opts) || codeview_debuginfo_p ())
+	 && ((opts->x_debug_info_level >= DINFO_LEVEL_NORMAL
+	      && (dwarf_debuginfo_p (opts) || codeview_debuginfo_p ()))
+	     || opts->x_flag_auto_profile)
 	 && !(opts->x_flag_selective_scheduling
 	      || opts->x_flag_selective_scheduling2));
 
@@ -2067,10 +2088,13 @@ print_specific_help (unsigned int include_flags,
 static void
 enable_fdo_optimizations (struct gcc_options *opts,
 			  struct gcc_options *opts_set,
-			  int value)
+			  int value, bool autofdo)
 {
-  SET_OPTION_IF_UNSET (opts, opts_set, flag_branch_probabilities, value);
-  SET_OPTION_IF_UNSET (opts, opts_set, flag_profile_values, value);
+  if (!autofdo)
+    {
+      SET_OPTION_IF_UNSET (opts, opts_set, flag_branch_probabilities, value);
+      SET_OPTION_IF_UNSET (opts, opts_set, flag_profile_values, value);
+    }
   SET_OPTION_IF_UNSET (opts, opts_set, flag_unroll_loops, value);
   SET_OPTION_IF_UNSET (opts, opts_set, flag_peel_loops, value);
   SET_OPTION_IF_UNSET (opts, opts_set, flag_tracer, value);
@@ -2684,7 +2708,7 @@ common_handle_option (struct gcc_options *opts,
 		      unsigned int lang_mask, int kind ATTRIBUTE_UNUSED,
 		      location_t loc,
 		      const struct cl_option_handlers *handlers,
-		      diagnostic_context *dc,
+		      diagnostics::context *dc,
 		      void (*target_option_override_hook) (void))
 {
   size_t scode = decoded->opt_index;
@@ -2859,7 +2883,7 @@ common_handle_option (struct gcc_options *opts,
       break;
 
     case OPT_Wfatal_errors:
-      dc->m_fatal_errors = value;
+      dc->set_fatal_errors (value);
       break;
 
     case OPT_Wstack_usage_:
@@ -2938,19 +2962,19 @@ common_handle_option (struct gcc_options *opts,
       break;
 
     case OPT_fdiagnostics_show_caret:
-      dc->m_source_printing.enabled = value;
+      dc->get_source_printing_options ().enabled = value;
       break;
 
     case OPT_fdiagnostics_show_event_links:
-      dc->m_source_printing.show_event_links_p = value;
+      dc->get_source_printing_options ().show_event_links_p = value;
       break;
 
     case OPT_fdiagnostics_show_labels:
-      dc->m_source_printing.show_labels_p = value;
+      dc->get_source_printing_options ().show_labels_p = value;
       break;
 
     case OPT_fdiagnostics_show_line_numbers:
-      dc->m_source_printing.show_line_numbers_p = value;
+      dc->get_source_printing_options ().show_line_numbers_p = value;
       break;
 
     case OPT_fdiagnostics_color_:
@@ -2966,10 +2990,10 @@ common_handle_option (struct gcc_options *opts,
 	  const char *basename = (opts->x_dump_base_name ? opts->x_dump_base_name
 				  : opts->x_main_input_basename);
 	  gcc_assert (dc);
-	  diagnostic_output_format_init (*dc,
-					 opts->x_main_input_filename, basename,
-					 (enum diagnostics_output_format)value,
-					 opts->x_flag_diagnostics_json_formatting);
+	  diagnostics::output_format_init (*dc,
+					   opts->x_main_input_filename, basename,
+					   (enum diagnostics_output_format)value,
+					   opts->x_flag_diagnostics_json_formatting);
 	  break;
 	}
 
@@ -3028,7 +3052,7 @@ common_handle_option (struct gcc_options *opts,
       break;
 
     case OPT_fdiagnostics_minimum_margin_width_:
-      dc->m_source_printing.min_margin_width = value;
+      dc->get_source_printing_options ().min_margin_width = value;
       break;
 
     case OPT_fdump_:
@@ -3066,7 +3090,7 @@ common_handle_option (struct gcc_options *opts,
 
     case OPT_fmessage_length_:
       pp_set_line_maximum_length (dc->get_reference_printer (), value);
-      diagnostic_set_caret_max_width (dc, value);
+      dc->set_caret_max_width (value);
       break;
 
     case OPT_fopt_info:
@@ -3111,7 +3135,7 @@ common_handle_option (struct gcc_options *opts,
       /* No break here - do -fprofile-use processing. */
       /* FALLTHRU */
     case OPT_fprofile_use:
-      enable_fdo_optimizations (opts, opts_set, value);
+      enable_fdo_optimizations (opts, opts_set, value, false);
       SET_OPTION_IF_UNSET (opts, opts_set, flag_profile_reorder_functions,
 			   value);
 	/* Indirect call profiling should do all useful transformations
@@ -3128,7 +3152,7 @@ common_handle_option (struct gcc_options *opts,
       /* No break here - do -fauto-profile processing. */
       /* FALLTHRU */
     case OPT_fauto_profile:
-      enable_fdo_optimizations (opts, opts_set, value);
+      enable_fdo_optimizations (opts, opts_set, value, true);
       SET_OPTION_IF_UNSET (opts, opts_set, flag_profile_correction, value);
       break;
 
@@ -3298,7 +3322,9 @@ common_handle_option (struct gcc_options *opts,
 
     case OPT_pedantic_errors:
       dc->m_pedantic_errors = 1;
-      control_warning_option (OPT_Wpedantic, DK_ERROR, NULL, value,
+      control_warning_option (OPT_Wpedantic,
+			      static_cast<int> (diagnostics::kind::error),
+			      NULL, value,
 			      loc, lang_mask,
 			      handlers, opts, opts_set,
                               dc);
@@ -3444,8 +3470,8 @@ set_fast_math_flags (struct gcc_options *opts, int set)
 	opts->x_flag_signaling_nans = 0;
       if (!opts->frontend_set_flag_rounding_math)
 	opts->x_flag_rounding_math = 0;
-      if (!opts->frontend_set_flag_cx_limited_range)
-	opts->x_flag_cx_limited_range = 1;
+      if (!opts->frontend_set_flag_complex_method)
+	opts->x_flag_complex_method = 0;
     }
 }
 
@@ -3599,7 +3625,7 @@ set_debug_level (uint32_t dinfo, int extended, const char *arg,
    abort ().)  */
 
 static void
-setup_core_dumping (diagnostic_context *dc)
+setup_core_dumping (diagnostics::context *dc)
 {
 #ifdef SIGABRT
   signal (SIGABRT, SIG_DFL);
@@ -3615,7 +3641,7 @@ setup_core_dumping (diagnostic_context *dc)
 		   "setting core file size limit to maximum: %m");
   }
 #endif
-  diagnostic_abort_on_error (dc);
+  dc->set_abort_on_error (true);
 }
 
 /* Parse a -d<ARG> command line switch for OPTS, location LOC,
@@ -3623,7 +3649,7 @@ setup_core_dumping (diagnostic_context *dc)
 
 static void
 decode_d_option (const char *arg, struct gcc_options *opts,
-		 location_t loc, diagnostic_context *dc)
+		 location_t loc, diagnostics::context *dc)
 {
   int c;
 
@@ -3672,7 +3698,7 @@ enable_warning_as_error (const char *arg, int value, unsigned int lang_mask,
 			 const struct cl_option_handlers *handlers,
 			 struct gcc_options *opts,
 			 struct gcc_options *opts_set,
-			 location_t loc, diagnostic_context *dc)
+			 location_t loc, diagnostics::context *dc)
 {
   char *new_option;
   int option_index;
@@ -3698,7 +3724,9 @@ enable_warning_as_error (const char *arg, int value, unsigned int lang_mask,
 	      "controls warnings", arg, new_option);
   else
     {
-      const diagnostic_t kind = value ? DK_ERROR : DK_WARNING;
+      const enum diagnostics::kind kind = (value
+					   ? diagnostics::kind::error
+					   : diagnostics::kind::warning);
       const char *arg = NULL;
 
       if (cl_options[option_index].flags & CL_JOINED)
@@ -3717,15 +3745,16 @@ enable_warning_as_error (const char *arg, int value, unsigned int lang_mask,
 
 char *
 compiler_diagnostic_option_manager::
-make_option_name (diagnostic_option_id option_id,
-		  diagnostic_t orig_diag_kind,
-		  diagnostic_t diag_kind) const
+make_option_name (diagnostics::option_id option_id,
+		  enum diagnostics::kind orig_diag_kind,
+		  enum diagnostics::kind diag_kind) const
 {
   if (option_id.m_idx)
     {
       /* A warning classified as an error.  */
-      if ((orig_diag_kind == DK_WARNING || orig_diag_kind == DK_PEDWARN)
-	  && diag_kind == DK_ERROR)
+      if ((orig_diag_kind == diagnostics::kind::warning
+	   || orig_diag_kind == diagnostics::kind::pedwarn)
+	  && diag_kind == diagnostics::kind::error)
 	return concat (cl_options[OPT_Werror_].opt_text,
 		       /* Skip over "-W".  */
 		       cl_options[option_id.m_idx].opt_text + 2,
@@ -3735,8 +3764,9 @@ make_option_name (diagnostic_option_id option_id,
 	return xstrdup (cl_options[option_id.m_idx].opt_text);
     }
   /* A warning without option classified as an error.  */
-  else if ((orig_diag_kind == DK_WARNING || orig_diag_kind == DK_PEDWARN
-	    || diag_kind == DK_WARNING)
+  else if ((orig_diag_kind == diagnostics::kind::warning
+	    || orig_diag_kind == diagnostics::kind::pedwarn
+	    || diag_kind == diagnostics::kind::warning)
 	   && m_context.warning_as_error_requested_p ())
     return xstrdup (cl_options[OPT_Werror].opt_text);
   else
@@ -3794,7 +3824,7 @@ get_option_url_suffix (int option_index, unsigned lang_mask)
 
 char *
 gcc_diagnostic_option_manager::
-make_option_url (diagnostic_option_id option_id) const
+make_option_url (diagnostics::option_id option_id) const
 {
   if (option_id.m_idx)
     {

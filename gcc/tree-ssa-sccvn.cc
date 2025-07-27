@@ -1615,6 +1615,8 @@ fully_constant_vn_reference_p (vn_reference_t ref)
 	      ++i;
 	      break;
 	    }
+	  if (operands[i].reverse)
+	    return NULL_TREE;
 	  if (known_eq (operands[i].off, -1))
 	    return NULL_TREE;
 	  off += operands[i].off;
@@ -2807,7 +2809,8 @@ vn_reference_lookup_3 (ao_ref *ref, tree vuse, void *data_,
          we find a VN result with exactly the same value as the
 	 possible clobber.  In this case we can ignore the clobber
 	 and return the found value.  */
-      if (is_gimple_reg_type (TREE_TYPE (lhs))
+      if (!gimple_has_volatile_ops (def_stmt)
+	  && is_gimple_reg_type (TREE_TYPE (lhs))
 	  && types_compatible_p (TREE_TYPE (lhs), vr->type)
 	  && (ref->ref || data->orig_ref.ref)
 	  && !data->mask
@@ -3091,7 +3094,8 @@ vn_reference_lookup_3 (ao_ref *ref, tree vuse, void *data_,
   else if (is_gimple_reg_type (vr->type)
 	   && gimple_assign_single_p (def_stmt)
 	   && gimple_assign_rhs_code (def_stmt) == CONSTRUCTOR
-	   && CONSTRUCTOR_NELTS (gimple_assign_rhs1 (def_stmt)) == 0)
+	   && CONSTRUCTOR_NELTS (gimple_assign_rhs1 (def_stmt)) == 0
+	   && !TREE_THIS_VOLATILE (gimple_assign_lhs (def_stmt)))
     {
       tree base2;
       poly_int64 offset2, size2, maxsize2;
@@ -3147,6 +3151,7 @@ vn_reference_lookup_3 (ao_ref *ref, tree vuse, void *data_,
 	   && !reverse_storage_order_for_component_p (vr->operands)
 	   && !contains_storage_order_barrier_p (vr->operands)
 	   && gimple_assign_single_p (def_stmt)
+	   && !TREE_THIS_VOLATILE (gimple_assign_lhs (def_stmt))
 	   && CHAR_BIT == 8
 	   && BITS_PER_UNIT == 8
 	   && BYTES_BIG_ENDIAN == WORDS_BIG_ENDIAN
@@ -3305,6 +3310,7 @@ vn_reference_lookup_3 (ao_ref *ref, tree vuse, void *data_,
 	   && !reverse_storage_order_for_component_p (vr->operands)
 	   && !contains_storage_order_barrier_p (vr->operands)
 	   && gimple_assign_single_p (def_stmt)
+	   && !TREE_THIS_VOLATILE (gimple_assign_lhs (def_stmt))
 	   && TREE_CODE (gimple_assign_rhs1 (def_stmt)) == SSA_NAME)
     {
       tree lhs = gimple_assign_lhs (def_stmt);
@@ -3516,6 +3522,7 @@ vn_reference_lookup_3 (ao_ref *ref, tree vuse, void *data_,
      the copy kills ref.  */
   else if (data->vn_walk_kind == VN_WALKREWRITE
 	   && gimple_assign_single_p (def_stmt)
+	   && !gimple_has_volatile_ops (def_stmt)
 	   && (DECL_P (gimple_assign_rhs1 (def_stmt))
 	       || TREE_CODE (gimple_assign_rhs1 (def_stmt)) == MEM_REF
 	       || handled_component_p (gimple_assign_rhs1 (def_stmt))))
@@ -3998,6 +4005,41 @@ vn_reference_lookup_pieces (tree vuse, alias_set_type set,
   return NULL_TREE;
 }
 
+/* When OPERANDS is an ADDR_EXPR that can be possibly expressed as a
+   POINTER_PLUS_EXPR return true and fill in its operands in OPS.  */
+
+bool
+vn_pp_nary_for_addr (const vec<vn_reference_op_s>& operands, tree ops[2])
+{
+  gcc_assert (operands[0].opcode == ADDR_EXPR
+	      && operands.last ().opcode == SSA_NAME);
+  poly_int64 off = 0;
+  vn_reference_op_t vro;
+  unsigned i;
+  for (i = 1; operands.iterate (i, &vro); ++i)
+    {
+      if (vro->opcode == SSA_NAME)
+	break;
+      else if (known_eq (vro->off, -1))
+	break;
+      off += vro->off;
+    }
+  if (i == operands.length () - 1
+      && maybe_ne (off, 0)
+      /* Make sure we the offset we accumulated in a 64bit int
+	 fits the address computation carried out in target
+	 offset precision.  */
+      && (off.coeffs[0]
+	  == sext_hwi (off.coeffs[0], TYPE_PRECISION (sizetype))))
+    {
+      gcc_assert (operands[i-1].opcode == MEM_REF);
+      ops[0] = operands[i].op0;
+      ops[1] = wide_int_to_tree (sizetype, off);
+      return true;
+    }
+  return false;
+}
+
 /* Lookup OP in the current hash table, and return the resulting value
    number if it exists in the hash table.  Return NULL_TREE if it does
    not exist in the hash table or if the result field of the structure
@@ -4034,28 +4076,9 @@ vn_reference_lookup (tree op, tree vuse, vn_lookup_kind kind,
       && operands[0].opcode == ADDR_EXPR
       && operands.last ().opcode == SSA_NAME)
     {
-      poly_int64 off = 0;
-      vn_reference_op_t vro;
-      unsigned i;
-      for (i = 1; operands.iterate (i, &vro); ++i)
+      tree ops[2];
+      if (vn_pp_nary_for_addr (operands, ops))
 	{
-	  if (vro->opcode == SSA_NAME)
-	    break;
-	  else if (known_eq (vro->off, -1))
-	    break;
-	  off += vro->off;
-	}
-      if (i == operands.length () - 1
-	  /* Make sure we the offset we accumulated in a 64bit int
-	     fits the address computation carried out in target
-	     offset precision.  */
-	  && (off.coeffs[0]
-	      == sext_hwi (off.coeffs[0], TYPE_PRECISION (sizetype))))
-	{
-	  gcc_assert (operands[i-1].opcode == MEM_REF);
-	  tree ops[2];
-	  ops[0] = operands[i].op0;
-	  ops[1] = wide_int_to_tree (sizetype, off);
 	  tree res = vn_nary_op_lookup_pieces (2, POINTER_PLUS_EXPR,
 					       TREE_TYPE (op), ops, NULL);
 	  if (res)
@@ -4178,28 +4201,9 @@ vn_reference_insert (tree op, tree result, tree vuse, tree vdef)
       && operands[0].opcode == ADDR_EXPR
       && operands.last ().opcode == SSA_NAME)
     {
-      poly_int64 off = 0;
-      vn_reference_op_t vro;
-      unsigned i;
-      for (i = 1; operands.iterate (i, &vro); ++i)
+      tree ops[2];
+      if (vn_pp_nary_for_addr (operands, ops))
 	{
-	  if (vro->opcode == SSA_NAME)
-	    break;
-	  else if (known_eq (vro->off, -1))
-	    break;
-	  off += vro->off;
-	}
-      if (i == operands.length () - 1
-	  /* Make sure we the offset we accumulated in a 64bit int
-	     fits the address computation carried out in target
-	     offset precision.  */
-	  && (off.coeffs[0]
-	      == sext_hwi (off.coeffs[0], TYPE_PRECISION (sizetype))))
-	{
-	  gcc_assert (operands[i-1].opcode == MEM_REF);
-	  tree ops[2];
-	  ops[0] = operands[i].op0;
-	  ops[1] = wide_int_to_tree (sizetype, off);
 	  vn_nary_op_insert_pieces (2, POINTER_PLUS_EXPR,
 				    TREE_TYPE (op), ops, result,
 				    VN_INFO (result)->value_id);

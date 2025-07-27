@@ -18,15 +18,13 @@ You should have received a copy of the GNU General Public License
 along with GCC; see the file COPYING3.  If not see
 <http://www.gnu.org/licenses/>.  */
 
-#include "config.h"
-#include "system.h"
-#include "coretypes.h"
-#include "tree.h"
+#include "analyzer/common.h"
+
+#include "diagnostic.h"
 #include "stringpool.h"
-#include "analyzer/analyzer.h"
+
 #include "analyzer/analyzer-language.h"
 #include "analyzer/analyzer-logging.h"
-#include "diagnostic.h"
 
 /* Map from identifier to INTEGER_CST.  */
 static GTY (()) hash_map <tree, tree> *analyzer_stashed_constants;
@@ -116,7 +114,7 @@ on_finish_translation_unit (const translation_unit &tu)
     return;
 
   FILE *logfile = get_or_create_any_logfile ();
-  log_user the_logger (NULL);
+  log_user the_logger (nullptr);
   if (logfile)
     the_logger.set_logger (new logger (logfile, 0, 0,
 				       *global_dc->get_reference_printer ()));

@@ -34,11 +34,17 @@
 # - the compiler proper (eg: cc1plus)
 # - define the names for selecting the language in LANGUAGES.
 
+# Use strict warnings for this front end.
+cobol-warn = $(STRICT_WARN)
+
 GCOBOL_INSTALL_NAME := $(shell echo gcobol|sed '$(program_transform_name)')
+GCOBOLIO_INSTALL_NAME := $(shell echo gcobol-io|sed '$(program_transform_name)')
 GCOBOL_TARGET_INSTALL_NAME := $(target_noncanonical)-$(shell echo gcobol|sed '$(program_transform_name)')
 
 GCOBC_INSTALL_NAME := $(shell echo gcobc|sed '$(program_transform_name)')
 GCOBC_TARGET_INSTALL_NAME := $(target_noncanonical)-$(shell echo gcobc|sed '$(program_transform_name)')
+
+GCOBOL_HTML_FILES = $(addprefix $(build_htmldir)/gcobol/,gcobol.html gcobol-io.html)
 
 cobol: cobol1$(exeext)
 cobol.serial = cobol1$(exeext)
@@ -88,9 +94,7 @@ cobol1_OBJS =    \
 # so that the .h files can be found.
 
 cobol/charmaps.cc cobol/valconv.cc: cobol/%.cc: $(LIB_SOURCE)/%.cc
-	-l='ec\|common-defs\|io\|gcobolio\|gfileio\|charmaps'; \
-	l=$$l'\|valconv\|exceptl'; \
-	sed -e '/^#include/s,"\('$$l'\)\.h","../../libgcobol/\1.h",' $^ > $@
+	sed -e '/^#include/s,"\([^"]*[^g"].h\)","../../libgcobol/\1",' $^ > $@
 
 LIB_SOURCE_H=$(wildcard $(LIB_SOURCE)/*.h)
 
@@ -156,10 +160,9 @@ cobol/cdf.cc: cobol/cdf.y
 FLEX_WARNING = warning, dangerous trailing context
 
 cobol/scan.cc: cobol/scan.l
-	$(FLEX) -o$@ $(LFLAGS) $< >$@~ 2>&1
+	$(FLEX) -o$@ $(LFLAGS) $< 2>$@~ || { cat $@~ >&1; exit 1; }
 	awk  '! /$(FLEX_WARNING)/ {print > "/dev/stderr"; nerr++}	\
-	     END {print "$(FLEX):", NR, "messages" > "/dev/stderr";	\
-		  exit nerr}' $@~
+	     END {print "$(FLEX):", NR, "messages" > "/dev/stderr"}' $@~
 	@rm $@~
 
 
@@ -284,7 +287,7 @@ cobol.install-common: installdirs
 	    rm -f $(DESTDIR)$(bindir)/$(GCOBOL_TARGET_INSTALL_NAME)$(exeext); \
 	    rm -f $(DESTDIR)$(bindir)/$(GCOBC_TARGET_INSTALL_NAME)$(exeext); \
 	    ( cd $(DESTDIR)$(bindir) && \
-	      $(LN) $(GCOBOL_INSTALL_NAME)$(exeext) $(GCOBOL_TARGET_INSTALL_NAME)$(exeext) ); \
+	      $(LN) $(GCOBOL_INSTALL_NAME)$(exeext) $(GCOBOL_TARGET_INSTALL_NAME)$(exeext) && \
 	      $(LN) $(GCOBC_INSTALL_NAME)$(exeext) $(GCOBC_TARGET_INSTALL_NAME)$(exeext) ); \
 	  fi; \
 	fi
@@ -293,7 +296,7 @@ cobol.install-common: installdirs
 
 cobol.install-man: installdirs
 	$(INSTALL_DATA) $(srcdir)/cobol/gcobol.1 $(DESTDIR)$(man1dir)/$(GCOBOL_INSTALL_NAME)$(man1ext)
-	$(INSTALL_DATA) $(srcdir)/cobol/gcobol.3 $(DESTDIR)$(man3dir)/
+	$(INSTALL_DATA) $(srcdir)/cobol/gcobol.3 $(DESTDIR)$(man3dir)/$(GCOBOLIO_INSTALL_NAME)$(man3ext)
 
 cobol.install-info:
 
@@ -303,8 +306,8 @@ cobol.install-pdf: installdirs gcobol.pdf gcobol-io.pdf
 
 cobol.install-plugin:
 
-cobol.install-html: installdirs gcobol.html gcobol-io.html
-	$(INSTALL_DATA) gcobol.html gcobol-io.html $(DESTDIR)$(htmldir)/
+cobol.install-html: installdirs $(GCOBOL_HTML_FILES)
+	$(INSTALL_DATA) $(GCOBOL_HTML_FILES) $(DESTDIR)$(htmldir)/
 
 cobol.info:
 cobol.srcinfo:
@@ -323,14 +326,16 @@ gcobol-io.pdf: $(srcdir)/cobol/gcobol.3
 	groff -mdoc -T pdf  $^ > $@~
 	@mv $@~ $@
 
-cobol.html: gcobol.html gcobol-io.html
-cobol.srchtml: gcobol.html gcobol-io.html
+cobol.html: $(GCOBOL_HTML_FILES)
+cobol.srchtml: $(GCOBOL_HTML_FILES)
 	ln $^ $(srcdir)/cobol/
 
-gcobol.html: $(srcdir)/cobol/gcobol.1
+$(build_htmldir)/gcobol/gcobol.html: $(srcdir)/cobol/gcobol.1
+	$(mkinstalldirs) $(build_htmldir)/gcobol
 	mandoc -T html $^ > $@~
 	@mv $@~ $@
-gcobol-io.html: $(srcdir)/cobol/gcobol.3
+$(build_htmldir)/gcobol/gcobol-io.html: $(srcdir)/cobol/gcobol.3
+	$(mkinstalldirs) $(build_htmldir)/gcobol
 	mandoc -T html $^ > $@~
 	@mv $@~ $@
 
@@ -340,17 +345,23 @@ cobol.uninstall:
 	rm -rf 	$(DESTDIR)$(bindir)/$(GCOBOL_INSTALL_NAME)$(exeext)	\
 		$(DESTDIR)$(bindir)/$(GCOBC_INSTALL_NAME)		\
 		$(DESTDIR)$(datadir)/gcobol/				\
-		$(DESTDIR)$(man1dir)/$(GCOBOL_INSTALL_NAME).1		\
-		$(DESTDIR)$(man3dir)/gcobol.3
+		$(DESTDIR)$(man1dir)/$(GCOBOL_INSTALL_NAME)$(man1ext)	\
+		$(DESTDIR)$(man3dir)/$(GCOBOLIO_INSTALL_NAME)$(man3ext)
 
 cobol.man:
 cobol.srcman:
 
 cobol.mostlyclean:
 
-cobol.clean:
+gcobol.clean:
+# This is intended for non-general use.  It is a last-ditch effort to flush
+# out all oject files and executable code for gcobol and libgcobol, causing 
+# a complete rebuild of all executable code.
 	rm -fr gcobol cobol1 cobol/*		\
 	../*/libgcobol/*
+
+cobol.clean:
+	rm -fr gcobol cobol1 cobol/*
 
 cobol.distclean:
 
@@ -373,3 +384,4 @@ cobol.stagefeedback: stagefeedback-start
 selftest-cobol:
 
 lang_checks += check-cobol
+

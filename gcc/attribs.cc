@@ -1076,21 +1076,15 @@ apply_tm_attr (tree fndecl, tree attr)
    it to CHAIN.  */
 
 tree
-make_attribute (const char *name, const char *arg_name, tree chain)
+make_attribute (string_slice name, string_slice arg_name, tree chain)
 {
-  tree attr_name;
-  tree attr_arg_name;
-  tree attr_args;
-  tree attr;
-
-  attr_name = get_identifier (name);
-  attr_arg_name = build_string (strlen (arg_name), arg_name);
-  attr_args = tree_cons (NULL_TREE, attr_arg_name, NULL_TREE);
-  attr = tree_cons (attr_name, attr_args, chain);
+  tree attr_name = get_identifier_with_length (name.begin (), name.size ());
+  tree attr_arg_name = build_string (arg_name.size (), arg_name.begin ());
+  tree attr_args = tree_cons (NULL_TREE, attr_arg_name, NULL_TREE);
+  tree attr = tree_cons (attr_name, attr_args, chain);
   return attr;
 }
 
-
 /* Common functions used for target clone support.  */
 
 /* Comparator function to be used in qsort routine to sort attribute
@@ -1279,18 +1273,31 @@ make_dispatcher_decl (const tree decl)
   return func_decl;
 }
 
-/* Returns true if DECL is multi-versioned using the target attribute, and this
-   is the default version.  This function can only be used for targets that do
-   not support the "target_version" attribute.  */
+/* Returns true if DECL a multiversioned default.
+   With the target attribute semantics, returns true if the function is marked
+   as default with the target version.
+   With the target_version attribute semantics, returns true if the function
+   is either not annotated, or annotated as default.  */
 
 bool
 is_function_default_version (const tree decl)
 {
-  if (TREE_CODE (decl) != FUNCTION_DECL
-      || !DECL_FUNCTION_VERSIONED (decl))
+  tree attr;
+  if (TREE_CODE (decl) != FUNCTION_DECL)
     return false;
-  tree attr = lookup_attribute ("target", DECL_ATTRIBUTES (decl));
-  gcc_assert (attr);
+  if (TARGET_HAS_FMV_TARGET_ATTRIBUTE)
+    {
+      if (!DECL_FUNCTION_VERSIONED (decl))
+	return false;
+      attr = lookup_attribute ("target", DECL_ATTRIBUTES (decl));
+      gcc_assert (attr);
+    }
+  else
+    {
+      attr = lookup_attribute ("target_version", DECL_ATTRIBUTES (decl));
+      if (!attr)
+	return true;
+    }
   attr = TREE_VALUE (TREE_VALUE (attr));
   return (TREE_CODE (attr) == STRING_CST
 	  && strcmp (TREE_STRING_POINTER (attr), "default") == 0);

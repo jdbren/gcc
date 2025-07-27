@@ -395,10 +395,14 @@ negate_mathfn_p (combined_fn fn)
     CASE_CFN_ASIN_FN:
     CASE_CFN_ASINH:
     CASE_CFN_ASINH_FN:
+    CASE_CFN_ASINPI:
+    CASE_CFN_ASINPI_FN:
     CASE_CFN_ATAN:
     CASE_CFN_ATAN_FN:
     CASE_CFN_ATANH:
     CASE_CFN_ATANH_FN:
+    CASE_CFN_ATANPI:
+    CASE_CFN_ATANPI_FN:
     CASE_CFN_CASIN:
     CASE_CFN_CASIN_FN:
     CASE_CFN_CASINH:
@@ -432,10 +436,14 @@ negate_mathfn_p (combined_fn fn)
     CASE_CFN_SIN_FN:
     CASE_CFN_SINH:
     CASE_CFN_SINH_FN:
+    CASE_CFN_SINPI:
+    CASE_CFN_SINPI_FN:
     CASE_CFN_TAN:
     CASE_CFN_TAN_FN:
     CASE_CFN_TANH:
     CASE_CFN_TANH_FN:
+    CASE_CFN_TANPI:
+    CASE_CFN_TANPI_FN:
     CASE_CFN_TRUNC:
     CASE_CFN_TRUNC_FN:
       return true;
@@ -1281,6 +1289,13 @@ poly_int_binop (poly_wide_int &res, enum tree_code code,
       if (TREE_CODE (arg2) == INTEGER_CST)
 	res = wi::to_poly_wide (arg1) << wi::to_wide (arg2);
       else
+	return false;
+      break;
+
+    case BIT_AND_EXPR:
+      if (TREE_CODE (arg2) != INTEGER_CST
+	  || !can_and_p (wi::to_poly_wide (arg1), wi::to_wide (arg2),
+			 &res))
 	return false;
       break;
 
@@ -5078,6 +5093,11 @@ simple_operand_p (const_tree exp)
 		 #pragma weak, etc).  */
 	      && ! TREE_PUBLIC (exp)
 	      && ! DECL_EXTERNAL (exp)
+	      /* DECL_VALUE_EXPR will expand to something non-simple.  */
+	      && ! ((VAR_P (exp)
+		     || TREE_CODE (exp) == PARM_DECL
+		     || TREE_CODE (exp) == RESULT_DECL)
+		    && DECL_HAS_VALUE_EXPR_P (exp))
 	      /* Weakrefs are not safe to be read, since they can be NULL.
  		 They are !TREE_PUBLIC && !DECL_EXTERNAL but still
 		 have DECL_WEAK flag set.  */
@@ -7239,6 +7259,12 @@ tree_swap_operands_p (const_tree arg0, const_tree arg1)
   if (TREE_CONSTANT (arg0))
     return true;
 
+  /* Put addresses in arg1. */
+  if (TREE_CODE (arg1) == ADDR_EXPR)
+    return false;
+  if (TREE_CODE (arg0) == ADDR_EXPR)
+    return true;
+
   /* It is preferable to swap two SSA_NAME to ensure a canonical form
      for commutative and comparison operators.  Ensuring a canonical
      form allows the optimizers to find additional redundancies without
@@ -7465,15 +7491,16 @@ fold_plusminus_mult_expr (location_t loc, enum tree_code code, tree type,
   return NULL_TREE;
 }
 
-/* Subroutine of native_encode_expr.  Encode the INTEGER_CST
-   specified by EXPR into the buffer PTR of length LEN bytes.
+
+/* Subroutine of native_encode_int.  Encode the integer VAL with type TYPE
+   into the buffer PTR of length LEN bytes.
    Return the number of bytes placed in the buffer, or zero
    upon failure.  */
 
-static int
-native_encode_int (const_tree expr, unsigned char *ptr, int len, int off)
+int
+native_encode_wide_int (tree type, const wide_int_ref &val,
+			unsigned char *ptr, int len, int off)
 {
-  tree type = TREE_TYPE (expr);
   int total_bytes;
   if (TREE_CODE (type) == BITINT_TYPE)
     {
@@ -7516,7 +7543,7 @@ native_encode_int (const_tree expr, unsigned char *ptr, int len, int off)
       int bitpos = byte * BITS_PER_UNIT;
       /* Extend EXPR according to TYPE_SIGN if the precision isn't a whole
 	 number of bytes.  */
-      value = wi::extract_uhwi (wi::to_widest (expr), bitpos, BITS_PER_UNIT);
+      value = wi::extract_uhwi (val, bitpos, BITS_PER_UNIT);
 
       if (total_bytes > UNITS_PER_WORD)
 	{
@@ -7535,6 +7562,18 @@ native_encode_int (const_tree expr, unsigned char *ptr, int len, int off)
 	ptr[offset - off] = value;
     }
   return MIN (len, total_bytes - off);
+}
+
+/* Subroutine of native_encode_expr.  Encode the INTEGER_CST
+   specified by EXPR into the buffer PTR of length LEN bytes.
+   Return the number of bytes placed in the buffer, or zero
+   upon failure.  */
+
+static int
+native_encode_int (const_tree expr, unsigned char *ptr, int len, int off)
+{
+  return native_encode_wide_int (TREE_TYPE (expr), wi::to_widest (expr),
+				 ptr, len, off);
 }
 
 
@@ -9891,22 +9930,29 @@ pointer_may_wrap_p (tree base, tree offset, poly_int64 bitpos)
 static int
 maybe_nonzero_address (tree decl)
 {
+  if (!DECL_P (decl))
+    return -1;
+
   /* Normally, don't do anything for variables and functions before symtab is
      built; it is quite possible that DECL will be declared weak later.
      But if folding_initializer, we need a constant answer now, so create
      the symtab entry and prevent later weak declaration.  */
-  if (DECL_P (decl) && decl_in_symtab_p (decl))
-    if (struct symtab_node *symbol
-	= (folding_initializer
-	   ? symtab_node::get_create (decl)
-	   : symtab_node::get (decl)))
-      return symbol->nonzero_address ();
+  if (decl_in_symtab_p (decl))
+    {
+      if (struct symtab_node *symbol
+	  = (folding_initializer
+	     ? symtab_node::get_create (decl)
+	     : symtab_node::get (decl)))
+	return symbol->nonzero_address ();
+    }
+  else if (folding_cxx_constexpr)
+    /* Anything that doesn't go in the symtab has non-zero address.  */
+    return 1;
 
   /* Function local objects are never NULL.  */
-  if (DECL_P (decl)
-      && (DECL_CONTEXT (decl)
+  if (DECL_CONTEXT (decl)
       && TREE_CODE (DECL_CONTEXT (decl)) == FUNCTION_DECL
-      && auto_var_in_fn_p (decl, DECL_CONTEXT (decl))))
+      && auto_var_in_fn_p (decl, DECL_CONTEXT (decl)))
     return 1;
 
   return -1;
@@ -14924,6 +14970,8 @@ tree_call_nonnegative_warnv_p (tree type, combined_fn fn, tree arg0, tree arg1,
     CASE_CFN_ACOS_FN:
     CASE_CFN_ACOSH:
     CASE_CFN_ACOSH_FN:
+    CASE_CFN_ACOSPI:
+    CASE_CFN_ACOSPI_FN:
     CASE_CFN_CABS:
     CASE_CFN_CABS_FN:
     CASE_CFN_COSH:
@@ -14968,10 +15016,14 @@ tree_call_nonnegative_warnv_p (tree type, combined_fn fn, tree arg0, tree arg1,
 
     CASE_CFN_ASINH:
     CASE_CFN_ASINH_FN:
+    CASE_CFN_ASINPI:
+    CASE_CFN_ASINPI_FN:
     CASE_CFN_ATAN:
     CASE_CFN_ATAN_FN:
     CASE_CFN_ATANH:
     CASE_CFN_ATANH_FN:
+    CASE_CFN_ATANPI:
+    CASE_CFN_ATANPI_FN:
     CASE_CFN_CBRT:
     CASE_CFN_CBRT_FN:
     CASE_CFN_CEIL:
@@ -15172,7 +15224,7 @@ bool
 tree_expr_nonnegative_warnv_p (tree t, bool *strict_overflow_p, int depth)
 {
   enum tree_code code;
-  if (t == error_mark_node)
+  if (error_operand_p (t))
     return false;
 
   code = TREE_CODE (t);

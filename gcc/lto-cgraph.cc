@@ -229,6 +229,8 @@ lto_set_symtab_encoder_in_partition (lto_symtab_encoder_t encoder,
 				     symtab_node *node)
 {
   int index = lto_symtab_encoder_encode (encoder, node);
+  if (dump_file)
+    fprintf(dump_file, "Node %s, index %d\n", node->asm_name(), index);
   encoder->nodes[index].in_partition = true;
 }
 
@@ -716,11 +718,12 @@ output_profile_summary (struct lto_simple_output_block *ob)
 {
   if (profile_info)
     {
-      /* We do not output num and run_max, they are not used by
-         GCC profile feedback and they are difficult to merge from multiple
-         units.  */
       unsigned runs = (profile_info->runs);
       streamer_write_uhwi_stream (ob->main_stream, runs);
+      streamer_write_gcov_count_stream (ob->main_stream,
+					profile_info->sum_max);
+      streamer_write_gcov_count_stream (ob->main_stream,
+					profile_info->cutoff);
 
       /* IPA-profile computes hot bb threshold based on cumulated
 	 whole program profile.  We need to stream it down to ltrans.  */
@@ -1301,7 +1304,7 @@ input_node (struct lto_file_decl_data *file_data,
     {
       node = dyn_cast<cgraph_node *> (nodes[clone_ref])->create_clone (fn_decl,
 	profile_count::uninitialized (), false,
-	vNULL, false, NULL, NULL);
+	vNULL, false, NULL, NULL, NULL);
     }
   else
     {
@@ -1676,6 +1679,8 @@ input_profile_summary (class lto_input_block *ib,
   if (runs)
     {
       file_data->profile_info.runs = runs;
+      file_data->profile_info.sum_max = streamer_read_gcov_count (ib);
+      file_data->profile_info.cutoff = streamer_read_gcov_count (ib);
 
       /* IPA-profile computes hot bb threshold based on cumulated
 	 whole program profile.  We need to stream it down to ltrans.  */
@@ -1717,6 +1722,8 @@ merge_profile_summaries (struct lto_file_decl_data **file_data_vec)
 
   profile_info = XCNEW (gcov_summary);
   profile_info->runs = max_runs;
+  profile_info->sum_max = 0;
+  profile_info->cutoff = 0;
 
   /* If merging already happent at WPA time, we are done.  */
   if (flag_ltrans)
@@ -1733,6 +1740,14 @@ merge_profile_summaries (struct lto_file_decl_data **file_data_vec)
 
 	scale = RDIV (node->count_materialization_scale * max_runs,
                       node->lto_file_data->profile_info.runs);
+	gcov_type sum_max = RDIV (node->lto_file_data->profile_info.sum_max * max_runs,
+				  node->lto_file_data->profile_info.runs);
+	gcov_type cutoff = RDIV (node->lto_file_data->profile_info.cutoff * max_runs,
+				 node->lto_file_data->profile_info.runs);
+	if (sum_max > profile_info->sum_max)
+	  profile_info->sum_max = sum_max;
+	if (cutoff > profile_info->cutoff)
+	  profile_info->cutoff = cutoff;
 	node->count_materialization_scale = scale;
 	if (scale < 0)
 	  fatal_error (input_location, "Profile information in %s corrupted",

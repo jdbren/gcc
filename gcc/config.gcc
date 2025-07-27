@@ -273,6 +273,7 @@ esac
 # Obsolete configurations.
 case ${target} in
      ia64*-*-hpux* | ia64*-*-*vms* | ia64*-*-elf*	\
+   | m32c*-*-*						\
  )
     if test "x$enable_obsolete" != xyes; then
       echo "*** Configuration ${target} is obsolete." >&2
@@ -350,7 +351,7 @@ aarch64*-*-*)
 	c_target_objs="aarch64-c.o"
 	cxx_target_objs="aarch64-c.o"
 	d_target_objs="aarch64-d.o"
-	extra_objs="aarch64-builtins.o aarch-common.o aarch64-sve-builtins.o aarch64-sve-builtins-shapes.o aarch64-sve-builtins-base.o aarch64-sve-builtins-sve2.o aarch64-sve-builtins-sme.o cortex-a57-fma-steering.o aarch64-speculation.o aarch-bti-insert.o aarch64-cc-fusion.o aarch64-early-ra.o aarch64-ldp-fusion.o"
+	extra_objs="aarch64-builtins.o aarch-common.o aarch64-elf-metadata.o aarch64-sve-builtins.o aarch64-sve-builtins-shapes.o aarch64-sve-builtins-base.o aarch64-sve-builtins-sve2.o aarch64-sve-builtins-sme.o cortex-a57-fma-steering.o aarch64-speculation.o aarch-bti-insert.o aarch64-cc-fusion.o aarch64-early-ra.o aarch64-ldp-fusion.o"
 	target_gtfiles="\$(srcdir)/config/aarch64/aarch64-protos.h \$(srcdir)/config/aarch64/aarch64-builtins.h \$(srcdir)/config/aarch64/aarch64-builtins.cc \$(srcdir)/config/aarch64/aarch64-sve-builtins.h \$(srcdir)/config/aarch64/aarch64-sve-builtins.cc"
 	target_has_targetm_common=yes
 	;;
@@ -451,14 +452,11 @@ i[34567]86-*-* | x86_64-*-*)
 		       cmpccxaddintrin.h amxfp16intrin.h prfchiintrin.h
 		       raointintrin.h amxcomplexintrin.h avxvnniint16intrin.h
 		       sm3intrin.h sha512intrin.h sm4intrin.h usermsrintrin.h
-		       avx10_2mediaintrin.h avx10_2-512mediaintrin.h
-		       avx10_2convertintrin.h avx10_2-512convertintrin.h
-		       avx10_2bf16intrin.h avx10_2-512bf16intrin.h
-		       avx10_2satcvtintrin.h avx10_2-512satcvtintrin.h
-		       avx10_2minmaxintrin.h avx10_2-512minmaxintrin.h
-		       avx10_2copyintrin.h amxavx512intrin.h amxtf32intrin.h
-		       amxtransposeintrin.h amxfp8intrin.h movrsintrin.h
-		       amxmovrsintrin.h"
+		       avx10_2mediaintrin.h avx10_2convertintrin.h
+		       avx10_2bf16intrin.h avx10_2satcvtintrin.h
+		       avx10_2minmaxintrin.h avx10_2copyintrin.h
+		       amxavx512intrin.h amxtf32intrin.h amxtransposeintrin.h
+		       amxfp8intrin.h movrsintrin.h amxmovrsintrin.h"
 	;;
 ia64-*-*)
 	extra_headers=ia64intrin.h
@@ -550,13 +548,14 @@ pru-*-*)
 riscv*)
 	cpu_type=riscv
 	extra_objs="riscv-builtins.o riscv-c.o riscv-sr.o riscv-shorten-memrefs.o riscv-selftests.o riscv-string.o"
-	extra_objs="${extra_objs} riscv-v.o riscv-vsetvl.o riscv-vector-costs.o riscv-avlprop.o"
+	extra_objs="${extra_objs} riscv-v.o riscv-vsetvl.o riscv-vector-costs.o riscv-avlprop.o riscv-vect-permconst.o"
 	extra_objs="${extra_objs} riscv-vector-builtins.o riscv-vector-builtins-shapes.o riscv-vector-builtins-bases.o sifive-vector-builtins-bases.o"
 	extra_objs="${extra_objs} thead.o riscv-target-attr.o riscv-zicfilp.o"
 	d_target_objs="riscv-d.o"
 	extra_headers="riscv_vector.h riscv_crypto.h riscv_bitmanip.h riscv_th_vector.h sifive_vector.h"
 	target_gtfiles="$target_gtfiles \$(srcdir)/config/riscv/riscv-vector-builtins.cc"
 	target_gtfiles="$target_gtfiles \$(srcdir)/config/riscv/riscv-vector-builtins.h"
+	extra_options="${extra_options} riscv/riscv-ext.opt"
 	;;
 rs6000*-*-*)
 	extra_options="${extra_options} g.opt fused-madd.opt rs6000/rs6000-tables.opt"
@@ -1861,11 +1860,11 @@ moxie-*-moxiebox*)
 	;;
 h8300-*-elf*)
 	tmake_file="h8300/t-h8300"
-	tm_file="h8300/h8300.h elfos.h newlib-stdint.h h8300/elf.h"
+	tm_file="elfos.h h8300/h8300.h newlib-stdint.h h8300/elf.h"
 	;;
 h8300-*-linux*)
 	tmake_file="${tmake_file} h8300/t-h8300 h8300/t-linux"
-	tm_file="h8300/h8300.h elfos.h gnu-user.h linux.h glibc-stdint.h h8300/linux.h"
+	tm_file="elfos.h h8300/h8300.h gnu-user.h linux.h glibc-stdint.h h8300/linux.h"
 	;;
 hppa*64*-*-linux*)
 	target_cpu_default="MASK_PA_11|MASK_PA_20"
@@ -2552,6 +2551,20 @@ riscv*-*-linux*)
 	# automatically detect that GAS supports it, yet we require it.
 	gcc_cv_initfini_array=yes
 	with_tls=${with_tls:-trad}
+	;;
+riscv*-*-gnu*)
+	tm_file="elfos.h gnu-user.h gnu.h glibc-stdint.h ${tm_file} riscv/gnu.h"
+	tmake_file="${tmake_file} riscv/t-riscv"
+	gnu_ld=yes
+	gas=yes
+	case $target in
+	riscv32be-*|riscv64be-*)
+		tm_defines="${tm_defines} TARGET_BIG_ENDIAN_DEFAULT=1"
+		;;
+	esac
+	# Force .init_array support.  The configure script cannot always
+	# automatically detect that GAS supports it, yet we require it.
+	gcc_cv_initfini_array=yes
 	;;
 riscv*-*-elf* | riscv*-*-rtems*)
 	tm_file="elfos.h newlib-stdint.h ${tm_file} riscv/elf.h"
@@ -3504,10 +3517,9 @@ sparc*-*-solaris2*)
 	    sparc64-*-* | sparcv9-*-*)
 		tm_file="sparc/default64.h ${tm_file}"
 		;;
-	    *)
-		test x$with_cpu != x || with_cpu=v9
-		;;
 	esac
+	# Match Studio 12.6 cc.
+	with_cpu=${with_cpu:-ultrasparc3}
 	tmake_file="${tmake_file} sparc/t-sparc sparc/t-sol2"
 	;;
 sparc-wrs-vxworks)
@@ -4457,7 +4469,7 @@ case "${target}" in
 
 		case "$with_abi" in
 		"" \
-		| apcs-gnu | atpcs | aapcs | iwmmxt | aapcs-linux )
+		| apcs-gnu | atpcs | aapcs | aapcs-linux )
 			#OK
 			;;
 		*)
@@ -4611,15 +4623,13 @@ case "${target}" in
 
 		for which in arch tune; do
 			eval "val=\$with_$which"
-			case ${val} in
-			"" | gfx900 | gfx906 | gfx908 | gfx90a | gfx90c | gfx1030 | gfx1036 | gfx1100 | gfx1103)
-				# OK
-				;;
-			*)
+			if test x"$val" != x \
+			   && ! grep -q "GCN_DEVICE($val," \
+					"${srcdir}/config/gcn/gcn-devices.def";
+			then
 				echo "Unknown cpu used in --with-$which=$val." 1>&2
 				exit 1
-				;;
-			esac
+			fi
 		done
 		[ "x$with_arch" = x ] && with_arch=gfx900
 
@@ -5656,6 +5666,7 @@ case "${target}" in
 			#TODO 'sm_[...]' list per 'nvptx-sm.def'.
 			sm_30 | sm_35 | sm_37 \
 			| sm_52 | sm_53 \
+			| sm_61 \
 			| sm_70 | sm_75 \
 			| sm_80 | sm_89 )
 				TM_MULTILIB_CONFIG="$TM_MULTILIB_CONFIG $nvptx_multilib"
@@ -5769,7 +5780,7 @@ case "${target}" in
 		for which in arch tune; do
 			eval "val=\$with_$which"
 			case ${val} in
-			"" | native | z900 | z990 | z9-109 | z9-ec | z10 | z196 | zEC12 | z13 | z14 | z15 | z16 | arch5 | arch6 | arch7 | arch8 | arch9 | arch10 | arch11 | arch12 | arch13 | arch14 | arch15 )
+			"" | native | z900 | z990 | z9-109 | z9-ec | z10 | z196 | zEC12 | z13 | z14 | z15 | z16 | z17 | arch5 | arch6 | arch7 | arch8 | arch9 | arch10 | arch11 | arch12 | arch13 | arch14 | arch15 )
 				# OK
 				;;
 			*)
@@ -5895,7 +5906,7 @@ esac
 # distinguish VxWorks variants such as VxWorks 7 or 64).
 
 case ${target} in
-arm*-*-* | i[34567]86-*-* | mips*-*-* | powerpc*-*-* | sh*-*-* \
+aarch64*-*-* | arm*-*-* | i[34567]86-*-* | mips*-*-* | powerpc*-*-* | sh*-*-* \
 | sparc*-*-* | x86_64-*-*)
 	tm_file="vxworks-dummy.h ${tm_file}"
 	;;

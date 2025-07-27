@@ -22,6 +22,7 @@ along with GCC; see the file COPYING3.  If not see
 
 #include "tree-core.h"
 #include "options.h"
+#include "vec.h"
 
 /* Convert a target-independent built-in function code to a combined_fn.  */
 
@@ -1078,6 +1079,11 @@ extern void omp_clause_range_check_failed (const_tree, const char *, int,
 #define IDENTIFIER_ANON_P(NODE) \
   (IDENTIFIER_NODE_CHECK (NODE)->base.private_flag)
 
+/* Nonzero indicates an IDENTIFIER_NODE that names an internal label.
+   The prefix used to generate the label can be found on the TREE_CHAIN.  */
+#define IDENTIFIER_INTERNAL_P(NODE) \
+  (IDENTIFIER_NODE_CHECK (NODE)->base.volatile_flag)
+
 /* Nonzero in an IDENTIFIER_NODE if the name is a local alias, whose
    uses are to be substituted for uses of the TREE_CHAINed identifier.  */
 #define IDENTIFIER_TRANSPARENT_ALIAS(NODE) \
@@ -1625,6 +1631,13 @@ class auto_suppress_location_wrappers
 #define OMP_METADIRECTIVE_VARIANT_BODY(v) \
   TREE_VALUE (TREE_VALUE (v))
 
+#define OMP_DECLARE_MAPPER_ID(NODE) \
+  TREE_OPERAND (OMP_DECLARE_MAPPER_CHECK (NODE), 0)
+#define OMP_DECLARE_MAPPER_DECL(NODE) \
+  TREE_OPERAND (OMP_DECLARE_MAPPER_CHECK (NODE), 1)
+#define OMP_DECLARE_MAPPER_CLAUSES(NODE) \
+  TREE_OPERAND (OMP_DECLARE_MAPPER_CHECK (NODE), 2)
+
 #define OMP_SCAN_BODY(NODE)	TREE_OPERAND (OMP_SCAN_CHECK (NODE), 0)
 #define OMP_SCAN_CLAUSES(NODE)	TREE_OPERAND (OMP_SCAN_CHECK (NODE), 1)
 
@@ -2118,6 +2131,18 @@ class auto_suppress_location_wrappers
 #define OMP_TARGET_DEVICE_MATCHES_PROPERTIES(NODE)	\
   TREE_OPERAND (OMP_TARGET_DEVICE_MATCHES_CHECK (NODE), 1)
 
+#define OMP_CLAUSE__MAPPER_BINDING__ID(NODE) \
+  OMP_CLAUSE_OPERAND (OMP_CLAUSE_SUBCODE_CHECK (NODE, \
+			OMP_CLAUSE__MAPPER_BINDING_), 0)
+
+#define OMP_CLAUSE__MAPPER_BINDING__DECL(NODE) \
+  OMP_CLAUSE_OPERAND (OMP_CLAUSE_SUBCODE_CHECK (NODE, \
+			OMP_CLAUSE__MAPPER_BINDING_), 1)
+
+#define OMP_CLAUSE__MAPPER_BINDING__MAPPER(NODE) \
+  OMP_CLAUSE_OPERAND (OMP_CLAUSE_SUBCODE_CHECK (NODE, \
+			OMP_CLAUSE__MAPPER_BINDING_), 2)
+
 /* SSA_NAME accessors.  */
 
 /* Whether SSA_NAME NODE is a virtual operand.  This simply caches the
@@ -2207,6 +2232,12 @@ class auto_suppress_location_wrappers
 
 #define OMP_CLAUSE_OPERAND(NODE, I)				\
 	OMP_CLAUSE_ELT_CHECK (NODE, I)
+
+/* True if the clause decl NODE contains an OpenMP iterator.  */
+#define OMP_ITERATOR_DECL_P(NODE) \
+	(TREE_CODE (NODE) == TREE_LIST				\
+	 && TREE_PURPOSE (NODE)					\
+	 && TREE_CODE (TREE_PURPOSE (NODE)) == TREE_VEC)
 
 /* In a BLOCK (scope) node:
    Variables declared in the scope NODE.  */
@@ -4725,6 +4756,8 @@ vector_cst_encoded_nelts (const_tree t)
   return VECTOR_CST_NPATTERNS (t) * VECTOR_CST_NELTS_PER_PATTERN (t);
 }
 
+extern tree generate_internal_label (const char *);
+extern const char *prefix_for_internal_label (tree label);
 extern tree decl_assembler_name (tree);
 extern void overwrite_decl_assembler_name (tree decl, tree name);
 extern tree decl_comdat_group (const_tree);
@@ -5053,6 +5086,17 @@ strip_array_types (tree type)
   return type;
 }
 
+/* Recursively traverse down pointer type layers to pointee type.  */
+
+inline const_tree
+strip_pointer_types (const_tree type)
+{
+  while (POINTER_TYPE_P (type))
+    type = TREE_TYPE (type);
+
+  return type;
+}
+
 /* Desription of the reason why the argument of valid_constant_size_p
    is not a valid size.  */
 enum cst_size_error {
@@ -5310,6 +5354,10 @@ extern tree staticp (tree);
 
 extern tree save_expr (tree);
 
+/* Return true if T is an object with invariant address.  */
+
+extern bool address_invariant_p (tree);
+
 /* Return true if T is function-invariant.  */
 
 extern bool tree_invariant_p (tree);
@@ -5488,7 +5536,7 @@ storage_order_barrier_p (const_tree t)
       && TYPE_REVERSE_STORAGE_ORDER (TREE_TYPE (op)))
     return true;
 
-  return false;
+  return reverse_storage_order_for_component_p (op);
 }
 
 /* Given a DECL or TYPE, return the scope in which it was declared, or
@@ -5870,7 +5918,7 @@ extern bool gimple_canonical_types_compatible_p (const_tree, const_tree,
 						 bool trust_type_canonical = true);
 extern bool type_with_interoperable_signedness (const_tree);
 extern bitmap get_nonnull_args (const_tree);
-extern int get_range_pos_neg (tree);
+extern int get_range_pos_neg (tree, gimple * = NULL);
 
 /* Return true for a valid pair of new and delete operators.  */
 extern bool valid_new_delete_pair_p (tree, tree, bool * = NULL);
@@ -7040,5 +7088,15 @@ extern unsigned fndecl_dealloc_argno (tree);
 extern tree get_attr_nonstring_decl (tree, tree * = NULL);
 
 extern int get_target_clone_attr_len (tree);
+
+/* Returns the version string for a decl with target_version attribute.
+   Returns an invalid string_slice if no attribute is present.  */
+extern string_slice get_target_version (const tree);
+/* Returns a vector of the version strings from a target_clones attribute on
+   a decl.  Can also record the number of default versions found.  */
+extern auto_vec<string_slice> get_clone_versions (const tree, int * = NULL);
+/* Returns a vector of the version strings from a target_clones attribute
+   directly.  */
+extern auto_vec<string_slice> get_clone_attr_versions (const tree, int *);
 
 #endif  /* GCC_TREE_H  */

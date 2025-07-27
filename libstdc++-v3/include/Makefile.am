@@ -38,6 +38,7 @@ std_freestanding = \
 	${std_srcdir}/generator \
 	${std_srcdir}/iterator \
 	${std_srcdir}/limits \
+	${std_srcdir}/mdspan \
 	${std_srcdir}/memory \
 	${std_srcdir}/numbers \
 	${std_srcdir}/numeric \
@@ -76,6 +77,7 @@ std_headers = \
 	${std_srcdir}/forward_list \
 	${std_srcdir}/fstream \
 	${std_srcdir}/future \
+	${std_srcdir}/inplace_vector \
 	${std_srcdir}/iomanip \
 	${std_srcdir}/ios \
 	${std_srcdir}/iosfwd \
@@ -193,8 +195,10 @@ bits_headers = \
 	${bits_srcdir}/chrono_io.h \
 	${bits_srcdir}/codecvt.h \
 	${bits_srcdir}/cow_string.h \
+	${bits_srcdir}/cpyfunc_impl.h \
 	${bits_srcdir}/deque.tcc \
 	${bits_srcdir}/erase_if.h \
+	${bits_srcdir}/formatfwd.h \
 	${bits_srcdir}/forward_list.h \
 	${bits_srcdir}/forward_list.tcc \
 	${bits_srcdir}/fs_dir.h \
@@ -202,10 +206,13 @@ bits_headers = \
 	${bits_srcdir}/fs_ops.h \
 	${bits_srcdir}/fs_path.h \
 	${bits_srcdir}/fstream.tcc \
+	${bits_srcdir}/funcref_impl.h \
+	${bits_srcdir}/funcwrap.h \
 	${bits_srcdir}/gslice.h \
 	${bits_srcdir}/gslice_array.h \
 	${bits_srcdir}/hashtable.h \
 	${bits_srcdir}/hashtable_policy.h \
+	${bits_srcdir}/indirect.h \
 	${bits_srcdir}/indirect_array.h \
 	${bits_srcdir}/ios_base.h \
 	${bits_srcdir}/istream.tcc \
@@ -221,7 +228,6 @@ bits_headers = \
 	${bits_srcdir}/mask_array.h \
 	${bits_srcdir}/memory_resource.h \
 	${bits_srcdir}/mofunc_impl.h \
-	${bits_srcdir}/move_only_function.h \
 	${bits_srcdir}/new_allocator.h \
 	${bits_srcdir}/node_handle.h \
 	${bits_srcdir}/ostream.tcc \

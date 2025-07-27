@@ -1,3 +1,99 @@
+2025-07-22  Patrick Palka  <ppalka@redhat.com>
+
+	* MAINTAINERS: Add myself as C++ front end reviewer.
+
+2025-07-07  Tamar Christina  <tamar.christina@arm.com>
+
+	* MAINTAINERS: Add myself to AArch64 pot.
+
+2025-07-04  Andrew Pinski  <quic_apinski@quicinc.com>
+
+	* MAINTAINERS: Replace tabs with spaces.
+
+2025-07-04  Alex Coplan  <alex.coplan@arm.com>
+
+	* MAINTAINERS (Reviewers): Add myself for the aarch64 port.
+
+2025-07-03  Andrew Pinski  <quic_apinski@quicinc.com>
+
+	* MAINTAINERS: Add myself as an aarch64 port reviewer.
+
+2025-06-22  Nicolas Boulenguez  <nicolas@debian.org>
+
+	PR ada/120106
+	* Makefile.tpl: Add GNATMAKE_FOR_BUILD to {HOST,BASE_TARGET}_EXPORTS
+	* Makefile.in: Regenerate.
+	* configure.ac: Set the default and substitute the variable.
+	* configure: Regenerate.
+
+2025-06-09  Kugan Vivekanandarajah  <kvivekananda@nvidia.com>
+
+	* configure.ac: Special case cpu_type for x86_64.
+	* configure: Regenerate.
+
+2025-06-09  Peter Bergner  <bergner@tenstorrent.com>
+
+	* MAINTAINERS: Update my email address and add myself to DCO.
+
+2025-05-28  Kugan Vivekanandarajah  <kvivekananda@nvidia.com>
+
+	* Makefile.def: Fix typo in cpu_type
+	* Makefile.tpl: Add cpu_type
+
+2025-05-26  Kugan Vivekanandarajah  <kvivekananda@nvidia.com>
+
+	* Makefile.def: AUTO_PROFILE based on cpu_type.
+	* Makefile.in: Likewise.
+	* configure: Regenerate.
+	* configure.ac: Set autofdo_target.
+
+2025-05-23  Kishan Parmar  <kishan@linux.ibm.com>
+
+	* MAINTAINERS: Add myself to write after approval.
+
+2025-05-23  Dhruv Chawla  <dhruvc@nvidia.com>
+
+	* MAINTAINERS: Add myself to write after approval and DCO.
+
+2025-05-21  Stephanos Ioannidis  <root@stephanos.io>
+
+	* configure.ac: Always add pre-installed heades to search path.
+	* configure: Regenerate.
+
+2025-05-16  Spencer Abson  <spencer.abson@arm.com>
+
+	* MAINTAINERS: Add myself to write after approval.
+
+2025-05-14  Richard Earnshaw  <rearnsha@arm.com>
+
+	* MAINTAINERS: Marcus Shawcroft has resigned from the project.
+
+2025-04-28  Kwok Cheung Yeung  <kcyeung@baylibre.com>
+
+	* MAINTAINERS (kcy): Add gcc.gnu.org username.
+
+2025-04-22  Rainer Orth  <ro@CeBiTec.Uni-Bielefeld.DE>
+
+	PR cobol/119217
+	* configure.ac: Restrict cobol to aarch64-*-linux*,
+	x86_64-*-linux*.
+	Fix indentation.
+	* configure: Regenerate.
+
+2025-04-16  Waffl3x  <waffl3x@baylibre.com>
+
+	* MAINTAINERS: Add myself.
+
+2025-04-02  Iain Sandoe  <iain@sandoe.co.uk>
+
+	* configure: Regenerate.
+	* configure.ac: Use -B instead of -L to specifiy the C++ runtime
+	paths on Darwin.
+
+2025-03-31  Alice Carlotti  <alice.carlotti@arm.com>
+
+	* MAINTAINERS: Update my name.
+
 2025-03-28  Richard Biener  <rguenther@suse.de>
 
 	PR bootstrap/119513

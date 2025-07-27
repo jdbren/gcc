@@ -24,6 +24,7 @@
 ------------------------------------------------------------------------------
 
 with Accessibility;  use Accessibility;
+with Aspects;        use Aspects;
 with Atree;          use Atree;
 with Checks;         use Checks;
 with Debug;          use Debug;
@@ -88,8 +89,10 @@ package body Exp_Attr is
       function Attribute_Op_Hash (Id : Entity_Id) return Header_Num is
         (Header_Num (Id mod Map_Size));
 
-      --  Cache used to avoid building duplicate subprograms for a single
-      --  type/streaming-attribute pair.
+      --  Caches used to avoid building duplicate subprograms for a single
+      --  type/attribute pair (where the attribute is either Put_Image or
+      --  one of the four streaming attributes). The type used as a key in
+      --  in accessing these maps should not be the entity of a subtype.
 
       package Read_Map is new GNAT.HTable.Simple_HTable
         (Header_Num => Header_Num,
@@ -282,8 +285,8 @@ package body Exp_Attr is
        (In_Same_Extended_Unit (Subp_Unit, Attr_Ref_Unit)
          --  If subp declared in unit body, then we don't want to refer
          --  to it from within unit spec so return False in that case.
-         and then not (Body_Required (Attr_Ref_Unit)
-                       and not Body_Required (Subp_Unit)));
+         and then not (not Is_Body (Unit (Attr_Ref_Unit))
+                       and Is_Body (Unit (Subp_Unit))));
    --  Returns True if it is ok to refer to a cached subprogram declared in
    --  Subp_Unit from the point of an attribute reference occurring in
    --  Attr_Ref_Unit. Both arguments are usually N_Compilation_Nodes,
@@ -1912,6 +1915,15 @@ package body Exp_Attr is
       --  call to the appropriate TSS procedure. Pname is the entity for the
       --  procedure to call.
 
+      procedure Read_Controlling_Tag
+        (P_Type : Entity_Id; Cntrl : out Node_Id);
+      --  Read the external tag from the stream and use it to construct the
+      --  controlling operand for a dispatching call.
+
+      procedure Write_Controlling_Tag (P_Type : Entity_Id);
+      --  Write the external tag of the given attribute prefix type to
+      --  the stream. Also perform the accompanying accessibility check.
+
       -------------------------------------
       -- Build_And_Insert_Type_Attr_Subp --
       -------------------------------------
@@ -2171,6 +2183,153 @@ package body Exp_Attr is
 
          Analyze (N);
       end Rewrite_Attribute_Proc_Call;
+
+      --------------------------
+      -- Read_Controlling_Tag --
+      --------------------------
+
+      procedure Read_Controlling_Tag
+        (P_Type : Entity_Id; Cntrl : out Node_Id)
+      is
+         Strm    : constant Node_Id := First (Exprs);
+         Expr    : Node_Id; -- call to Descendant_Tag
+         Get_Tag : Node_Id; -- expression to read the 'Tag
+
+      begin
+         --  Read the internal tag (RM 13.13.2(34)) and use it to
+         --  initialize a dummy tag value. We used to unconditionally
+         --  generate:
+         --
+         --     Descendant_Tag (String'Input (Strm), P_Type);
+         --
+         --  which turns into a call to String_Input_Blk_IO. However,
+         --  if the input is malformed, that could try to read an
+         --  enormous String, causing chaos. So instead we call
+         --  String_Input_Tag, which does the same thing as
+         --  String_Input_Blk_IO, except that if the String is
+         --  absurdly long, it raises an exception.
+         --
+         --  However, if the No_Stream_Optimizations restriction
+         --  is active, we disable this unnecessary attempt at
+         --  robustness; we really need to read the string
+         --  character-by-character.
+         --
+         --  This value is used only to provide a controlling
+         --  argument for the eventual _Input call. Descendant_Tag is
+         --  called rather than Internal_Tag to ensure that we have a
+         --  tag for a type that is descended from the prefix type and
+         --  declared at the same accessibility level (the exception
+         --  Tag_Error will be raised otherwise). The level check is
+         --  required for Ada 2005 because tagged types can be
+         --  extended in nested scopes (AI-344).
+
+         --  Note: we used to generate an explicit declaration of a
+         --  constant Ada.Tags.Tag object, and use an occurrence of
+         --  this constant in Cntrl, but this caused a secondary stack
+         --  leak.
+
+         if Restriction_Active (No_Stream_Optimizations) then
+            Get_Tag :=
+              Make_Attribute_Reference (Loc,
+                Prefix         =>
+                  New_Occurrence_Of (Standard_String, Loc),
+                Attribute_Name => Name_Input,
+                Expressions    => New_List (
+                  Relocate_Node (Duplicate_Subexpr (Strm))));
+         else
+            Get_Tag :=
+              Make_Function_Call (Loc,
+                Name                   =>
+                  New_Occurrence_Of
+                    (RTE (RE_String_Input_Tag), Loc),
+                Parameter_Associations => New_List (
+                  Relocate_Node (Duplicate_Subexpr (Strm))));
+         end if;
+
+         Expr :=
+           Make_Function_Call (Loc,
+             Name                   =>
+               New_Occurrence_Of (RTE (RE_Descendant_Tag), Loc),
+             Parameter_Associations => New_List (
+               Get_Tag,
+               Make_Attribute_Reference (Loc,
+                 Prefix         => New_Occurrence_Of (P_Type, Loc),
+                 Attribute_Name => Name_Tag)));
+
+         Set_Etype (Expr, RTE (RE_Tag));
+
+         --  Construct a controlling operand for a dispatching call.
+
+         Cntrl := Unchecked_Convert_To (P_Type, Expr);
+         Set_Etype (Cntrl, P_Type);
+         Set_Parent (Cntrl, N);
+      end Read_Controlling_Tag;
+
+      ----------------------------
+      --  Write_Controlling_Tag --
+      ----------------------------
+
+      procedure Write_Controlling_Tag (P_Type : Entity_Id) is
+         Strm : constant Node_Id := First (Exprs);
+         Item : constant Node_Id := Next (Strm);
+      begin
+         --  Ada 2005 (AI-344): Check that the accessibility level
+         --  of the type of the output object is not deeper than
+         --  that of the attribute's prefix type.
+
+         --  if Get_Access_Level (Item'Tag)
+         --       /= Get_Access_Level (P_Type'Tag)
+         --  then
+         --     raise Tag_Error;
+         --  end if;
+
+         --  String'Output (Strm, External_Tag (Item'Tag));
+
+         --  We cannot figure out a practical way to implement this
+         --  accessibility check on virtual machines, so we omit it.
+
+         if Ada_Version >= Ada_2005
+           and then Tagged_Type_Expansion
+         then
+            Insert_Action (N,
+              Make_Implicit_If_Statement (N,
+                Condition =>
+                  Make_Op_Ne (Loc,
+                    Left_Opnd  =>
+                      Build_Get_Access_Level (Loc,
+                        Make_Attribute_Reference (Loc,
+                          Prefix         =>
+                            Relocate_Node (
+                              Duplicate_Subexpr (Item,
+                                Name_Req => True)),
+                          Attribute_Name => Name_Tag)),
+
+                    Right_Opnd =>
+                      Make_Integer_Literal (Loc,
+                        Type_Access_Level (P_Type))),
+
+                Then_Statements =>
+                  New_List (Make_Raise_Statement (Loc,
+                              New_Occurrence_Of (
+                                RTE (RE_Tag_Error), Loc)))));
+         end if;
+
+         Insert_Action (N,
+           Make_Attribute_Reference (Loc,
+             Prefix => New_Occurrence_Of (Standard_String, Loc),
+             Attribute_Name => Name_Output,
+             Expressions => New_List (
+               Relocate_Node (Duplicate_Subexpr (Strm)),
+               Make_Function_Call (Loc,
+                 Name =>
+                   New_Occurrence_Of (RTE (RE_External_Tag), Loc),
+                 Parameter_Associations => New_List (
+                  Make_Attribute_Reference (Loc,
+                    Prefix =>
+                      Relocate_Node
+                        (Duplicate_Subexpr (Item, Name_Req => True)),
+                    Attribute_Name => Name_Tag))))));
+      end Write_Controlling_Tag;
 
       Typ  : constant Entity_Id    := Etype (N);
       Btyp : constant Entity_Id    := Base_Type (Typ);
@@ -4484,6 +4643,47 @@ package body Exp_Attr is
 
             elsif Is_Class_Wide_Type (P_Type) then
 
+               if Is_Mutably_Tagged_Type (P_Type) then
+
+                  --  In mutably tagged case, rewrite
+                  --    T'Class'Input (Strm)
+                  --  as (roughly)
+                  --    declare
+                  --       Result : T'Class;
+                  --       T'Class'Read (Strm, Result);
+                  --    begin
+                  --      Result;
+                  --    end;
+
+                  declare
+                     Result_Temp : constant Entity_Id :=
+                       Make_Temporary (Loc, 'I');
+
+                     --  Gets default initialization
+                     Result_Temp_Decl : constant Node_Id :=
+                       Make_Object_Declaration (Loc,
+                         Defining_Identifier => Result_Temp,
+                         Object_Definition =>
+                           New_Occurrence_Of (P_Type, Loc));
+
+                     function Result_Temp_Name return Node_Id is
+                       (New_Occurrence_Of (Result_Temp, Loc));
+
+                     Actions : constant List_Id := New_List (
+                       Result_Temp_Decl,
+                       Make_Attribute_Reference (Loc,
+                         Prefix => New_Occurrence_Of (P_Type, Loc),
+                         Attribute_Name => Name_Read,
+                         Expressions => New_List (
+                           Relocate_Node (Strm), Result_Temp_Name)));
+                  begin
+                     Rewrite (N, Make_Expression_With_Actions (Loc,
+                                   Actions, Result_Temp_Name));
+                     Analyze_And_Resolve (N, P_Type);
+                     return;
+                  end;
+               end if;
+
                --  No need to do anything else compiling under restriction
                --  No_Dispatching_Calls. During the semantic analysis we
                --  already notified such violation.
@@ -4492,86 +4692,8 @@ package body Exp_Attr is
                   return;
                end if;
 
-               declare
-                  Rtyp : constant Entity_Id := Root_Type (P_Type);
-
-                  Expr    : Node_Id; -- call to Descendant_Tag
-                  Get_Tag : Node_Id; -- expression to read the 'Tag
-
-               begin
-                  --  Read the internal tag (RM 13.13.2(34)) and use it to
-                  --  initialize a dummy tag value. We used to unconditionally
-                  --  generate:
-                  --
-                  --     Descendant_Tag (String'Input (Strm), P_Type);
-                  --
-                  --  which turns into a call to String_Input_Blk_IO. However,
-                  --  if the input is malformed, that could try to read an
-                  --  enormous String, causing chaos. So instead we call
-                  --  String_Input_Tag, which does the same thing as
-                  --  String_Input_Blk_IO, except that if the String is
-                  --  absurdly long, it raises an exception.
-                  --
-                  --  However, if the No_Stream_Optimizations restriction
-                  --  is active, we disable this unnecessary attempt at
-                  --  robustness; we really need to read the string
-                  --  character-by-character.
-                  --
-                  --  This value is used only to provide a controlling
-                  --  argument for the eventual _Input call. Descendant_Tag is
-                  --  called rather than Internal_Tag to ensure that we have a
-                  --  tag for a type that is descended from the prefix type and
-                  --  declared at the same accessibility level (the exception
-                  --  Tag_Error will be raised otherwise). The level check is
-                  --  required for Ada 2005 because tagged types can be
-                  --  extended in nested scopes (AI-344).
-
-                  --  Note: we used to generate an explicit declaration of a
-                  --  constant Ada.Tags.Tag object, and use an occurrence of
-                  --  this constant in Cntrl, but this caused a secondary stack
-                  --  leak.
-
-                  if Restriction_Active (No_Stream_Optimizations) then
-                     Get_Tag :=
-                       Make_Attribute_Reference (Loc,
-                         Prefix         =>
-                           New_Occurrence_Of (Standard_String, Loc),
-                         Attribute_Name => Name_Input,
-                         Expressions    => New_List (
-                           Relocate_Node (Duplicate_Subexpr (Strm))));
-                  else
-                     Get_Tag :=
-                       Make_Function_Call (Loc,
-                         Name                   =>
-                           New_Occurrence_Of
-                             (RTE (RE_String_Input_Tag), Loc),
-                         Parameter_Associations => New_List (
-                           Relocate_Node (Duplicate_Subexpr (Strm))));
-                  end if;
-
-                  Expr :=
-                    Make_Function_Call (Loc,
-                      Name                   =>
-                        New_Occurrence_Of (RTE (RE_Descendant_Tag), Loc),
-                      Parameter_Associations => New_List (
-                        Get_Tag,
-                        Make_Attribute_Reference (Loc,
-                          Prefix         => New_Occurrence_Of (P_Type, Loc),
-                          Attribute_Name => Name_Tag)));
-
-                  Set_Etype (Expr, RTE (RE_Tag));
-
-                  --  Now we need to get the entity for the call, and construct
-                  --  a function call node, where we preset a reference to Dnn
-                  --  as the controlling argument (doing an unchecked convert
-                  --  to the class-wide tagged type to make it look like a real
-                  --  tagged object).
-
-                  Fname := Find_Prim_Op (Rtyp, TSS_Stream_Input);
-                  Cntrl := Unchecked_Convert_To (P_Type, Expr);
-                  Set_Etype (Cntrl, P_Type);
-                  Set_Parent (Cntrl, N);
-               end;
+               Read_Controlling_Tag (P_Type, Cntrl);
+               Fname := Find_Prim_Op (Root_Type (P_Type), TSS_Stream_Input);
 
             --  For tagged types, use the primitive Input function
 
@@ -4669,7 +4791,7 @@ package body Exp_Attr is
          end if;
 
          if not Is_Tagged_Type (P_Type) then
-            Cached_Attribute_Ops.Input_Map.Set (P_Type, Fname);
+            Cached_Attribute_Ops.Input_Map.Set (U_Type, Fname);
          end if;
       end Input;
 
@@ -4983,6 +5105,316 @@ package body Exp_Attr is
 
          Analyze_And_Resolve (N, Typ);
 
+      ----------
+      -- Make --
+      ----------
+
+      when Attribute_Make =>
+         declare
+            Params    : List_Id;
+            Param     : Node_Id;
+            Par       : Node_Id;
+            Construct : Entity_Id;
+            Obj       : Node_Id := Empty;
+            Make_Expr : Node_Id := N;
+
+            Formal       : Entity_Id;
+            Replace_Expr : Node_Id;
+            Init_Param   : Node_Id;
+            Construct_Call : Node_Id;
+            Curr_Nam : Node_Id := Empty;
+
+            function Replace_Formal_Ref
+              (N : Node_Id) return Traverse_Result;
+
+            function Replace_Formal_Ref
+              (N : Node_Id) return Traverse_Result is
+            begin
+               if Is_Entity_Name (N)
+                 and then Chars (Formal) = Chars (N)
+               then
+                  Rewrite (N,
+                    New_Copy_Tree (Replace_Expr));
+               end if;
+
+               return OK;
+            end Replace_Formal_Ref;
+
+            procedure Search_And_Replace_Formal is new
+              Traverse_Proc (Replace_Formal_Ref);
+
+         begin
+            --  Remove side effects for constructor call
+
+            Param := First (Expressions (N));
+            while Present (Param) loop
+               if Nkind (Param) = N_Parameter_Association then
+                  Remove_Side_Effects (Explicit_Actual_Parameter (Param),
+                                       Check_Side_Effects => False);
+               else
+                  Remove_Side_Effects (Param, Check_Side_Effects => False);
+               end if;
+
+               Next (Param);
+            end loop;
+
+            --  Construct the parameters list
+
+            Params := New_Copy_List (Expressions (N));
+            if Is_Empty_List (Params) then
+               Params := New_List;
+            end if;
+
+            --  Identify the enclosing parent for the non-copy cases
+
+            Par := Parent (N);
+            if Nkind (Par) = N_Qualified_Expression then
+               Par       := Parent (Par);
+               Make_Expr := Par;
+            end if;
+            if Nkind (Par) = N_Allocator then
+               Par := Parent (Par);
+               Curr_Nam := Make_Explicit_Dereference
+                            (Loc, Prefix => Empty);
+               Obj := Curr_Nam;
+            end if;
+
+            declare
+               Base_Obj : Node_Id := Empty;
+               Typ_Comp : Entity_Id;
+               Agg_Comp : Entity_Id;
+               Comp_Nam : Node_Id := Empty;
+            begin
+               while Nkind (Par) not in N_Object_Declaration
+                                      | N_Assignment_Statement
+               loop
+                  if Nkind (Par) = N_Aggregate then
+                     Typ_Comp := First_Entity (Etype (Par));
+                     Agg_Comp := First (Expressions (Par));
+                     loop
+                        if No (Agg_Comp) then
+                           return;
+                        end if;
+
+                        if Agg_Comp = Make_Expr then
+                           Comp_Nam :=
+                             Make_Selected_Component (Loc,
+                               Prefix => Empty,
+                               Selector_Name =>
+                                 New_Occurrence_Of (Typ_Comp, Loc));
+
+                           Make_Expr := Parent (Make_Expr);
+                           Par       := Parent (Par);
+                           exit;
+                        end if;
+
+                        Next_Entity (Typ_Comp);
+                        Next (Agg_Comp);
+                     end loop;
+                  elsif Nkind (Par) = N_Component_Association then
+                     Comp_Nam :=
+                       Make_Selected_Component (Loc,
+                         Prefix => Empty,
+                         Selector_Name =>
+                           Make_Identifier (Loc,
+                             (Chars (First (Choices (Par))))));
+
+                     Make_Expr := Parent (Parent (Make_Expr));
+                     Par       := Parent (Parent (Par));
+                  else
+                     declare
+                        Temp : constant Entity_Id :=
+                          Make_Temporary (Loc, 'T', N);
+                     begin
+                        Rewrite (N,
+                          Make_Expression_With_Actions (Loc,
+                            Actions => New_List (
+                              Make_Object_Declaration (Loc,
+                                Defining_Identifier => Temp,
+                                Object_Definition   =>
+                                  New_Occurrence_Of (Typ, Loc),
+                                Expression          =>
+                                  New_Copy_Tree (N))),
+                            Expression => New_Occurrence_Of (Temp, Loc)));
+                        Analyze_And_Resolve (N);
+                        return;
+                     end;
+                  end if;
+
+                  if No (Curr_Nam) then
+                     Curr_Nam := Comp_Nam;
+                     Obj      := Curr_Nam;
+                  elsif Has_Prefix (Curr_Nam) then
+                     Set_Prefix (Curr_Nam, Comp_Nam);
+                     Curr_Nam := Comp_Nam;
+                  end if;
+               end loop;
+
+               Base_Obj := (case Nkind (Par) is
+                              when N_Assignment_Statement =>
+                                 New_Copy_Tree (Name (Par)),
+                              when N_Object_Declaration =>
+                                 New_Occurrence_Of
+                                   (Defining_Identifier (Par), Loc),
+                              when others => (raise Program_Error));
+
+               if Present (Curr_Nam) then
+                  Set_Prefix (Curr_Nam, Base_Obj);
+               else
+                  Obj := Base_Obj;
+               end if;
+            end;
+
+            Prepend_To (Params, Obj);
+
+            --  Find the constructor we are interested in by doing a
+            --  pseudo-pass to resolve the constructor call.
+
+            declare
+               Dummy_Params : List_Id := New_Copy_List (Expressions (N));
+               Dummy_Self   : Node_Id;
+               Dummy_Block  : Node_Id;
+               Dummy_Call   : Node_Id;
+               Dummy_Id     : Entity_Id := Make_Temporary (Loc, 'D', N);
+            begin
+               if Is_Empty_List (Dummy_Params) then
+                  Dummy_Params := New_List;
+               end if;
+
+               Dummy_Self := Make_Object_Declaration (Loc,
+                               Defining_Identifier => Dummy_Id,
+                               Object_Definition   =>
+                                  New_Occurrence_Of (Typ, Loc));
+               Prepend_To (Dummy_Params, New_Occurrence_Of (Dummy_Id, Loc));
+
+               Dummy_Call := Make_Procedure_Call_Statement (Loc,
+                               Parameter_Associations => Dummy_Params,
+                               Name                   =>
+                                 (if not Has_Prefix (Pref) then
+                                     Make_Identifier (Loc,
+                                       Chars (Constructor_Name (Typ)))
+                                  else
+                                     Make_Expanded_Name (Loc,
+                                       Chars =>
+                                         Chars (Constructor_Name (Typ)),
+                                       Prefix =>
+                                         New_Copy_Tree (Prefix (Pref)),
+                                       Selector_Name =>
+                                         Make_Identifier (Loc,
+                                          Chars (Constructor_Name (Typ))))));
+               Set_Is_Expanded_Constructor_Call (Dummy_Call, True);
+
+               Dummy_Block := Make_Block_Statement (Loc,
+                                Declarations => New_List (Dummy_Self),
+                                Handled_Statement_Sequence =>
+                                  Make_Handled_Sequence_Of_Statements (Loc,
+                                    Statements => New_List (Dummy_Call)));
+
+               Expander_Active := False;
+
+               Insert_After_And_Analyze
+                 (Enclosing_Declaration_Or_Statement (Par), Dummy_Block);
+
+               Expander_Active := True;
+
+               --  Finally, we can get the constructor based on our pseudo-pass
+
+               Construct := Entity (Name (Dummy_Call));
+
+               --  Replace the Typ'Make attribute with an aggregate featuring
+               --  then relevant aggregate from the correct constructor's
+               --  Inializeaspect if it is present - otherwise, simply use a
+               --  box.
+
+               if Has_Aspect (Construct, Aspect_Initialize) then
+                  Rewrite (N,
+                    New_Copy_Tree
+                      (Find_Value_Of_Aspect (Construct, Aspect_Initialize)));
+
+                  Param  := Next (First (Params));
+                  Formal := Next_Entity (First_Entity (Construct));
+                  while Present (Param) loop
+                     if Nkind (Param) = N_Parameter_Association then
+                        Formal := Selector_Name (Param);
+                        Replace_Expr := Explicit_Actual_Parameter (Param);
+                     else
+                        Replace_Expr := Param;
+                     end if;
+
+                     Init_Param := First (Component_Associations (N));
+                     while Present (Init_Param) loop
+                        Search_And_Replace_Formal (Expression (Init_Param));
+
+                        Next (Init_Param);
+                     end loop;
+
+                     if Nkind (Param) /= N_Parameter_Association then
+                        Next_Entity (Formal);
+                     end if;
+                     Next (Param);
+                  end loop;
+
+                  Init_Param := First (Component_Associations (N));
+                  while Present (Init_Param) loop
+                     if Nkind (Expression (Init_Param)) = N_Attribute_Reference
+                       and then Attribute_Name
+                                  (Expression (Init_Param)) = Name_Make
+                     then
+                        Insert_After (Par,
+                          Make_Assignment_Statement (Loc,
+                            Name       =>
+                              Make_Selected_Component (Loc,
+                                Prefix =>
+                                  New_Copy_Tree (First (Params)),
+                                Selector_Name =>
+                                  Make_Identifier (Loc,
+                                    Chars (First (Choices (Init_Param))))),
+                            Expression =>
+                              New_Copy_Tree (Expression (Init_Param))));
+
+                        Rewrite (Expression (Init_Param),
+                          Make_Aggregate (Loc,
+                            Expressions            => New_List,
+                            Component_Associations => New_List (
+                              Make_Component_Association (Loc,
+                                Choices     =>
+                                  New_List (Make_Others_Choice (Loc)),
+                                Expression  => Empty,
+                                Box_Present => True))));
+                     end if;
+
+                     Next (Init_Param);
+                  end loop;
+               else
+                  Rewrite (N,
+                    Make_Aggregate (Loc,
+                      Expressions            => New_List,
+                      Component_Associations => New_List (
+                        Make_Component_Association (Loc,
+                          Choices     => New_List (Make_Others_Choice (Loc)),
+                          Expression  => Empty,
+                          Box_Present => True))));
+               end if;
+
+               --  Rewrite this block to be null and pretend it didn't happen
+
+               Rewrite (Dummy_Block, Make_Null_Statement (Loc));
+            end;
+
+            Analyze_And_Resolve (N, Typ);
+
+            --  Finally, insert the constructor call
+
+            Construct_Call :=
+              Make_Procedure_Call_Statement (Loc,
+                Name                   =>
+                  New_Occurrence_Of (Construct, Loc),
+                Parameter_Associations => Params);
+
+            Set_Is_Expanded_Constructor_Call (Construct_Call);
+            Insert_After (Par, Construct_Call);
+         end;
+
       --------------
       -- Mantissa --
       --------------
@@ -5040,22 +5472,42 @@ package body Exp_Attr is
          Typ : constant Entity_Id := Etype (N);
 
       begin
-         --  If the prefix is X'Class, we transform it into a direct reference
-         --  to the class-wide type, because the back end must not see a 'Class
-         --  reference. See also 'Size.
+         --  Tranform T'Class'Max_Size_In_Storage_Elements (for any T) into
+         --  Storage_Count'Pos (Storage_Count'Last), because it must include
+         --  all descendants, which can be arbitrarily large. Note that the
+         --  back end must not see any 'Class attribute references.
+         --  The 'Pos is to make it be of type universal_integer.
+         --
+         --  ???If T'Class'Size is specified, it should probably affect
+         --  T'Class'Max_Size_In_Storage_Elements accordingly.
 
          if Is_Entity_Name (Pref)
            and then Is_Class_Wide_Type (Entity (Pref))
          then
-            Rewrite (Prefix (N), New_Occurrence_Of (Entity (Pref), Loc));
-            return;
-         end if;
+            declare
+               Storage_Count_Type : constant Entity_Id :=
+                 RTE (RE_Storage_Count);
+               Attr : constant Node_Id :=
+                 Make_Attribute_Reference (Loc,
+                   Prefix => New_Occurrence_Of (Storage_Count_Type, Loc),
+                   Attribute_Name => Name_Pos,
+                   Expressions => New_List (
+                     Make_Attribute_Reference (Loc,
+                       Prefix => New_Occurrence_Of (Storage_Count_Type, Loc),
+                       Attribute_Name => Name_Last)));
+            begin
+               Rewrite (N, Attr);
+               Analyze_And_Resolve (N, Typ);
+               return;
+            end;
 
          --  Heap-allocated controlled objects contain two extra pointers which
          --  are not part of the actual type. Transform the attribute reference
          --  into a runtime expression to add the size of the hidden header.
 
-         if Needs_Finalization (Ptyp) and then not Header_Size_Added (N) then
+         elsif Needs_Finalization (Ptyp)
+           and then not Header_Size_Added (N)
+         then
             Set_Header_Size_Added (N);
 
             --  Generate:
@@ -5624,6 +6076,14 @@ package body Exp_Attr is
                      Attr_Ref => N);
                end;
 
+            --  In the mutably tagged case, T'Class'Output calls T'Class'Write;
+            --  T'Write will take care of writing out the external tag.
+
+            elsif Is_Mutably_Tagged_Type (P_Type) then
+               Set_Attribute_Name (N, Name_Write);
+               Analyze (N);
+               return;
+
             --  Class-wide case, first output external tag, then dispatch
             --  to the appropriate primitive Output function (RM 13.13.2(31)).
 
@@ -5637,68 +6097,7 @@ package body Exp_Attr is
                   return;
                end if;
 
-               Tag_Write : declare
-                  Strm : constant Node_Id := First (Exprs);
-                  Item : constant Node_Id := Next (Strm);
-
-               begin
-                  --  Ada 2005 (AI-344): Check that the accessibility level
-                  --  of the type of the output object is not deeper than
-                  --  that of the attribute's prefix type.
-
-                  --  if Get_Access_Level (Item'Tag)
-                  --       /= Get_Access_Level (P_Type'Tag)
-                  --  then
-                  --     raise Tag_Error;
-                  --  end if;
-
-                  --  String'Output (Strm, External_Tag (Item'Tag));
-
-                  --  We cannot figure out a practical way to implement this
-                  --  accessibility check on virtual machines, so we omit it.
-
-                  if Ada_Version >= Ada_2005
-                    and then Tagged_Type_Expansion
-                  then
-                     Insert_Action (N,
-                       Make_Implicit_If_Statement (N,
-                         Condition =>
-                           Make_Op_Ne (Loc,
-                             Left_Opnd  =>
-                               Build_Get_Access_Level (Loc,
-                                 Make_Attribute_Reference (Loc,
-                                   Prefix         =>
-                                     Relocate_Node (
-                                       Duplicate_Subexpr (Item,
-                                         Name_Req => True)),
-                                   Attribute_Name => Name_Tag)),
-
-                             Right_Opnd =>
-                               Make_Integer_Literal (Loc,
-                                 Type_Access_Level (P_Type))),
-
-                         Then_Statements =>
-                           New_List (Make_Raise_Statement (Loc,
-                                       New_Occurrence_Of (
-                                         RTE (RE_Tag_Error), Loc)))));
-                  end if;
-
-                  Insert_Action (N,
-                    Make_Attribute_Reference (Loc,
-                      Prefix => New_Occurrence_Of (Standard_String, Loc),
-                      Attribute_Name => Name_Output,
-                      Expressions => New_List (
-                        Relocate_Node (Duplicate_Subexpr (Strm)),
-                        Make_Function_Call (Loc,
-                          Name =>
-                            New_Occurrence_Of (RTE (RE_External_Tag), Loc),
-                          Parameter_Associations => New_List (
-                           Make_Attribute_Reference (Loc,
-                             Prefix =>
-                               Relocate_Node
-                                 (Duplicate_Subexpr (Item, Name_Req => True)),
-                             Attribute_Name => Name_Tag))))));
-               end Tag_Write;
+               Write_Controlling_Tag (P_Type);
 
                Pname := Find_Prim_Op (U_Type, TSS_Stream_Output);
 
@@ -5750,7 +6149,7 @@ package body Exp_Attr is
          Rewrite_Attribute_Proc_Call (Pname);
 
          if not Is_Tagged_Type (P_Type) then
-            Cached_Attribute_Ops.Output_Map.Set (P_Type, Pname);
+            Cached_Attribute_Ops.Output_Map.Set (U_Type, Pname);
          end if;
       end Output;
 
@@ -6460,6 +6859,7 @@ package body Exp_Attr is
          P_Type  : constant Entity_Id := Entity (Pref);
          B_Type  : constant Entity_Id := Base_Type (P_Type);
          U_Type  : constant Entity_Id := Underlying_Type (P_Type);
+         Cntrl   : Node_Id := Empty; -- nonempty only if P_Type mutably tagged
          Pname   : Entity_Id;
          Decl    : Node_Id;
          Prag    : Node_Id;
@@ -6608,6 +7008,11 @@ package body Exp_Attr is
             --  this will dispatch in the class-wide case which is what we want
 
             elsif Is_Tagged_Type (U_Type) then
+
+               if Is_Mutably_Tagged_Type (U_Type) then
+                  Read_Controlling_Tag (P_Type, Cntrl);
+               end if;
+
                Pname := Find_Prim_Op (U_Type, TSS_Stream_Read);
 
             --  All other record type cases, including protected records. The
@@ -6668,8 +7073,48 @@ package body Exp_Attr is
 
          Rewrite_Attribute_Proc_Call (Pname);
 
+         if Present (Cntrl) then
+            pragma Assert (Is_Mutably_Tagged_Type (U_Type));
+            pragma Assert (Nkind (N) = N_Procedure_Call_Statement);
+
+            --  Assign the Tag value that was read from the stream
+            --  to the tag of the out-mode actual parameter so that
+            --  we dispatch correctly. This isn't quite right.
+            --  We should assign a complete object (not just
+            --  the tag), but that would require a dispatching call to
+            --  perform default initialization of the source object and
+            --  dispatching default init calls are currently not supported.
+
+            declare
+               function Select_Tag (Prefix : Node_Id) return Node_Id is
+                 (Make_Selected_Component (Loc,
+                    Prefix => Prefix,
+                    Selector_Name =>
+                      New_Occurrence_Of (First_Tag_Component
+                                           (Etype (Prefix)), Loc)));
+
+               Controlling_Actual : constant Node_Id :=
+                 Next (First (Parameter_Associations (N)));
+
+               pragma Assert (Is_Controlling_Actual (Controlling_Actual));
+
+               Assign_Tag : Node_Id;
+            begin
+               Remove_Side_Effects (Controlling_Actual, Name_Req => True);
+
+               Assign_Tag :=
+                 Make_Assignment_Statement (Loc,
+                   Name =>
+                     Select_Tag (New_Copy_Tree (Controlling_Actual)),
+                   Expression => Select_Tag (Cntrl));
+
+               Insert_Before (Before => N, Node => Assign_Tag);
+               Analyze (Assign_Tag);
+            end;
+         end if;
+
          if not Is_Tagged_Type (P_Type) then
-            Cached_Attribute_Ops.Read_Map.Set (P_Type, Pname);
+            Cached_Attribute_Ops.Read_Map.Set (U_Type, Pname);
          end if;
       end Read;
 
@@ -7870,9 +8315,8 @@ package body Exp_Attr is
          else
             declare
                Uns  : constant Boolean :=
-                        Is_Unsigned_Type (Ptyp)
-                          or else (Is_Private_Type (Ptyp)
-                                    and then Is_Unsigned_Type (PBtyp));
+                 Is_Unsigned_Type (Validated_View (Ptyp));
+
                Size : Uint;
                P    : Node_Id := Pref;
 
@@ -8279,6 +8723,14 @@ package body Exp_Attr is
             --  this will dispatch in the class-wide case which is what we want
 
             elsif Is_Tagged_Type (U_Type) then
+
+               --  If T'Class is mutably tagged, then the external tag
+               --  is written out by T'Class'Write, not by T'Class'Output.
+
+               if Is_Mutably_Tagged_Type (U_Type) then
+                  Write_Controlling_Tag (P_Type);
+               end if;
+
                Pname := Find_Prim_Op (U_Type, TSS_Stream_Write);
 
             --  All other record type cases, including protected records.
@@ -8349,7 +8801,7 @@ package body Exp_Attr is
          Rewrite_Attribute_Proc_Call (Pname);
 
          if not Is_Tagged_Type (P_Type) then
-            Cached_Attribute_Ops.Write_Map.Set (P_Type, Pname);
+            Cached_Attribute_Ops.Write_Map.Set (U_Type, Pname);
          end if;
       end Write;
 
@@ -8444,7 +8896,7 @@ package body Exp_Attr is
 
    exception
       when RE_Not_Available =>
-         return;
+         null;
    end Expand_N_Attribute_Reference;
 
    --------------------------------
@@ -8600,10 +9052,10 @@ package body Exp_Attr is
             Rewrite (N,
               Make_Op_Multiply (Loc,
                 Make_Attribute_Reference (Loc,
-                  Prefix         => Duplicate_Subexpr (Pref, True),
+                  Prefix         => Duplicate_Subexpr (Pref, Name_Req => True),
                   Attribute_Name => Name_Length),
                 Make_Attribute_Reference (Loc,
-                  Prefix         => Duplicate_Subexpr (Pref, True),
+                  Prefix         => Duplicate_Subexpr (Pref, Name_Req => True),
                   Attribute_Name => Name_Component_Size)));
             Analyze_And_Resolve (N, Typ);
          end if;
@@ -8951,15 +9403,22 @@ package body Exp_Attr is
          return Empty;
       end if;
 
-      if Nam = TSS_Stream_Read then
-         Ent := Cached_Attribute_Ops.Read_Map.Get (Typ);
-      elsif Nam = TSS_Stream_Write then
-         Ent := Cached_Attribute_Ops.Write_Map.Get (Typ);
-      elsif Nam = TSS_Stream_Input then
-         Ent := Cached_Attribute_Ops.Input_Map.Get (Typ);
-      elsif Nam = TSS_Stream_Output then
-         Ent := Cached_Attribute_Ops.Output_Map.Get (Typ);
-      end if;
+      declare
+         function U_Base return Entity_Id is
+           (Underlying_Type (Base_Type (Typ)));
+         --  Return the right type node for use in a C_A_O map lookup.
+         --  In particular, we do not want the entity for a subtype.
+      begin
+         if Nam = TSS_Stream_Read then
+            Ent := Cached_Attribute_Ops.Read_Map.Get (U_Base);
+         elsif Nam = TSS_Stream_Write then
+            Ent := Cached_Attribute_Ops.Write_Map.Get (U_Base);
+         elsif Nam = TSS_Stream_Input then
+            Ent := Cached_Attribute_Ops.Input_Map.Get (U_Base);
+         elsif Nam = TSS_Stream_Output then
+            Ent := Cached_Attribute_Ops.Output_Map.Get (U_Base);
+         end if;
+      end;
 
       Cached_Attribute_Ops.Validate_Cached_Candidate
         (Subp => Ent, Attr_Ref => Attr_Ref);

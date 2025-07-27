@@ -1225,7 +1225,6 @@ make_packable_type (tree type, bool in_record, unsigned int max_align)
      Note that we rely on the pointer equality created here for
      TYPE_NAME to look through conversions in various places.  */
   TYPE_NAME (new_type) = TYPE_NAME (type);
-  TYPE_PACKED (new_type) = 1;
   TYPE_JUSTIFIED_MODULAR_P (new_type) = TYPE_JUSTIFIED_MODULAR_P (type);
   TYPE_CONTAINS_TEMPLATE_P (new_type) = TYPE_CONTAINS_TEMPLATE_P (type);
   TYPE_REVERSE_STORAGE_ORDER (new_type) = TYPE_REVERSE_STORAGE_ORDER (type);
@@ -1240,6 +1239,8 @@ make_packable_type (tree type, bool in_record, unsigned int max_align)
       new_size = ceil_pow2 (size);
       new_align = MIN (new_size, BIGGEST_ALIGNMENT);
       SET_TYPE_ALIGN (new_type, new_align);
+      /* build_aligned_type needs to be able to adjust back the alignment.  */
+      TYPE_PACKED (new_type) = 0;
     }
   else
     {
@@ -1261,6 +1262,7 @@ make_packable_type (tree type, bool in_record, unsigned int max_align)
       if (max_align > 0 && new_align > max_align)
 	new_align = max_align;
       SET_TYPE_ALIGN (new_type, MIN (align, new_align));
+      TYPE_PACKED (new_type) = 1;
     }
 
   TYPE_USER_ALIGN (new_type) = 1;
@@ -3286,30 +3288,6 @@ tree
 create_param_decl (tree name, tree type)
 {
   tree param_decl = build_decl (input_location, PARM_DECL, name, type);
-
-  /* Honor TARGET_PROMOTE_PROTOTYPES like the C compiler, as not doing so
-     can lead to various ABI violations.  */
-  if (targetm.calls.promote_prototypes (NULL_TREE)
-      && INTEGRAL_TYPE_P (type)
-      && TYPE_PRECISION (type) < TYPE_PRECISION (integer_type_node))
-    {
-      /* We have to be careful about biased types here.  Make a subtype
-	 of integer_type_node with the proper biasing.  */
-      if (TREE_CODE (type) == INTEGER_TYPE
-	  && TYPE_BIASED_REPRESENTATION_P (type))
-	{
-	  tree subtype
-	    = make_unsigned_type (TYPE_PRECISION (integer_type_node));
-	  TREE_TYPE (subtype) = integer_type_node;
-	  TYPE_BIASED_REPRESENTATION_P (subtype) = 1;
-	  SET_TYPE_RM_MIN_VALUE (subtype, TYPE_MIN_VALUE (type));
-	  SET_TYPE_RM_MAX_VALUE (subtype, TYPE_MAX_VALUE (type));
-	  type = subtype;
-	}
-      else
-	type = integer_type_node;
-    }
-
   DECL_ARG_TYPE (param_decl) = type;
   return param_decl;
 }
@@ -4532,8 +4510,8 @@ build_unc_object_type_from_ptr (tree thin_fat_ptr_type, tree object_type,
 void
 update_pointer_to (tree old_type, tree new_type)
 {
-  tree ptr = TYPE_POINTER_TO (old_type);
-  tree ref = TYPE_REFERENCE_TO (old_type);
+  const tree old_ptr = TYPE_POINTER_TO (old_type);
+  const tree old_ref = TYPE_REFERENCE_TO (old_type);
   tree t;
 
   /* If this is the main variant, process all the other variants first.  */
@@ -4542,7 +4520,7 @@ update_pointer_to (tree old_type, tree new_type)
       update_pointer_to (t, new_type);
 
   /* If no pointers and no references, we are done.  */
-  if (!ptr && !ref)
+  if (!old_ptr && !old_ref)
     return;
 
   /* Merge the old type qualifiers in the new type.
@@ -4576,12 +4554,13 @@ update_pointer_to (tree old_type, tree new_type)
   if (TREE_CODE (new_type) != UNCONSTRAINED_ARRAY_TYPE)
     {
       tree new_ptr, new_ref;
+      tree ptr, ref;
 
       /* If pointer or reference already points to new type, nothing to do.
 	 This can happen as update_pointer_to can be invoked multiple times
 	 on the same couple of types because of the type variants.  */
-      if ((ptr && TREE_TYPE (ptr) == new_type)
-	  || (ref && TREE_TYPE (ref) == new_type))
+      if ((old_ptr && TREE_TYPE (old_ptr) == new_type)
+	  || (old_ref && TREE_TYPE (old_ref) == new_type))
 	return;
 
       /* Chain PTR and its variants at the end.  */
@@ -4590,13 +4569,13 @@ update_pointer_to (tree old_type, tree new_type)
 	{
 	  while (TYPE_NEXT_PTR_TO (new_ptr))
 	    new_ptr = TYPE_NEXT_PTR_TO (new_ptr);
-	  TYPE_NEXT_PTR_TO (new_ptr) = ptr;
+	  TYPE_NEXT_PTR_TO (new_ptr) = old_ptr;
 	}
       else
-	TYPE_POINTER_TO (new_type) = ptr;
+	TYPE_POINTER_TO (new_type) = old_ptr;
 
       /* Now adjust them.  */
-      for (; ptr; ptr = TYPE_NEXT_PTR_TO (ptr))
+      for (ptr = old_ptr; ptr; ptr = TYPE_NEXT_PTR_TO (ptr))
 	for (t = TYPE_MAIN_VARIANT (ptr); t; t = TYPE_NEXT_VARIANT (t))
 	  {
 	    TREE_TYPE (t) = new_type;
@@ -4611,13 +4590,13 @@ update_pointer_to (tree old_type, tree new_type)
 	{
 	  while (TYPE_NEXT_REF_TO (new_ref))
 	    new_ref = TYPE_NEXT_REF_TO (new_ref);
-	  TYPE_NEXT_REF_TO (new_ref) = ref;
+	  TYPE_NEXT_REF_TO (new_ref) = old_ref;
 	}
       else
-	TYPE_REFERENCE_TO (new_type) = ref;
+	TYPE_REFERENCE_TO (new_type) = old_ref;
 
       /* Now adjust them.  */
-      for (; ref; ref = TYPE_NEXT_REF_TO (ref))
+      for (ref = old_ref; ref; ref = TYPE_NEXT_REF_TO (ref))
 	for (t = TYPE_MAIN_VARIANT (ref); t; t = TYPE_NEXT_VARIANT (t))
 	  {
 	    TREE_TYPE (t) = new_type;
@@ -4636,20 +4615,20 @@ update_pointer_to (tree old_type, tree new_type)
     {
       tree new_ptr = TYPE_POINTER_TO (new_type);
 
-      gcc_assert (TYPE_IS_FAT_POINTER_P (ptr));
+      gcc_assert (TYPE_IS_FAT_POINTER_P (old_ptr));
 
       /* If PTR already points to NEW_TYPE, nothing to do.  This can happen
 	 since update_pointer_to can be invoked multiple times on the same
 	 couple of types because of the type variants.  */
-      if (TYPE_UNCONSTRAINED_ARRAY (ptr) == new_type)
+      if (TYPE_UNCONSTRAINED_ARRAY (old_ptr) == new_type)
 	return;
 
       update_pointer_to
-	(TREE_TYPE (TREE_TYPE (TYPE_FIELDS (ptr))),
+	(TREE_TYPE (TREE_TYPE (TYPE_FIELDS (old_ptr))),
 	 TREE_TYPE (TREE_TYPE (TYPE_FIELDS (new_ptr))));
 
       update_pointer_to
-	(TREE_TYPE (TREE_TYPE (DECL_CHAIN (TYPE_FIELDS (ptr)))),
+	(TREE_TYPE (TREE_TYPE (DECL_CHAIN (TYPE_FIELDS (old_ptr)))),
 	 TREE_TYPE (TREE_TYPE (DECL_CHAIN (TYPE_FIELDS (new_ptr)))));
 
       update_pointer_to (TYPE_OBJECT_RECORD_TYPE (old_type),
@@ -5259,12 +5238,27 @@ convert (tree type, tree expr)
 	      : size_zero_node;
 	  tree byte_diff = size_diffop (type_pos, etype_pos);
 
-	  expr = build1 (NOP_EXPR, type, expr);
+	  expr = fold_convert (type, expr);
 	  if (integer_zerop (byte_diff))
 	    return expr;
 
 	  return build_binary_op (POINTER_PLUS_EXPR, type, expr,
 				  fold_convert (sizetype, byte_diff));
+	}
+
+      /* If converting from a thin pointer with zero offset from the base to
+	 a pointer to the array, add the offset of the array field.  */
+      if (TYPE_IS_THIN_POINTER_P (etype)
+	  && !TYPE_UNCONSTRAINED_ARRAY (TREE_TYPE (etype)))
+	{
+	  tree arr_field = DECL_CHAIN (TYPE_FIELDS (TREE_TYPE (etype)));
+
+	  if (TREE_TYPE (type) == TREE_TYPE (arr_field))
+	    {
+	      expr = fold_convert (type, expr);
+	      return build_binary_op (POINTER_PLUS_EXPR, type, expr,
+				      byte_position (arr_field));
+	    }
 	}
 
       /* If converting fat pointer to normal or thin pointer, get the pointer

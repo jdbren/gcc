@@ -4774,10 +4774,6 @@ that element as the canonical location and ignore the others.  The m68k
 port uses this type of @code{parallel} to return pointers in both
 @samp{%a0} (the canonical location) and @samp{%d0}.
 
-If @code{TARGET_PROMOTE_FUNCTION_RETURN} returns true, you must apply
-the same promotion rules specified in @code{PROMOTE_MODE} if
-@var{valtype} is a scalar type.
-
 If the precise function being called is known, @var{func} is a tree
 node (@code{FUNCTION_DECL}) for it; otherwise, @var{func} is a null
 pointer.  This makes it possible to use a different value-returning
@@ -6386,12 +6382,14 @@ return type of the vectorized function shall be of vector type
 @var{vec_type_out} and the argument types should be @var{vec_type_in}.
 @end deftypefn
 
-@deftypefn {Target Hook} bool TARGET_VECTORIZE_SUPPORT_VECTOR_MISALIGNMENT (machine_mode @var{mode}, const_tree @var{type}, int @var{misalignment}, bool @var{is_packed})
+@deftypefn {Target Hook} bool TARGET_VECTORIZE_SUPPORT_VECTOR_MISALIGNMENT (machine_mode @var{mode}, const_tree @var{type}, int @var{misalignment}, bool @var{is_packed}, bool @var{is_gather_scatter})
 This hook should return true if the target supports misaligned vector
 store/load of a specific factor denoted in the @var{misalignment}
 parameter.  The vector store/load should be of machine mode @var{mode} and
-the elements in the vectors should be of type @var{type}.  @var{is_packed}
-parameter is true if the memory access is defined in a packed struct.
+the elements in the vectors should be of type @var{type}.  The
+@var{is_packed} parameter is true if the misalignment is unknown and the
+memory access is defined in a packed struct.  @var{is_gather_scatter} is true
+if the load/store is a gather or scatter.
 @end deftypefn
 
 @deftypefn {Target Hook} machine_mode TARGET_VECTORIZE_PREFERRED_SIMD_MODE (scalar_mode @var{mode})

@@ -1158,12 +1158,18 @@ validate_arglist (const_tree callexpr, ...)
 	unsigned int idx = TREE_INT_CST_LOW (TREE_VALUE (args)) - 1;
 	unsigned int idx2
 	  = TREE_INT_CST_LOW (TREE_VALUE (TREE_CHAIN (args))) - 1;
+	unsigned int idx3 = idx2;
+	if (tree chain2 = TREE_CHAIN (TREE_CHAIN (args)))
+	  idx3 = TREE_INT_CST_LOW (TREE_VALUE (chain2)) - 1;
 	if (idx < (unsigned) call_expr_nargs (callexpr)
 	    && idx2 < (unsigned) call_expr_nargs (callexpr)
+	    && idx3 < (unsigned) call_expr_nargs (callexpr)
 	    && POINTER_TYPE_P (TREE_TYPE (CALL_EXPR_ARG (callexpr, idx)))
 	    && integer_zerop (CALL_EXPR_ARG (callexpr, idx))
 	    && INTEGRAL_TYPE_P (TREE_TYPE (CALL_EXPR_ARG (callexpr, idx2)))
-	    && integer_nonzerop (CALL_EXPR_ARG (callexpr, idx2)))
+	    && integer_nonzerop (CALL_EXPR_ARG (callexpr, idx2))
+	    && INTEGRAL_TYPE_P (TREE_TYPE (CALL_EXPR_ARG (callexpr, idx3)))
+	    && integer_nonzerop (CALL_EXPR_ARG (callexpr, idx3)))
 	  return false;
       }
 
@@ -1640,8 +1646,7 @@ expand_builtin_apply_args (void)
 
     start_sequence ();
     temp = expand_builtin_apply_args_1 ();
-    rtx_insn *seq = get_insns ();
-    end_sequence ();
+    rtx_insn *seq = end_sequence ();
 
     apply_args_value = temp;
 
@@ -1863,8 +1868,7 @@ expand_builtin_return (rtx result)
 
 	push_to_sequence (call_fusage);
 	emit_use (reg);
-	call_fusage = get_insns ();
-	end_sequence ();
+	call_fusage = end_sequence ();
 	size += GET_MODE_SIZE (mode);
       }
 
@@ -2373,8 +2377,7 @@ expand_builtin_mathfn_ternary (tree exp, rtx target, rtx subtarget)
     }
 
   /* Output the entire sequence.  */
-  insns = get_insns ();
-  end_sequence ();
+  insns = end_sequence ();
   emit_insn (insns);
 
   return result;
@@ -2466,8 +2469,7 @@ expand_builtin_mathfn_3 (tree exp, rtx target, rtx subtarget)
       if (result != 0)
 	{
 	  /* Output the entire sequence.  */
-	  insns = get_insns ();
-	  end_sequence ();
+	  insns = end_sequence ();
 	  emit_insn (insns);
 	  return result;
 	}
@@ -3164,8 +3166,7 @@ expand_builtin_int_roundingfn (tree exp, rtx target)
   if (expand_sfix_optab (target, op0, builtin_optab))
     {
       /* Output the entire sequence.  */
-      insns = get_insns ();
-      end_sequence ();
+      insns = end_sequence ();
       emit_insn (insns);
       return target;
     }
@@ -3308,8 +3309,7 @@ expand_builtin_int_roundingfn_2 (tree exp, rtx target)
       if (expand_sfix_optab (result, op0, builtin_optab))
 	{
 	  /* Output the entire sequence.  */
-	  insns = get_insns ();
-	  end_sequence ();
+	  insns = end_sequence ();
 	  emit_insn (insns);
 	  return result;
 	}
@@ -3477,8 +3477,7 @@ expand_builtin_strlen (tree exp, rtx target,
 #endif
       emit_move_insn (src_reg, pat);
     }
-  pat = get_insns ();
-  end_sequence ();
+  pat = end_sequence ();
 
   if (before_strlen)
     emit_insn_after (pat, before_strlen);
@@ -3536,7 +3535,8 @@ expand_builtin_strnlen (tree exp, rtx target, machine_mode target_mode)
 
   wide_int min, max;
   int_range_max r;
-  get_global_range_query ()->range_of_expr (r, bound);
+  get_range_query (cfun)->range_of_expr (r, bound,
+					 currently_expanding_gimple_stmt);
   if (r.varying_p () || r.undefined_p ())
     return NULL_RTX;
   min = r.lower_bound ();
@@ -3611,7 +3611,8 @@ determine_block_size (tree len, rtx len_rtx,
 	{
 	  int_range_max r;
 	  tree tmin, tmax;
-	  get_global_range_query ()->range_of_expr (r, len);
+	  gimple *cg = currently_expanding_gimple_stmt;
+	  get_range_query (cfun)->range_of_expr (r, len, cg);
 	  range_type = get_legacy_range (r, tmin, tmax);
 	  if (range_type != VR_UNDEFINED)
 	    {
@@ -5183,8 +5184,7 @@ expand_builtin_saveregs (void)
   /* Do whatever the machine needs done in this case.  */
   val = targetm.calls.expand_builtin_saveregs ();
 
-  seq = get_insns ();
-  end_sequence ();
+  seq = end_sequence ();
 
   saveregs_value = val;
 
@@ -7624,8 +7624,7 @@ inline_string_cmp (rtx target, tree var_str, const char *const_str,
     }
 
   emit_label (ne_label);
-  rtx_insn *insns = get_insns ();
-  end_sequence ();
+  rtx_insn *insns = end_sequence ();
   emit_insn (insns);
 
   return result;
@@ -7800,11 +7799,17 @@ expand_builtin_crc_table_based (internal_fn fn, scalar_mode crc_mode,
 
   rtx op1 = expand_normal (rhs1);
   rtx op2 = expand_normal (rhs2);
-  gcc_assert (TREE_CODE (rhs3) == INTEGER_CST);
-  rtx op3 = gen_int_mode (TREE_INT_CST_LOW (rhs3), crc_mode);
+  rtx op3;
+  if (TREE_CODE (rhs3) != INTEGER_CST)
+    {
+      error ("third argument to %<crc%> builtins must be a constant");
+      op3 = const0_rtx;
+    }
+  else
+    op3 = convert_to_mode (crc_mode, expand_normal (rhs3), 0);
 
   if (CONST_INT_P (op2))
-    op2 = gen_int_mode (INTVAL (op2), crc_mode);
+    op2 = convert_to_mode (crc_mode, op2, 0);
 
   if (fn == IFN_CRC)
     expand_crc_table_based (target, op1, op2, op3, data_mode);

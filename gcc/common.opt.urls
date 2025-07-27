@@ -31,8 +31,9 @@ UrlSuffix(gcc/Optimize-Options.html#index-Og)
 Oz
 UrlSuffix(gcc/Optimize-Options.html#index-Oz)
 
-Q
-UrlSuffix(gcc/Developer-Options.html#index-Q)
+; skipping UrlSuffix for 'Q' due to multiple URLs:
+;   duplicate: 'gcc/Developer-Options.html#index-Q-1'
+;   duplicate: 'gcc/Overall-Options.html#index-Q'
 
 Qn
 UrlSuffix(gcc/System-V-Options.html#index-Qn)
@@ -62,6 +63,9 @@ UrlSuffix(gcc/Warning-Options.html#index-Warray-bounds)
 
 Warray-bounds=
 UrlSuffix(gcc/Warning-Options.html#index-Warray-bounds)
+
+Wauto-profile
+UrlSuffix(gcc/Warning-Options.html#index-Wauto-profile)
 
 Wuse-after-free
 UrlSuffix(gcc/Warning-Options.html#index-Wno-use-after-free)
@@ -156,6 +160,12 @@ UrlSuffix(gcc/Warning-Options.html#index-Wno-unsafe-loop-optimizations)
 
 Wmissing-noreturn
 UrlSuffix(gcc/Warning-Options.html#index-Wmissing-noreturn)
+
+Wmusttail-local-addr
+UrlSuffix(gcc/Warning-Options.html#index-Wmusttail-local-addr)
+
+Wmaybe-musttail-local-addr
+UrlSuffix(gcc/Warning-Options.html#index-Wmaybe-musttail-local-addr)
 
 Wodr
 UrlSuffix(gcc/Warning-Options.html#index-Wno-odr)
@@ -262,7 +272,13 @@ UrlSuffix(gcc/Warning-Options.html#index-Wno-unused)
 Wunused-but-set-parameter
 UrlSuffix(gcc/Warning-Options.html#index-Wno-unused-but-set-parameter)
 
+Wunused-but-set-parameter=
+UrlSuffix(gcc/Warning-Options.html#index-Wno-unused-but-set-parameter)
+
 Wunused-but-set-variable
+UrlSuffix(gcc/Warning-Options.html#index-Wno-unused-but-set-variable)
+
+Wunused-but-set-variable=
 UrlSuffix(gcc/Warning-Options.html#index-Wno-unused-but-set-variable)
 
 Wunused-function
@@ -426,6 +442,9 @@ UrlSuffix(gcc/Optimize-Options.html#index-fauto-profile)
 fauto-profile=
 UrlSuffix(gcc/Optimize-Options.html#index-fauto-profile)
 
+fauto-profile-inlining
+UrlSuffix(gcc/Optimize-Options.html#index-fauto-profile-inlining)
+
 fbounds-check
 LangUrlSuffix_D(gdc/Runtime-Options.html#index-fbounds-check) LangUrlSuffix_Fortran(gfortran/Code-Gen-Options.html#index-fbounds-check)
 
@@ -494,6 +513,9 @@ UrlSuffix(gcc/Optimize-Options.html#index-fcse-follow-jumps)
 
 fcse-skip-blocks
 UrlSuffix(gcc/Optimize-Options.html#index-fcse-skip-blocks)
+
+fcx-method=
+UrlSuffix(gcc/Optimize-Options.html#index-fcx-method)
 
 fcx-limited-range
 UrlSuffix(gcc/Optimize-Options.html#index-fcx-limited-range)
@@ -861,6 +883,9 @@ UrlSuffix(gcc/Optimize-Options.html#index-fipa-bit-cp)
 
 fipa-modref
 UrlSuffix(gcc/Optimize-Options.html#index-fipa-modref)
+
+fipa-reorder-for-locality
+UrlSuffix(gcc/Optimize-Options.html#index-fipa-reorder-for-locality)
 
 fipa-profile
 UrlSuffix(gcc/Optimize-Options.html#index-fipa-profile)
@@ -1452,6 +1477,9 @@ UrlSuffix(gcc/Optimize-Options.html#index-ftree-coalesce-vars)
 
 ftree-copy-prop
 UrlSuffix(gcc/Optimize-Options.html#index-ftree-copy-prop)
+
+ftree-cselim
+UrlSuffix(gcc/Optimize-Options.html#index-ftree-cselim)
 
 ftree-switch-conversion
 UrlSuffix(gcc/Optimize-Options.html#index-ftree-switch-conversion)

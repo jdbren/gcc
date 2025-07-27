@@ -1169,6 +1169,8 @@ extern const char *cpp_probe_header_unit (cpp_reader *, const char *file,
 extern const char *cpp_get_narrow_charset_name (cpp_reader *) ATTRIBUTE_PURE;
 extern const char *cpp_get_wide_charset_name (cpp_reader *) ATTRIBUTE_PURE;
 
+extern location_t cpp_get_diagnostic_override_loc (const cpp_reader *);
+
 /* This function reads the file, but does not start preprocessing.  It
    returns the name of the original file; this is the same as the
    input file, except for preprocessed input.  This will generate at
@@ -1608,7 +1610,8 @@ struct cpp_decoded_char
    This is a tabstop value, along with a callback for getting the
    widths of characters.  Normally this callback is cpp_wcwidth, but we
    support other schemes for escaping non-ASCII unicode as a series of
-   ASCII chars when printing the user's source code in diagnostic-show-locus.cc
+   ASCII chars when printing the user's source code in
+   gcc/diagnostics/source-printing.cc
 
    For example, consider:
    - the Unicode character U+03C0 "GREEK SMALL LETTER PI" (UTF-8: 0xCF 0x80)

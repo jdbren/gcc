@@ -1,3 +1,78 @@
+2025-07-25  David Malcolm  <dmalcolm@redhat.com>
+
+	* charset.cc: Update comment for file rename.
+
+2025-07-25  David Malcolm  <dmalcolm@redhat.com>
+
+	* internal.h: Update comment for diagnostic_t becoming
+	enum class diagnostics::kind.
+
+2025-07-25  David Malcolm  <dmalcolm@redhat.com>
+
+	* include/cpplib.h: Update for moves to "source-printing".
+	* include/rich-location.h (class label_effects): Move to...
+	(class diagnostics::label_effects): ...here.
+
+2025-07-25  David Malcolm  <dmalcolm@redhat.com>
+
+	* include/rich-location.h: Replace diagnostic_path with
+	diagnostics::paths::path.
+
+2025-06-17  Jason Merrill  <jason@redhat.com>
+
+	* line-map.cc (linemap_location_from_module_p): Add.
+	* include/line-map.h: Declare it.
+
+2025-06-11  David Malcolm  <dmalcolm@redhat.com>
+
+	PR other/116792
+	* include/line-map.h (typedef expanded_location): Convert to...
+	(struct expanded_location): ...this.
+	(operator==): New decl, for expanded_location.
+	(operator!=): Likewise.
+	* line-map.cc (operator==): New decl, for expanded_location.
+
+2025-05-07  Jakub Jelinek  <jakub@redhat.com>
+
+	PR preprocessor/108900
+	PR preprocessor/116047
+	PR preprocessor/120061
+	* files.cc (_cpp_stack_file): Revert 2025-03-28 change.
+	* line-map.cc (linemap_add): Use
+	SOURCE_LINE (from, linemap_included_from (map - 1)) + 1; instead of
+	SOURCE_LINE (from, from[1].start_location); to compute to_line
+	for LC_LEAVE.  For LC_ENTER included_from computation, look at
+	map[-2] or even lower if map[-1] has the same start_location as
+	map[0].
+
+2025-04-28  Lewis Hyatt  <lhyatt@gmail.com>
+
+	PR c/118838
+	* errors.cc (cpp_get_diagnostic_override_loc): New function.
+	* include/cpplib.h (cpp_get_diagnostic_override_loc): Declare.
+
+2025-04-24  Jakub Jelinek  <jakub@redhat.com>
+
+	PR c++/110343
+	* lex.cc (lex_raw_string): For C allow $@` in raw string delimiters
+	if CPP_OPTION (pfile, low_ucns) i.e. for C23 and later.
+
+2025-04-09  Jakub Jelinek  <jakub@redhat.com>
+
+	PR preprocessor/118674
+	* macro.cc (parse_params) <case CPP_ELLIPSIS>: If _cpp_save_parameter
+	failed for __VA_ARGS__, goto out.
+
+2025-04-04  Jakub Jelinek  <jakub@redhat.com>
+
+	PR preprocessor/119391
+	* expr.cc (num_lshift): Add pfile argument.  Don't set num.overflow
+	for !num.unsignedp in C++20 or later unless n >= precision.  For
+	C++11 to C++17 set it if orig >> (precision - 1 - n) as logical
+	shift results in value > 1.
+	(num_binary_op): Pass pfile to num_lshift.
+	(num_div_op): Likewise.
+
 2025-03-28  Jeremy Bettis  <jbettis@google.com>
 
 	PR preprocessor/108900

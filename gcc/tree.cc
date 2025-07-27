@@ -32,6 +32,8 @@ along with GCC; see the file COPYING3.  If not see
 #include "coretypes.h"
 #include "backend.h"
 #include "target.h"
+#include "memmodel.h"
+#include "tm_p.h"
 #include "tree.h"
 #include "gimple.h"
 #include "tree-pass.h"
@@ -326,6 +328,7 @@ unsigned const char omp_clause_num_ops[] =
   2, /* OMP_CLAUSE_MAP  */
   1, /* OMP_CLAUSE_HAS_DEVICE_ADDR  */
   1, /* OMP_CLAUSE_DOACROSS  */
+  3, /* OMP_CLAUSE__MAPPER_BINDING_  */
   2, /* OMP_CLAUSE__CACHE_  */
   1, /* OMP_CLAUSE_DESTROY  */
   2, /* OMP_CLAUSE_INIT  */
@@ -428,6 +431,7 @@ const char * const omp_clause_code_name[] =
   "map",
   "has_device_addr",
   "doacross",
+  "_mapper_binding_",
   "_cache_",
   "destroy",
   "init",
@@ -786,6 +790,57 @@ init_ttree (void)
 }
 
 
+/* Mapping from prefix to label number.  */
+
+struct identifier_hash : ggc_ptr_hash <tree_node>
+{
+  static inline hashval_t hash (tree t)
+  {
+    return IDENTIFIER_HASH_VALUE (t);
+  }
+};
+struct identifier_count_traits
+  : simple_hashmap_traits<identifier_hash, long> {};
+typedef hash_map<tree, long, identifier_count_traits> internal_label_map;
+static GTY(()) internal_label_map *internal_label_nums;
+
+/* Generates an identifier intended to be used internally with the
+   given PREFIX.  This is intended to be used by the frontend so that
+   C++ modules can regenerate appropriate (non-clashing) identifiers on
+   stream-in.  */
+
+tree
+generate_internal_label (const char *prefix)
+{
+  tree prefix_id = get_identifier (prefix);
+  if (!internal_label_nums)
+    internal_label_nums = internal_label_map::create_ggc();
+  long &num = internal_label_nums->get_or_insert (prefix_id);
+
+  char tmp[32];
+  ASM_GENERATE_INTERNAL_LABEL (tmp, prefix, num++);
+
+  tree id = get_identifier (tmp);
+  IDENTIFIER_INTERNAL_P (id) = true;
+
+  /* Cache the prefix on the identifier so we can retrieve it later.  */
+  TREE_CHAIN (id) = prefix_id;
+
+  return id;
+}
+
+/* Get the PREFIX we created the internal identifier LABEL with.  */
+
+const char *
+prefix_for_internal_label (tree label)
+{
+  gcc_assert (IDENTIFIER_INTERNAL_P (label)
+	      && !IDENTIFIER_TRANSPARENT_ALIAS (label)
+	      && TREE_CHAIN (label)
+	      && TREE_CODE (TREE_CHAIN (label)) == IDENTIFIER_NODE);
+  return IDENTIFIER_POINTER (TREE_CHAIN (label));
+}
+
 /* The name of the object as the assembler will see it (but before any
    translations made by ASM_OUTPUT_LABELREF).  Often this is the same
    as DECL_NAME.  It is an IDENTIFIER_NODE.  */
@@ -3962,6 +4017,38 @@ decl_address_ip_invariant_p (const_tree op)
   return false;
 }
 
+/* Return true if T is an object with invariant address.  */
+
+bool
+address_invariant_p (tree t)
+{
+  while (handled_component_p (t))
+    {
+      switch (TREE_CODE (t))
+	{
+	case ARRAY_REF:
+	case ARRAY_RANGE_REF:
+	  if (!tree_invariant_p (TREE_OPERAND (t, 1))
+	      || TREE_OPERAND (t, 2) != NULL_TREE
+	      || TREE_OPERAND (t, 3) != NULL_TREE)
+	    return false;
+	  break;
+
+	case COMPONENT_REF:
+	  if (TREE_OPERAND (t, 2) != NULL_TREE)
+	    return false;
+	  break;
+
+	default:
+	  break;
+	}
+      t = TREE_OPERAND (t, 0);
+    }
+
+  STRIP_ANY_LOCATION_WRAPPER (t);
+  return CONSTANT_CLASS_P (t) || decl_address_invariant_p (t);
+}
+
 
 /* Return true if T is function-invariant (internal function, does
    not handle arithmetic; that's handled in skip_simple_arithmetic and
@@ -3970,10 +4057,7 @@ decl_address_ip_invariant_p (const_tree op)
 static bool
 tree_invariant_p_1 (tree t)
 {
-  tree op;
-
-  if (TREE_CONSTANT (t)
-      || (TREE_READONLY (t) && !TREE_SIDE_EFFECTS (t)))
+  if (TREE_CONSTANT (t) || (TREE_READONLY (t) && !TREE_SIDE_EFFECTS (t)))
     return true;
 
   switch (TREE_CODE (t))
@@ -3983,30 +4067,7 @@ tree_invariant_p_1 (tree t)
       return true;
 
     case ADDR_EXPR:
-      op = TREE_OPERAND (t, 0);
-      while (handled_component_p (op))
-	{
-	  switch (TREE_CODE (op))
-	    {
-	    case ARRAY_REF:
-	    case ARRAY_RANGE_REF:
-	      if (!tree_invariant_p (TREE_OPERAND (op, 1))
-		  || TREE_OPERAND (op, 2) != NULL_TREE
-		  || TREE_OPERAND (op, 3) != NULL_TREE)
-		return false;
-	      break;
-
-	    case COMPONENT_REF:
-	      if (TREE_OPERAND (op, 2) != NULL_TREE)
-		return false;
-	      break;
-
-	    default:;
-	    }
-	  op = TREE_OPERAND (op, 0);
-	}
-
-      return CONSTANT_CLASS_P (op) || decl_address_invariant_p (op);
+      return address_invariant_p (TREE_OPERAND (t, 0));
 
     default:
       break;
@@ -8769,20 +8830,6 @@ tree_builtin_call_types_compatible_p (const_tree call, tree fndecl)
 	      && POINTER_TYPE_P (type)
 	      && POINTER_TYPE_P (TREE_TYPE (arg))
 	      && tree_nop_conversion_p (type, TREE_TYPE (arg)))
-	    continue;
-	  /* char/short integral arguments are promoted to int
-	     by several frontends if targetm.calls.promote_prototypes
-	     is true.  Allow such promotion too.  */
-	  if (INTEGRAL_TYPE_P (type)
-	      && TYPE_PRECISION (type) < TYPE_PRECISION (integer_type_node)
-	      && INTEGRAL_TYPE_P (TREE_TYPE (arg))
-	      && !TYPE_UNSIGNED (TREE_TYPE (arg))
-	      && targetm.calls.promote_prototypes (TREE_TYPE (fndecl))
-	      && (gimple_form
-		  ? useless_type_conversion_p (integer_type_node,
-					       TREE_TYPE (arg))
-		  : tree_nop_conversion_p (integer_type_node,
-					   TREE_TYPE (arg))))
 	    continue;
 	  return false;
 	}
@@ -14625,10 +14672,11 @@ verify_type (const_tree t)
 
 /* Return 1 if ARG interpreted as signed in its precision is known to be
    always non-negative or 2 if ARG is known to be always negative, or 3 if
-   ARG may be non-negative or negative.  */
+   ARG may be non-negative or negative.  STMT if specified is the statement
+   on which it is being tested.  */
 
 int
-get_range_pos_neg (tree arg)
+get_range_pos_neg (tree arg, gimple *stmt)
 {
   if (arg == error_mark_node)
     return 3;
@@ -14661,7 +14709,7 @@ get_range_pos_neg (tree arg)
   if (TREE_CODE (arg) != SSA_NAME)
     return 3;
   int_range_max r;
-  while (!get_global_range_query ()->range_of_expr (r, arg)
+  while (!get_range_query (cfun)->range_of_expr (r, arg, stmt)
 	 || r.undefined_p () || r.varying_p ())
     {
       gimple *g = SSA_NAME_DEF_STMT (arg);
@@ -15370,6 +15418,65 @@ get_target_clone_attr_len (tree arglist)
   if (argnum <= 1)
     return -1;
   return str_len_sum;
+}
+
+/* Returns an auto_vec of string_slices containing the version strings from
+   ARGLIST.  DEFAULT_COUNT is incremented for each default version found.  */
+
+auto_vec<string_slice>
+get_clone_attr_versions (const tree arglist, int *default_count)
+{
+  gcc_assert (TREE_CODE (arglist) == TREE_LIST);
+  auto_vec<string_slice> versions;
+
+  static const char separator_str[] = {TARGET_CLONES_ATTR_SEPARATOR, 0};
+  string_slice separators = string_slice (separator_str);
+
+  for (tree arg = arglist; arg; arg = TREE_CHAIN (arg))
+    {
+      string_slice str = string_slice (TREE_STRING_POINTER (TREE_VALUE (arg)));
+      while (str.is_valid ())
+	{
+	  string_slice attr = string_slice::tokenize (&str, separators);
+	  attr = attr.strip ();
+
+	  if (attr == "default" && default_count)
+	    (*default_count)++;
+	  versions.safe_push (attr);
+	}
+    }
+  return versions;
+}
+
+/* Returns an auto_vec of string_slices containing the version strings from
+   the target_clone attribute from DECL.  DEFAULT_COUNT is incremented for each
+   default version found.  */
+auto_vec<string_slice>
+get_clone_versions (const tree decl, int *default_count)
+{
+  tree attr = lookup_attribute ("target_clones", DECL_ATTRIBUTES (decl));
+  if (!attr)
+    return auto_vec<string_slice> ();
+  tree arglist = TREE_VALUE (attr);
+  return get_clone_attr_versions (arglist, default_count);
+}
+
+/* If DECL has a target_version attribute, returns a string_slice containing the
+   attribute value.  Otherwise, returns string_slice::invalid.
+   Only works for target_version due to target attributes allowing multiple
+   string arguments to specify one target.  */
+string_slice
+get_target_version (const tree decl)
+{
+  gcc_assert (!TARGET_HAS_FMV_TARGET_ATTRIBUTE);
+
+  tree attr = lookup_attribute ("target_version", DECL_ATTRIBUTES (decl));
+
+  if (!attr)
+    return string_slice::invalid ();
+
+  return string_slice (TREE_STRING_POINTER (TREE_VALUE (TREE_VALUE (attr))))
+	   .strip ();
 }
 
 void

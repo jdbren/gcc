@@ -1,3 +1,376 @@
+2025-07-25  David Malcolm  <dmalcolm@redhat.com>
+
+	* c-errors.cc: Update usage of "diagnostic_info" to explicitly
+	refer to "diagnostics::diagnostic_info".
+
+2025-07-25  David Malcolm  <dmalcolm@redhat.com>
+
+	* c-errors.cc: Update for diagnostic_t becoming
+	enum class diagnostics::kind.
+	* c-parser.cc: Likewise.
+	* c-typeck.cc: Likewise.
+
+2025-07-25  David Malcolm  <dmalcolm@redhat.com>
+
+	* c-decl.cc: Update for renaming of diagnostic_option_id to
+	diagnostics::option_id.
+	* c-errors.cc: Likewise.
+	* c-tree.h: Likewise.
+
+2025-07-25  David Malcolm  <dmalcolm@redhat.com>
+
+	* c-objc-common.cc: Update for diagnostic_context becoming
+	diagnostics::context.
+	* c-tree.h: Likewise.
+
+2025-07-25  David Malcolm  <dmalcolm@redhat.com>
+
+	* c-errors.cc: Update to add "m_" prefix to fields of
+	diagnostic_info throughout.
+
+2025-07-21  Stefan Schulze Frielinghaus  <stefansf@gcc.gnu.org>
+
+	* c-typeck.cc (build_asm_expr): Pass null pointer to
+	parse_{input,output}_constraint().
+
+2025-07-16  Kwok Cheung Yeung  <kcyeung@baylibre.com>
+
+	* c-typeck.cc (handle_omp_array_sections): Use OMP_ITERATOR_DECL_P.
+	(c_finish_omp_clauses): Likewise.
+
+2025-07-15  Jakub Jelinek  <jakub@redhat.com>
+	    Jason Merrill  <jason@redhat.com>
+
+	PR c/44677
+	* c-parser.cc (c_parser_unary_expression): Clear DECL_READ_P
+	after default_function_array_read_conversion for
+	-Wunused-but-set-{parameter,variable}={2,3} on
+	PRE{IN,DE}CREMENT_EXPR argument.
+	(c_parser_postfix_expression_after_primary): Similarly for
+	POST{IN,DE}CREMENT_EXPR.
+	* c-decl.cc (pop_scope): Use OPT_Wunused_but_set_variable_
+	instead of OPT_Wunused_but_set_variable.
+	(finish_function): Use OPT_Wunused_but_set_parameter_
+	instead of OPT_Wunused_but_set_parameter.
+	* c-typeck.cc (mark_exp_read): Handle {PRE,POST}{IN,DE}CREMENT_EXPR
+	and don't handle it when cast to void.
+	(build_modify_expr): Clear DECL_READ_P after build_binary_op
+	for -Wunused-but-set-{parameter,variable}=3.
+
+2025-07-10  Qing Zhao  <qing.zhao@oracle.com>
+
+	* c-typeck.cc (build_access_with_size_for_counted_by): Update comments.
+	Adjust the arguments per the new design.
+
+2025-07-10  Qing Zhao  <qing.zhao@oracle.com>
+
+	PR middle-end/121000
+	* c-typeck.cc (build_access_with_size_for_counted_by): Update comments.
+	Pass TYPE_SIZE_UNIT of the element as the 6th argument.
+
+2025-07-07  Qing Zhao  <qing.zhao@oracle.com>
+
+	Revert:
+	2025-07-07  Qing Zhao  <qing.zhao@oracle.com>
+
+	* c-decl.cc (verify_counted_by_attribute): Change the 2nd argument
+	to a vector of fields with counted_by attribute. Verify all fields
+	in this vector.
+	(finish_struct): Collect all the fields with counted_by attribute
+	to a vector and pass this vector to verify_counted_by_attribute.
+	* c-typeck.cc (build_counted_by_ref): Handle pointers with counted_by.
+	Add one more argument, issue error when the pointee type is a structure
+	or union including a flexible array member.
+	(build_access_with_size_for_counted_by): Handle pointers with counted_by.
+	(handle_counted_by_for_component_ref): Call build_counted_by_ref
+	with the new prototype.
+
+2025-07-01  Qing Zhao  <qing.zhao@oracle.com>
+
+	* c-decl.cc (verify_counted_by_attribute): Change the 2nd argument
+	to a vector of fields with counted_by attribute. Verify all fields
+	in this vector.
+	(finish_struct): Collect all the fields with counted_by attribute
+	to a vector and pass this vector to verify_counted_by_attribute.
+	* c-typeck.cc (build_counted_by_ref): Handle pointers with counted_by.
+	Add one more argument, issue error when the pointee type is a structure
+	or union including a flexible array member.
+	(build_access_with_size_for_counted_by): Handle pointers with counted_by.
+	(handle_counted_by_for_component_ref): Call build_counted_by_ref
+	with the new prototype.
+
+2025-06-23  Tobias Burnus  <tburnus@baylibre.com>
+
+	* c-parser.cc (OACC_WAIT_CLAUSE_MASK): Add if clause.
+
+2025-06-12  Jakub Jelinek  <jakub@redhat.com>
+
+	* c-lang.h (union lang_type::maybe_objc_info): New type.
+	(struct lang_type): Use union maybe_objc_info info member
+	instead of tree objc_info.
+	* c-decl.cc (finish_struct): Allocate struct lang_type using
+	ggc_internal_cleared_alloc instead of ggc_cleared_alloc,
+	and use sizeof (struct lang_type) for ObjC and otherwise
+	offsetof (struct lang_type, info) as size.
+	(finish_enum): Likewise.
+
+2025-06-11  Martin Uecker  <uecker@tugraz.at>
+
+	PR c/120510
+	* c-typeck.cc (composite_type_internal): Activate checking
+	assertions for all types and also inputs.
+	(comptypes_for_composite_check): New helper function.
+	(function_types_compatible_p): Add exception.
+
+2025-06-11  Martin Uecker  <uecker@tugraz.at>
+
+	* c-typeck.cc (function_types_compatible_p): Remove unused
+	variables and return true/false instead of 1/0.
+	(type_lists_compatible_p): Return false instead of 0.
+
+2025-06-11  Martin Uecker  <uecker@tugraz.at>
+
+	PR c/120303
+	* c-parser.cc (c_parser_generic_selection): Handle error
+	condition.
+
+2025-06-09  Martin Uecker  <uecker@tugraz.at>
+
+	PR c/120510
+	* c-typeck.cc (remove_qualifiers): New function.
+	(composite_type_internal): Use it.
+	(comp_target_types): Use it.
+	(type_lists_compatible_p): Use it.
+	(find_anonymous_field_with_type): Use it.
+	(convert_to_anonymous_field): Use it.
+	(convert_for_assignment): Use it.
+
+2025-06-09  Martin Uecker  <uecker@tugraz.at>
+
+	PR c/120510
+	* c-typeck.cc (composite_type_internal): Activate checking
+	assertion for arrays.
+	(common_pointer_type): Remove qualifiers also from arrays.
+
+2025-06-09  Martin Uecker  <uecker@tugraz.at>
+
+	PR c/120510
+	* c-typeck.cc (composite_types_internal): Handle arrays
+	declared with atomic for function arguments.
+
+2025-06-03  Martin Uecker  <uecker@tugraz.at>
+
+	* c-typeck.cc (composite_type_internal,composite_type): Move
+	checking assertions.
+
+2025-06-03  Martin Uecker  <uecker@tugraz.at>
+
+	PR c/116892
+	* c-decl.cc (finish_enum): Propagate TYPE_PACKED.
+
+2025-06-02  Sandra Loosemore  <sloosemore@baylibre.com>
+
+	* c-parser.cc (c_parser_omp_context_selector): Call
+	convert_lvalue_to_rvalue and c_objc_common_truthvalue_conversion
+	on the expression for OMP_TRAIT_PROPERTY_BOOL_EXPR.
+
+2025-06-01  Martin Uecker  <uecker@tugraz.at>
+
+	PR c/120380
+	* c-objc-common.cc (get_aka_type): Ignore attributes for tagged types.
+
+2025-05-30  Qing Zhao  <qing.zhao@oracle.com>
+
+	PR c/120354
+	* c-decl.cc (finish_struct): Or the results for TYPE_INCLUDES_FLEXARRAY.
+
+2025-05-30  Qing Zhao  <qing.zhao@oracle.com>
+
+	PR c/120353
+	* c-decl.cc (finish_struct): Copy TYPE_INCLUDES_FLEXARRAY marking
+	to all the variant types of the current structure type.
+
+2025-05-30  Julian Brown  <julian@codesourcery.com>
+
+	* c-decl.cc (c_omp_mapper_id, c_omp_mapper_decl, c_omp_mapper_lookup,
+	c_omp_extract_mapper_directive, c_omp_map_array_section,
+	c_omp_scan_mapper_bindings_r, c_omp_scan_mapper_bindings): New
+	functions.
+	* c-objc-common.h (LANG_HOOKS_OMP_FINISH_MAPPER_CLAUSES,
+	LANG_HOOKS_OMP_MAPPER_LOOKUP, LANG_HOOKS_OMP_EXTRACT_MAPPER_DIRECTIVE,
+	LANG_HOOKS_OMP_MAP_ARRAY_SECTION): Define langhooks for C.
+	* c-parser.cc (c_parser_omp_clause_map): Add declare_mapper_p
+	parameter; handle mapper modifier.
+	(c_parser_omp_all_clauses): Update call to c_parser_omp_clause_map.
+	(c_parser_omp_target): Instantiate explicit mappers and record bindings
+	for implicit mappers.
+	(c_parser_omp_declare_mapper): Parse "declare mapper" directives.
+	(c_parser_omp_declare): Support "declare mapper".
+	(c_parser_omp_declare_reduction): Use inform not error_at.
+	* c-tree.h (c_omp_finish_mapper_clauses, c_omp_mapper_lookup,
+	c_omp_extract_mapper_directive, c_omp_map_array_section,
+	c_omp_mapper_id, c_omp_mapper_decl, c_omp_scan_mapper_bindings,
+	c_omp_instantiate_mappers): Add prototypes.
+	* c-typeck.cc (c_finish_omp_clauses): Handle GOMP_MAP_PUSH_MAPPER_NAME
+	and GOMP_MAP_POP_MAPPER_NAME.
+	(c_omp_finish_mapper_clauses): New function (langhook).
+
+2025-05-30  Martin Uecker  <uecker@tugraz.at>
+
+	PR c/120381
+	* c-typeck.cc (composite_type_internal): Stop recursion for
+	swapped pairs.
+
+2025-05-29  Sandra Loosemore  <sloosemore@baylibre.com>
+
+	* c-parser.cc (c_parser_skip_to_closing_brace): New, copied from
+	the equivalent function in the C++ front end.
+	(c_parser_skip_to_end_of_block_or_statement): Pass false to
+	the error flag.
+	(c_parser_omp_context_selector): Immediately return error_mark_node
+	after giving an error that the integer trait property is invalid,
+	similarly to C++ front end.
+	(c_parser_omp_context_selector_specification): Likewise handle
+	error return from c_parser_omp_context_selector similarly to C++.
+	(c_parser_omp_metadirective): Do not call
+	c_parser_skip_to_end_of_block_or_statement after an error.
+
+2025-05-29  Sandra Loosemore  <sloosemore@baylibre.com>
+
+	PR c/120180
+	* c-parser.cc (c_parser_omp_metadirective): Only consume the
+	token if it is the expected close paren.
+
+2025-05-27  Jakub Jelinek  <jakub@redhat.com>
+
+	PR c/117025
+	* c-parser.cc (c_parser_sizeof_or_countof_expression): Use
+	C2Y rather than C23 in pedwarn_c23.
+
+2025-05-27  Alejandro Colomar  <alx@kernel.org>
+
+	PR c/117025
+	* c-parser.cc (c_parser_sizeof_or_countof_expression):
+	Add -Wpedantic diagnostic for _Countof in <= C23 mode.
+
+2025-05-27  Alejandro Colomar  <alx@kernel.org>
+	    Martin Uecker  <uecker@tugraz.at>
+
+	PR c/117025
+	* c-tree.h (in_countof): Add global variable declaration.
+	(c_expr_countof_expr): Add function prototype.
+	(c_expr_countof_type): Add function prototype.
+	* c-decl.cc (start_struct, finish_struct): Add support for
+	_Countof.
+	(start_enum, finish_enum): Add support for _Countof.
+	* c-parser.cc (c_parser_sizeof_expression): New macro.
+	(c_parser_countof_expression): New macro.
+	(c_parser_sizeof_or_countof_expression): Rename function and add
+	support for _Countof.
+	(c_parser_unary_expression): Add RID_COUNTOF entry.
+	* c-typeck.cc (in_countof): Add global variable.
+	(build_external_ref): Add support for _Countof.
+	(record_maybe_used_decl): Add support for _Countof.
+	(pop_maybe_used): Add support for _Countof.
+	(is_top_array_vla): New function.
+	(c_expr_countof_expr, c_expr_countof_type): New functions.
+
+2025-05-02  Jakub Jelinek  <jakub@redhat.com>
+
+	PR c/120057
+	* c-typeck.cc (check_constexpr_init): Handle RAW_DATA_CST.
+
+2025-05-02  Florian Weimer  <fweimer@redhat.com>
+
+	PR c/120055
+	* c-typeck.cc (convert_arguments): Check if fundecl is null
+	before checking for builtin function declaration.
+
+2025-05-01  Christopher Bazley  <chris.bazley@arm.com>
+
+	PR c/119317
+	* c-decl.cc (c_get_loop_names): Do not prematurely
+	end the search for a label that names a loop or
+	switch statement upon encountering a DEBUG_BEGIN_STMT.
+	Instead, ignore any instances of DEBUG_BEGIN_STMT.
+
+2025-05-01  Florian Weimer  <fweimer@redhat.com>
+
+	PR c/119950
+	* c-typeck.cc (convert_arguments): Check for built-in
+	function declaration before warning.
+
+2025-04-28  David Malcolm  <dmalcolm@redhat.com>
+
+	* c-decl.cc: Drop include of "make-unique.h".
+	Replace uses of ::make_unique with std::make_unique.
+	* c-objc-common.cc: Likewise.
+	* c-parser.cc: Likewise.
+
+2025-04-28  David Malcolm  <dmalcolm@redhat.com>
+
+	* c-decl.cc: Include "make-unique.h".
+	(lookup_name_fuzzy): Use ::make_unique rather than "new" when
+	making suggest_missing_header and suggest_missing_option.
+	* c-parser.cc: Include "make-unique.h"
+	(c_parser_error_richloc): Use ::make_unique rather than "new" when
+	making suggest_missing_header.
+
+2025-04-28  Andrew Pinski  <quic_apinski@quicinc.com>
+
+	PR c/119432
+	* gimple-parser.cc (gimple_binary_identifier_code): Add
+	__ROTATE_LEFT and __ROTATE_RIGHT.
+
+2025-04-28  Andrew Pinski  <quic_apinski@quicinc.com>
+
+	* gimple-parser.cc (gimple_binary_identifier_code): New variable.
+	(c_parser_gimple_binary_expression): Use gimple_binary_identifier_code
+	instead of doing if statements on the strings.
+
+2025-04-27  H.J. Lu  <hjl.tools@gmail.com>
+
+	PR c/48274
+	PR middle-end/112877
+	PR middle-end/118288
+	* c-decl.cc (start_decl): Remove the
+	targetm.calls.promote_prototypes call.
+	(store_parm_decls_oldstyle): Likewise.
+	(finish_function): Likewise.
+	* c-typeck.cc (convert_argument): Likewise.
+	(c_safe_arg_type_equiv_p): Likewise.
+
+2025-04-15  Qing Zhao  <qing.zhao@oracle.com>
+
+	PR c/119717
+	* c-typeck.cc (build_access_with_size_for_counted_by): Fully fold the
+	parameters for call to .ACCESS_WITH_SIZE.
+
+2025-04-08  Martin Uecker  <uecker@tugraz.at>
+
+	PR c/119612
+	* c-tree.h (c_type_tag): Add prototype.
+	* c-typeck.cc (c_type_tag): New function.
+	(tagged_types_tu_compatible_p, composite_type_internal): Use
+	c_type_tag.
+	* c-decl.cc (c_struct_hasher::hash, previous_tag): Use c_type_tag.
+
+2025-04-02  Jakub Jelinek  <jakub@redhat.com>
+
+	PR c/119582
+	* c-typeck.cc (pointer_diff, build_binary_op): Call c_fully_fold on
+	__sanitizer_ptr_sub or __sanitizer_ptr_cmp arguments.
+
+2025-04-02  Sandra Loosemore  <sloosemore@baylibre.com>
+
+	PR middle-end/118965
+	* c-parser.cc (c_parser_omp_clause_init_modifiers): Adjust
+	error message.
+	(c_parser_omp_clause_init): Remove code for recognizing clauses
+	without modifiers.  Diagnose missing target/targetsync modifier.
+	(c_finish_omp_declare_variant): Diagnose missing target/targetsync
+	modifier.
+
 2025-03-28  Jakub Jelinek  <jakub@redhat.com>
 
 	* Make-lang.in (c.srcextra): Don't depend on anything and don't copy

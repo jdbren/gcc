@@ -926,7 +926,10 @@ get_min_precision (tree arg, signop sign)
 	{
 	  if (TYPE_UNSIGNED (TREE_TYPE (arg)))
 	    sign = UNSIGNED;
-	  else if (sign == UNSIGNED && get_range_pos_neg (arg) != 1)
+	  else if (sign == UNSIGNED
+		   && (get_range_pos_neg (arg,
+					  currently_expanding_gimple_stmt)
+		       != 1))
 	    return prec + (orig_sign != sign);
 	  prec = TYPE_PRECISION (TREE_TYPE (arg));
 	}
@@ -946,7 +949,8 @@ get_min_precision (tree arg, signop sign)
   if (TREE_CODE (arg) != SSA_NAME)
     return prec + (orig_sign != sign);
   int_range_max r;
-  while (!get_global_range_query ()->range_of_expr (r, arg)
+  gimple *cg = currently_expanding_gimple_stmt;
+  while (!get_range_query (cfun)->range_of_expr (r, arg, cg)
 	 || r.varying_p ()
 	 || r.undefined_p ())
     {
@@ -963,7 +967,8 @@ get_min_precision (tree arg, signop sign)
 		{
 		  if (TYPE_UNSIGNED (TREE_TYPE (arg)))
 		    sign = UNSIGNED;
-		  else if (sign == UNSIGNED && get_range_pos_neg (arg) != 1)
+		  else if (sign == UNSIGNED
+			   && get_range_pos_neg (arg, g) != 1)
 		    return prec + (orig_sign != sign);
 		  prec = TYPE_PRECISION (TREE_TYPE (arg));
 		}
@@ -1301,7 +1306,7 @@ expand_addsub_overflow (location_t loc, tree_code code, tree lhs,
 	 unsigned.  */
       res = expand_binop (mode, sub_optab, op0, op1, NULL_RTX, false,
 			  OPTAB_LIB_WIDEN);
-      int pos_neg = get_range_pos_neg (arg0);
+      int pos_neg = get_range_pos_neg (arg0, currently_expanding_gimple_stmt);
       if (pos_neg == 2)
 	/* If ARG0 is known to be always negative, this is always overflow.  */
 	emit_jump (do_error);
@@ -1361,10 +1366,11 @@ expand_addsub_overflow (location_t loc, tree_code code, tree lhs,
 	 unsigned.  */
       res = expand_binop (mode, code == PLUS_EXPR ? add_optab : sub_optab,
 			  op0, op1, NULL_RTX, false, OPTAB_LIB_WIDEN);
-      int pos_neg = get_range_pos_neg (arg1);
+      int pos_neg = get_range_pos_neg (arg1, currently_expanding_gimple_stmt);
       if (code == PLUS_EXPR)
 	{
-	  int pos_neg0 = get_range_pos_neg (arg0);
+	  int pos_neg0 = get_range_pos_neg (arg0,
+					    currently_expanding_gimple_stmt);
 	  if (pos_neg0 != 3 && pos_neg == 3)
 	    {
 	      std::swap (op0, op1);
@@ -1462,10 +1468,11 @@ expand_addsub_overflow (location_t loc, tree_code code, tree lhs,
        the second operand, as subtraction is not commutative) is always
        non-negative or always negative, we can do just one comparison
        and conditional jump.  */
-    int pos_neg = get_range_pos_neg (arg1);
+    int pos_neg = get_range_pos_neg (arg1, currently_expanding_gimple_stmt);
     if (code == PLUS_EXPR)
       {
-	int pos_neg0 = get_range_pos_neg (arg0);
+	int pos_neg0 = get_range_pos_neg (arg0,
+					  currently_expanding_gimple_stmt);
 	if (pos_neg0 != 3 && pos_neg == 3)
 	  {
 	    std::swap (op0, op1);
@@ -1757,8 +1764,8 @@ expand_mul_overflow (location_t loc, tree lhs, tree arg0, tree arg1,
       uns1_p = true;
     }
 
-  int pos_neg0 = get_range_pos_neg (arg0);
-  int pos_neg1 = get_range_pos_neg (arg1);
+  int pos_neg0 = get_range_pos_neg (arg0, currently_expanding_gimple_stmt);
+  int pos_neg1 = get_range_pos_neg (arg1, currently_expanding_gimple_stmt);
   /* Unsigned types with smaller than mode precision, even if they have most
      significant bit set, are still zero-extended.  */
   if (uns0_p && TYPE_PRECISION (TREE_TYPE (arg0)) < GET_MODE_PRECISION (mode))
@@ -2763,9 +2770,9 @@ expand_arith_overflow (enum tree_code code, gimple *stmt)
   int prec1 = TYPE_PRECISION (TREE_TYPE (arg1));
   int precres = TYPE_PRECISION (type);
   location_t loc = gimple_location (stmt);
-  if (!uns0_p && get_range_pos_neg (arg0) == 1)
+  if (!uns0_p && get_range_pos_neg (arg0, stmt) == 1)
     uns0_p = true;
-  if (!uns1_p && get_range_pos_neg (arg1) == 1)
+  if (!uns1_p && get_range_pos_neg (arg1, stmt) == 1)
     uns1_p = true;
   int pr = get_min_precision (arg0, uns0_p ? UNSIGNED : SIGNED);
   prec0 = MIN (prec0, pr);
@@ -3435,25 +3442,23 @@ expand_DEFERRED_INIT (internal_fn, gcall *stmt)
 }
 
 /* Expand the IFN_ACCESS_WITH_SIZE function:
-   ACCESS_WITH_SIZE (REF_TO_OBJ, REF_TO_SIZE, CLASS_OF_SIZE,
-		     TYPE_OF_SIZE, ACCESS_MODE)
+   ACCESS_WITH_SIZE (REF_TO_OBJ, REF_TO_SIZE,
+		     TYPE_OF_SIZE + ACCESS_MODE, TYPE_SIZE_UNIT for element)
    which returns the REF_TO_OBJ same as the 1st argument;
 
    1st argument REF_TO_OBJ: The reference to the object;
    2nd argument REF_TO_SIZE: The reference to the size of the object,
-   3rd argument CLASS_OF_SIZE: The size referenced by the REF_TO_SIZE represents
-     0: the number of bytes.
-     1: the number of the elements of the object type;
-   4th argument TYPE_OF_SIZE: A constant 0 with its TYPE being the same as the TYPE
-    of the object referenced by REF_TO_SIZE
-   5th argument ACCESS_MODE:
-    -1: Unknown access semantics
-     0: none
-     1: read_only
-     2: write_only
-     3: read_write
-   6th argument: A constant 0 with the pointer TYPE to the original flexible
-     array type.
+   3rd argument TYPE_OF_SIZE + ACCESS_MODE: An integer constant with a pointer
+     TYPE.
+     The pointee TYPE of the pointer TYPE is the TYPE of the object referenced
+	by REF_TO_SIZE.
+     The integer constant value represents the ACCESS_MODE:
+	0: none
+	1: read_only
+	2: write_only
+	3: read_write
+
+   4th argument: The TYPE_SIZE_UNIT of the element TYPE of the array.
 
    Both the return type and the type of the first argument of this
    function have been converted from the incomplete array type to
@@ -3647,8 +3652,8 @@ expand_scatter_store_optab_fn (internal_fn, gcall *stmt, direct_optab optab)
   internal_fn ifn = gimple_call_internal_fn (stmt);
   int rhs_index = internal_fn_stored_value_index (ifn);
   tree base = gimple_call_arg (stmt, 0);
-  tree offset = gimple_call_arg (stmt, 1);
-  tree scale = gimple_call_arg (stmt, 2);
+  tree offset = gimple_call_arg (stmt, internal_fn_offset_index (ifn));
+  tree scale = gimple_call_arg (stmt, internal_fn_scale_index (ifn));
   tree rhs = gimple_call_arg (stmt, rhs_index);
 
   rtx base_rtx = expand_normal (base);
@@ -3673,12 +3678,12 @@ expand_scatter_store_optab_fn (internal_fn, gcall *stmt, direct_optab optab)
 /* Expand {MASK_,}GATHER_LOAD call CALL using optab OPTAB.  */
 
 static void
-expand_gather_load_optab_fn (internal_fn, gcall *stmt, direct_optab optab)
+expand_gather_load_optab_fn (internal_fn ifn, gcall *stmt, direct_optab optab)
 {
   tree lhs = gimple_call_lhs (stmt);
   tree base = gimple_call_arg (stmt, 0);
-  tree offset = gimple_call_arg (stmt, 1);
-  tree scale = gimple_call_arg (stmt, 2);
+  tree offset = gimple_call_arg (stmt, internal_fn_offset_index (ifn));
+  tree scale = gimple_call_arg (stmt, internal_fn_scale_index (ifn));
 
   rtx lhs_rtx = expand_expr (lhs, NULL_RTX, VOIDmode, EXPAND_WRITE);
   rtx base_rtx = expand_normal (base);
@@ -4024,9 +4029,14 @@ expand_crc_optab_fn (internal_fn fn, gcall *stmt, convert_optab optab)
   rtx dest = expand_expr (lhs, NULL_RTX, VOIDmode, EXPAND_WRITE);
   rtx crc = expand_normal (rhs1);
   rtx data = expand_normal (rhs2);
-  gcc_assert (TREE_CODE (rhs3) == INTEGER_CST);
-  rtx polynomial = gen_rtx_CONST_INT (TYPE_MODE (result_type),
-				      TREE_INT_CST_LOW (rhs3));
+  rtx polynomial;
+  if (TREE_CODE (rhs3) != INTEGER_CST)
+    {
+      error ("third argument to %<crc%> builtins must be a constant");
+      polynomial = const0_rtx;
+    }
+  else
+    polynomial = convert_to_mode (TYPE_MODE (result_type), expand_normal (rhs3), 0);
 
   /* Use target specific expansion if it exists.
      Otherwise, generate table-based CRC.  */
@@ -4416,6 +4426,7 @@ commutative_binary_fn_p (internal_fn fn)
     case IFN_ADD_OVERFLOW:
     case IFN_MUL_OVERFLOW:
     case IFN_SAT_ADD:
+    case IFN_SAT_MUL:
     case IFN_VEC_WIDEN_PLUS:
     case IFN_VEC_WIDEN_PLUS_LO:
     case IFN_VEC_WIDEN_PLUS_HI:
@@ -4527,6 +4538,33 @@ widening_fn_p (code_helper code)
     case IFN_##NAME:						  \
     case IFN_##NAME##_HI:					  \
     case IFN_##NAME##_LO:					  \
+    case IFN_##NAME##_EVEN:					  \
+    case IFN_##NAME##_ODD:					  \
+      return true;
+    #include "internal-fn.def"
+
+    default:
+      return false;
+    }
+}
+
+/* Return true if this CODE describes an internal_fn that returns a vector with
+   elements twice as wide as the element size of the input vectors and operates
+   on even/odd parts of the input.  */
+
+bool
+widening_evenodd_fn_p (code_helper code)
+{
+  if (!code.is_fn_code ())
+    return false;
+
+  if (!internal_fn_p ((combined_fn) code))
+    return false;
+
+  internal_fn fn = as_internal_fn ((combined_fn) code);
+  switch (fn)
+    {
+    #define DEF_INTERNAL_WIDENING_OPTAB_FN(NAME, F, S, SO, UO, T) \
     case IFN_##NAME##_EVEN:					  \
     case IFN_##NAME##_ODD:					  \
       return true;
@@ -4929,11 +4967,13 @@ internal_fn_len_index (internal_fn fn)
       return 2;
 
     case IFN_MASK_LEN_SCATTER_STORE:
+      return 6;
+
     case IFN_MASK_LEN_STRIDED_LOAD:
       return 5;
 
     case IFN_MASK_LEN_GATHER_LOAD:
-      return 6;
+      return 7;
 
     case IFN_COND_LEN_FMA:
     case IFN_COND_LEN_FMS:
@@ -5037,7 +5077,7 @@ internal_fn_else_index (internal_fn fn)
 
     case IFN_MASK_GATHER_LOAD:
     case IFN_MASK_LEN_GATHER_LOAD:
-      return 5;
+      return 6;
 
     default:
       return -1;
@@ -5072,7 +5112,7 @@ internal_fn_mask_index (internal_fn fn)
     case IFN_MASK_SCATTER_STORE:
     case IFN_MASK_LEN_GATHER_LOAD:
     case IFN_MASK_LEN_SCATTER_STORE:
-      return 4;
+      return 5;
 
     case IFN_VCOND_MASK:
     case IFN_VCOND_MASK_LEN:
@@ -5097,10 +5137,11 @@ internal_fn_stored_value_index (internal_fn fn)
 
     case IFN_MASK_STORE:
     case IFN_MASK_STORE_LANES:
+      return 3;
     case IFN_SCATTER_STORE:
     case IFN_MASK_SCATTER_STORE:
     case IFN_MASK_LEN_SCATTER_STORE:
-      return 3;
+      return 4;
 
     case IFN_LEN_STORE:
       return 4;
@@ -5114,6 +5155,75 @@ internal_fn_stored_value_index (internal_fn fn)
     }
 }
 
+/* If FN has an alias pointer return its index, otherwise return -1.  */
+
+int
+internal_fn_alias_ptr_index (internal_fn fn)
+{
+  switch (fn)
+    {
+    case IFN_MASK_LOAD:
+    case IFN_MASK_LEN_LOAD:
+    case IFN_GATHER_LOAD:
+    case IFN_MASK_GATHER_LOAD:
+    case IFN_MASK_LEN_GATHER_LOAD:
+    case IFN_SCATTER_STORE:
+    case IFN_MASK_SCATTER_STORE:
+    case IFN_MASK_LEN_SCATTER_STORE:
+      return 1;
+
+    default:
+      return -1;
+    }
+}
+
+/* If FN is a gather/scatter return the index of its offset argument,
+   otherwise return -1.  */
+
+int
+internal_fn_offset_index (internal_fn fn)
+{
+  if (!internal_gather_scatter_fn_p (fn))
+    return -1;
+
+  switch (fn)
+    {
+    case IFN_GATHER_LOAD:
+    case IFN_MASK_GATHER_LOAD:
+    case IFN_MASK_LEN_GATHER_LOAD:
+    case IFN_SCATTER_STORE:
+    case IFN_MASK_SCATTER_STORE:
+    case IFN_MASK_LEN_SCATTER_STORE:
+      return 2;
+
+    default:
+      return -1;
+    }
+}
+
+/* If FN is a gather/scatter return the index of its scale argument,
+   otherwise return -1.  */
+
+int
+internal_fn_scale_index (internal_fn fn)
+{
+  if (!internal_gather_scatter_fn_p (fn))
+    return -1;
+
+  switch (fn)
+    {
+    case IFN_GATHER_LOAD:
+    case IFN_MASK_GATHER_LOAD:
+    case IFN_MASK_LEN_GATHER_LOAD:
+    case IFN_SCATTER_STORE:
+    case IFN_MASK_SCATTER_STORE:
+    case IFN_MASK_LEN_SCATTER_STORE:
+      return 3;
+
+    default:
+      return -1;
+    }
+}
 
 /* Store all supported else values for the optab referred to by ICODE
    in ELSE_VALS.  The index of the else operand must be specified in
@@ -5192,13 +5302,9 @@ internal_gather_scatter_fn_supported_p (internal_fn ifn, tree vector_type,
     && insn_operand_matches (icode, 2 + output_ops, GEN_INT (unsigned_p))
     && insn_operand_matches (icode, 3 + output_ops, GEN_INT (scale));
 
-  /* For gather the optab's operand indices do not match the IFN's because
-     the latter does not have the extension operand (operand 3).  It is
-     implicitly added during expansion so we use the IFN's else index + 1.
-     */
   if (ok && elsvals)
     get_supported_else_vals
-      (icode, internal_fn_else_index (IFN_MASK_GATHER_LOAD) + 1, *elsvals);
+      (icode, internal_fn_else_index (IFN_MASK_GATHER_LOAD), *elsvals);
 
   return ok;
 }
@@ -5552,10 +5658,9 @@ expand_POPCOUNT (internal_fn fn, gcall *stmt)
   do_pending_stack_adjust ();
   start_sequence ();
   expand_unary_optab_fn (fn, stmt, popcount_optab);
-  rtx_insn *popcount_insns = get_insns ();
-  end_sequence ();
+  rtx_insn *popcount_insns = end_sequence ();
   start_sequence ();
-  rtx plhs = expand_normal (lhs);
+  rtx plhs = expand_expr (lhs, NULL_RTX, VOIDmode, EXPAND_WRITE);
   rtx pcmp = emit_store_flag (NULL_RTX, EQ, plhs, const1_rtx, lhsmode, 0, 0);
   if (pcmp == NULL_RTX)
     {
@@ -5564,8 +5669,7 @@ expand_POPCOUNT (internal_fn fn, gcall *stmt)
       emit_insn (popcount_insns);
       return;
     }
-  rtx_insn *popcount_cmp_insns = get_insns ();
-  end_sequence ();
+  rtx_insn *popcount_cmp_insns = end_sequence ();
   start_sequence ();
   rtx op0 = expand_normal (arg);
   rtx argm1 = expand_simple_binop (mode, PLUS, op0, constm1_rtx, NULL_RTX,
@@ -5583,8 +5687,7 @@ expand_POPCOUNT (internal_fn fn, gcall *stmt)
     cmp = emit_store_flag (NULL_RTX, GTU, argxorargm1, argm1, mode, 1, 1);
   if (cmp == NULL_RTX)
     goto fail;
-  rtx_insn *cmp_insns = get_insns ();
-  end_sequence ();
+  rtx_insn *cmp_insns = end_sequence ();
   unsigned popcount_cost = (seq_cost (popcount_insns, speed_p)
 			    + seq_cost (popcount_cmp_insns, speed_p));
   unsigned cmp_cost = seq_cost (cmp_insns, speed_p);
@@ -5599,7 +5702,7 @@ expand_POPCOUNT (internal_fn fn, gcall *stmt)
     {
       start_sequence ();
       emit_insn (cmp_insns);
-      plhs = expand_normal (lhs);
+      plhs = expand_expr (lhs, NULL_RTX, VOIDmode, EXPAND_WRITE);
       if (GET_MODE (cmp) != GET_MODE (plhs))
 	cmp = convert_to_mode (GET_MODE (plhs), cmp, 1);
       /* For `<= 1`, we need to produce `2 - cmp` or `cmp ? 1 : 2` as that
@@ -5612,8 +5715,7 @@ expand_POPCOUNT (internal_fn fn, gcall *stmt)
 	    goto fail;
 	}
       emit_move_insn (plhs, cmp);
-      rtx_insn *all_insns = get_insns ();
-      end_sequence ();
+      rtx_insn *all_insns = end_sequence ();
       emit_insn (all_insns);
     }
 }

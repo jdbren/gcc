@@ -48,6 +48,7 @@ along with GCC; see the file COPYING3.  If not see
 #include "tree-ssa-alias-compare.h"
 #include "builtins.h"
 #include "internal-fn.h"
+#include "ipa-utils.h"
 
 /* Broad overview of how alias analysis on gimple works:
 
@@ -4165,7 +4166,7 @@ attr_fnspec::verify ()
 }
 
 /* Return ture if TYPE1 and TYPE2 will always give the same answer
-   when compared wit hother types using same_type_for_tbaa_p.  */
+   when compared with other types using same_type_for_tbaa.  */
 
 static bool
 types_equal_for_same_type_for_tbaa_p (tree type1, tree type2,
@@ -4186,6 +4187,16 @@ types_equal_for_same_type_for_tbaa_p (tree type1, tree type2,
     return type1 == type2;
   else
     return TYPE_CANONICAL (type1) == TYPE_CANONICAL (type2);
+}
+
+/* Return ture if TYPE1 and TYPE2 will always give the same answer
+   when compared with other types using same_type_for_tbaa.  */
+
+bool
+types_equal_for_same_type_for_tbaa_p (tree type1, tree type2)
+{
+  return types_equal_for_same_type_for_tbaa_p (type1, type2,
+					       lto_streaming_expected_p ());
 }
 
 /* Compare REF1 and REF2 and return flags specifying their differences.
@@ -4365,7 +4376,7 @@ ao_compare::compare_ao_refs (ao_ref *ref1, ao_ref *ref2,
       i++;
     }
 
-  /* For variable accesses we can not rely on offset match bellow.
+  /* For variable accesses we can not rely on offset match below.
      We know that paths are struturally same, so only check that
      starts of TBAA paths did not diverge.  */
   if (!known_eq (ref1->size, ref1->max_size)

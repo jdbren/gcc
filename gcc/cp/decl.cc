@@ -110,7 +110,7 @@ static void initialize_local_var (tree, tree, bool);
 static void expand_static_init (tree, tree);
 static location_t smallest_type_location (const cp_decl_specifier_seq*);
 static bool identify_goto (tree, location_t, const location_t *,
-			   diagnostic_t, bool);
+			   enum diagnostics::kind, bool);
 
 /* The following symbols are subsumed in the cp_global_trees array, and
    listed here individually for documentation purposes.
@@ -747,11 +747,11 @@ poplevel (int keep, int reverse, int functionbody)
 	      {
 		if (!DECL_NAME (decl) && DECL_DECOMPOSITION_P (decl))
 		  warning_at (DECL_SOURCE_LOCATION (decl),
-			      OPT_Wunused_but_set_variable, "structured "
+			      OPT_Wunused_but_set_variable_, "structured "
 			      "binding declaration set but not used");
 		else
 		  warning_at (DECL_SOURCE_LOCATION (decl),
-			      OPT_Wunused_but_set_variable,
+			      OPT_Wunused_but_set_variable_,
 			      "variable %qD set but not used", decl);
 		unused_but_set_errorcount = errorcount;
 	      }
@@ -846,11 +846,9 @@ poplevel (int keep, int reverse, int functionbody)
       DECL_INITIAL (current_function_decl) = block ? block : subblocks;
       if (subblocks)
 	{
-	  if (FUNCTION_NEEDS_BODY_BLOCK (current_function_decl))
-	    {
-	      if (BLOCK_SUBBLOCKS (subblocks))
-		BLOCK_OUTER_CURLY_BRACE_P (BLOCK_SUBBLOCKS (subblocks)) = 1;
-	    }
+	  if (FUNCTION_NEEDS_BODY_BLOCK (current_function_decl)
+	      && BLOCK_SUBBLOCKS (subblocks))
+	    BLOCK_OUTER_CURLY_BRACE_P (BLOCK_SUBBLOCKS (subblocks)) = 1;
 	  else
 	    BLOCK_OUTER_CURLY_BRACE_P (subblocks) = 1;
 	}
@@ -1216,9 +1214,7 @@ decls_match (tree newdecl, tree olddecl, bool record_versions /* = true */)
 	  && targetm.target_option.function_versions (newdecl, olddecl))
 	{
 	  if (record_versions)
-	    maybe_version_functions (newdecl, olddecl,
-				     (!DECL_FUNCTION_VERSIONED (newdecl)
-				      || !DECL_FUNCTION_VERSIONED (olddecl)));
+	    maybe_version_functions (newdecl, olddecl);
 	  return 0;
 	}
     }
@@ -1285,11 +1281,11 @@ maybe_mark_function_versioned (tree decl)
 }
 
 /* NEWDECL and OLDDECL have identical signatures.  If they are
-   different versions adjust them and return true.
-   If RECORD is set to true, record function versions.  */
+   different versions adjust them, record function versions, and return
+   true.  */
 
 bool
-maybe_version_functions (tree newdecl, tree olddecl, bool record)
+maybe_version_functions (tree newdecl, tree olddecl)
 {
   if (!targetm.target_option.function_versions (newdecl, olddecl))
     return false;
@@ -1312,8 +1308,13 @@ maybe_version_functions (tree newdecl, tree olddecl, bool record)
       maybe_mark_function_versioned (newdecl);
     }
 
-  if (record)
-    cgraph_node::record_function_versions (olddecl, newdecl);
+  /* Add the new version to the function version structure.  */
+  cgraph_node *fn_node = cgraph_node::get_create (olddecl);
+  cgraph_function_version_info *fn_v = fn_node->function_version ();
+  if (!fn_v)
+    fn_v = fn_node->insert_new_function_version ();
+
+  cgraph_node::add_function_version (fn_v, newdecl);
 
   return true;
 }
@@ -2008,8 +2009,10 @@ duplicate_decls (tree newdecl, tree olddecl, bool hiding, bool was_hidden)
 	    }
 	  /* For function versions, params and types match, but they
 	     are not ambiguous.  */
-	  else if ((!DECL_FUNCTION_VERSIONED (newdecl)
-		    && !DECL_FUNCTION_VERSIONED (olddecl))
+	  else if (((!DECL_FUNCTION_VERSIONED (newdecl)
+		     && !DECL_FUNCTION_VERSIONED (olddecl))
+		    || !same_type_p (fndecl_declared_return_type (newdecl),
+				     fndecl_declared_return_type (olddecl)))
 		   /* Let constrained hidden friends coexist for now, we'll
 		      check satisfaction later.  */
 		   && !member_like_constrained_friend_p (newdecl)
@@ -3734,10 +3737,10 @@ decl_jump_unsafe (tree decl)
 
 static bool
 identify_goto (tree decl, location_t loc, const location_t *locus,
-	       diagnostic_t diag_kind, bool computed)
+	       enum diagnostics::kind diag_kind, bool computed)
 {
   if (computed)
-    diag_kind = DK_WARNING;
+    diag_kind = diagnostics::kind::warning;
   bool complained
     = emit_diagnostic (diag_kind, loc, 0,
 		       decl ? G_("jump to label %qD")
@@ -3773,7 +3776,8 @@ check_previous_goto_1 (tree decl, cp_binding_level* level, tree names,
 
   if (exited_omp)
     {
-      complained = identify_goto (decl, input_location, locus, DK_ERROR,
+      complained = identify_goto (decl, input_location, locus,
+				  diagnostics::kind::error,
 				  computed);
       if (complained)
 	inform (input_location, "  exits OpenMP structured block");
@@ -3795,7 +3799,8 @@ check_previous_goto_1 (tree decl, cp_binding_level* level, tree names,
 
 	  if (!identified)
 	    {
-	      complained = identify_goto (decl, input_location, locus, DK_ERROR,
+	      complained = identify_goto (decl, input_location, locus,
+					  diagnostics::kind::error,
 					  computed);
 	      identified = 2;
 	    }
@@ -3863,7 +3868,8 @@ check_previous_goto_1 (tree decl, cp_binding_level* level, tree names,
       if (inf)
 	{
 	  if (identified < 2)
-	    complained = identify_goto (decl, input_location, locus, DK_ERROR,
+	    complained = identify_goto (decl, input_location, locus,
+					diagnostics::kind::error,
 					computed);
 	  identified = 2;
 	  if (complained)
@@ -3874,7 +3880,8 @@ check_previous_goto_1 (tree decl, cp_binding_level* level, tree names,
   if (!vec_safe_is_empty (computed))
     {
       if (!identified)
-	complained = identify_goto (decl, input_location, locus, DK_ERROR,
+	complained = identify_goto (decl, input_location, locus,
+				    diagnostics::kind::error,
 				    computed);
       identified = 2;
       if (complained)
@@ -3946,14 +3953,14 @@ check_goto_1 (named_label_entry *ent, bool computed)
       || ent->in_omp_scope || ent->in_stmt_expr
       || !vec_safe_is_empty (ent->bad_decls))
     {
-      diagnostic_t diag_kind = DK_PERMERROR;
+      enum diagnostics::kind diag_kind = diagnostics::kind::permerror;
       if (ent->in_try_scope || ent->in_catch_scope || ent->in_constexpr_if
 	  || ent->in_consteval_if || ent->in_transaction_scope
 	  || ent->in_omp_scope || ent->in_stmt_expr)
-	diag_kind = DK_ERROR;
+	diag_kind = diagnostics::kind::error;
       complained = identify_goto (decl, DECL_SOURCE_LOCATION (decl),
 				  &input_location, diag_kind, computed);
-      identified = 1 + (diag_kind == DK_ERROR);
+      identified = 1 + (diag_kind == diagnostics::kind::error);
     }
 
   FOR_EACH_VEC_SAFE_ELT (ent->bad_decls, ix, bad)
@@ -3966,7 +3973,9 @@ check_goto_1 (named_label_entry *ent, bool computed)
 	  if (identified == 1)
 	    {
 	      complained = identify_goto (decl, DECL_SOURCE_LOCATION (decl),
-					  &input_location, DK_ERROR, computed);
+					  &input_location,
+					  diagnostics::kind::error,
+					  computed);
 	      identified = 2;
 	    }
 	  if (complained)
@@ -4010,7 +4019,8 @@ check_goto_1 (named_label_entry *ent, bool computed)
 	      {
 		complained = identify_goto (decl,
 					    DECL_SOURCE_LOCATION (decl),
-					    &input_location, DK_ERROR,
+					    &input_location,
+					    diagnostics::kind::error,
 					    computed);
 		identified = 2;
 	      }
@@ -4034,7 +4044,8 @@ check_goto_1 (named_label_entry *ent, bool computed)
 		{
 		  complained
 		    = identify_goto (decl, DECL_SOURCE_LOCATION (decl),
-				     &input_location, DK_ERROR, computed);
+				     &input_location, diagnostics::kind::error,
+				     computed);
 		  identified = 2;
 		}
 	      if (complained)
@@ -4050,7 +4061,8 @@ check_goto_1 (named_label_entry *ent, bool computed)
 		    {
 		      complained
 			= identify_goto (decl, DECL_SOURCE_LOCATION (decl),
-					 &input_location, DK_ERROR, computed);
+					 &input_location, diagnostics::kind::error,
+					 computed);
 		      identified = 2;
 		    }
 		  if (complained)
@@ -4362,6 +4374,7 @@ struct typename_info {
   tree template_id;
   bool enum_p;
   bool class_p;
+  bool union_p;
 };
 
 struct typename_hasher : ggc_ptr_hash<tree_node>
@@ -4400,7 +4413,8 @@ struct typename_hasher : ggc_ptr_hash<tree_node>
 	    && TYPE_CONTEXT (t1) == t2->scope
 	    && TYPENAME_TYPE_FULLNAME (t1) == t2->template_id
 	    && TYPENAME_IS_ENUM_P (t1) == t2->enum_p
-	    && TYPENAME_IS_CLASS_P (t1) == t2->class_p);
+	    && TYPENAME_IS_CLASS_P (t1) == t2->class_p
+	    && TYPENAME_IS_UNION_P (t1) == t2->union_p);
   }
 };
 
@@ -4424,9 +4438,8 @@ build_typename_type (tree context, tree name, tree fullname,
   ti.name = name;
   ti.template_id = fullname;
   ti.enum_p = tag_type == enum_type;
-  ti.class_p = (tag_type == class_type
-		|| tag_type == record_type
-		|| tag_type == union_type);
+  ti.class_p = (tag_type == class_type || tag_type == record_type);
+  ti.union_p = tag_type == union_type;
   hashval_t hash = typename_hasher::hash (&ti);
 
   /* See if we already have this type.  */
@@ -4442,6 +4455,7 @@ build_typename_type (tree context, tree name, tree fullname,
       TYPENAME_TYPE_FULLNAME (t) = ti.template_id;
       TYPENAME_IS_ENUM_P (t) = ti.enum_p;
       TYPENAME_IS_CLASS_P (t) = ti.class_p;
+      TYPENAME_IS_UNION_P (t) = ti.union_p;
 
       /* Build the corresponding TYPE_DECL.  */
       tree d = build_decl (input_location, TYPE_DECL, name, t);
@@ -5072,6 +5086,18 @@ cxx_init_decl_processing (void)
 			    BUILT_IN_FRONTEND, NULL, NULL_TREE);
   set_call_expr_flags (decl, ECF_CONST | ECF_NOTHROW | ECF_LEAF);
 
+  if (cxx_dialect >= cxx26)
+    {
+      tree void_ptrintftype
+	= build_function_type_list (void_type_node, ptr_type_node,
+				    integer_type_node, NULL_TREE);
+      decl = add_builtin_function ("__builtin_eh_ptr_adjust_ref",
+				   void_ptrintftype,
+				   CP_BUILT_IN_EH_PTR_ADJUST_REF,
+				   BUILT_IN_FRONTEND, NULL, NULL_TREE);
+      set_call_expr_flags (decl, ECF_NOTHROW | ECF_LEAF);
+    }
+
   integer_two_node = build_int_cst (NULL_TREE, 2);
 
   /* Guess at the initial static decls size.  */
@@ -5339,6 +5365,8 @@ cp_make_fname_decl (location_t loc, tree id, int type_dep)
       decl = pushdecl_outermost_localscope (decl);
       if (decl != error_mark_node)
 	add_decl_expr (decl);
+      else
+	gcc_assert (seen_error ());
     }
   else
     {
@@ -6198,22 +6226,28 @@ start_decl (const cp_declarator *declarator,
     }
 
   if (current_function_decl && VAR_P (decl)
-      && DECL_DECLARED_CONSTEXPR_P (current_function_decl)
+      && maybe_constexpr_fn (current_function_decl)
       && cxx_dialect < cxx23)
     {
       bool ok = false;
       if (CP_DECL_THREAD_LOCAL_P (decl) && !DECL_REALLY_EXTERN (decl))
-	error_at (DECL_SOURCE_LOCATION (decl),
-		  "%qD defined %<thread_local%> in %qs function only "
-		  "available with %<-std=c++23%> or %<-std=gnu++23%>", decl,
-		  DECL_IMMEDIATE_FUNCTION_P (current_function_decl)
-		  ? "consteval" : "constexpr");
+	{
+	  if (DECL_DECLARED_CONSTEXPR_P (current_function_decl))
+	    error_at (DECL_SOURCE_LOCATION (decl),
+		      "%qD defined %<thread_local%> in %qs function only "
+		      "available with %<-std=c++23%> or %<-std=gnu++23%>", decl,
+		      DECL_IMMEDIATE_FUNCTION_P (current_function_decl)
+		      ? "consteval" : "constexpr");
+	}
       else if (TREE_STATIC (decl))
-	error_at (DECL_SOURCE_LOCATION (decl),
-		  "%qD defined %<static%> in %qs function only available "
-		  "with %<-std=c++23%> or %<-std=gnu++23%>", decl,
-		  DECL_IMMEDIATE_FUNCTION_P (current_function_decl)
-		  ? "consteval" : "constexpr");
+	{
+	  if (DECL_DECLARED_CONSTEXPR_P (current_function_decl))
+	    error_at (DECL_SOURCE_LOCATION (decl),
+		      "%qD defined %<static%> in %qs function only available "
+		      "with %<-std=c++23%> or %<-std=gnu++23%>", decl,
+		      DECL_IMMEDIATE_FUNCTION_P (current_function_decl)
+		      ? "consteval" : "constexpr");
+	}
       else
 	ok = true;
       if (!ok)
@@ -7871,6 +7905,12 @@ check_initializer (tree decl, tree init, int flags, vec<tree, va_gc> **cleanups)
     }
   else if (!init && DECL_REALLY_EXTERN (decl))
     ;
+  else if (flag_openmp
+	   && VAR_P (decl)
+	   && DECL_LANG_SPECIFIC (decl)
+	   && DECL_OMP_DECLARE_MAPPER_P (decl)
+	   && TREE_CODE (init) == OMP_DECLARE_MAPPER)
+    return NULL_TREE;
   else if (init || type_build_ctor_call (type)
 	   || TYPE_REF_P (type))
     {
@@ -8897,13 +8937,18 @@ cp_finish_decl (tree decl, tree init, bool init_const_expr_p,
 	  TREE_TYPE (decl) = error_mark_node;
 	  return;
 	}
+
+      /* Now that we have a type, try these again.  */
+      layout_decl (decl, 0);
       cp_apply_type_quals_to_decl (cp_type_quals (type), decl);
 
       /* Update the type of the corresponding TEMPLATE_DECL to match.  */
-      if (DECL_LANG_SPECIFIC (decl)
-	  && DECL_TEMPLATE_INFO (decl)
-	  && DECL_TEMPLATE_RESULT (DECL_TI_TEMPLATE (decl)) == decl)
-	TREE_TYPE (DECL_TI_TEMPLATE (decl)) = type;
+      if (DECL_LANG_SPECIFIC (decl) && DECL_TEMPLATE_INFO (decl))
+	{
+	  tree tmpl = template_for_substitution (decl);
+	  if (DECL_TEMPLATE_RESULT (tmpl) == decl)
+	    TREE_TYPE (tmpl) = type;
+	}
     }
 
   if (ensure_literal_type_for_constexpr_object (decl) == error_mark_node)
@@ -9147,6 +9192,10 @@ cp_finish_decl (tree decl, tree init, bool init_const_expr_p,
 
       if (decomp)
 	{
+	  if (DECL_DECLARED_CONSTINIT_P (decl) && cxx_dialect < cxx26)
+	    pedwarn (DECL_SOURCE_LOCATION (decl), OPT_Wc__26_extensions,
+		     "%<constinit%> can be applied to structured binding "
+		     "only with %<-std=c++2c%> or %<-std=gnu++2c%>");
 	  cp_maybe_mangle_decomp (decl, decomp);
 	  if (TREE_STATIC (decl) && !DECL_FUNCTION_SCOPE_P (decl))
 	    {
@@ -9188,14 +9237,23 @@ cp_finish_decl (tree decl, tree init, bool init_const_expr_p,
 	  varpool_node::get_create (decl);
 	}
 
+      if (flag_openmp
+	  && VAR_P (decl)
+	  && DECL_LANG_SPECIFIC (decl)
+	  && DECL_OMP_DECLARE_MAPPER_P (decl)
+	  && init)
+	{
+	  gcc_assert (TREE_CODE (init) == OMP_DECLARE_MAPPER);
+	  DECL_INITIAL (decl) = init;
+	}
       /* Convert the initializer to the type of DECL, if we have not
 	 already initialized DECL.  */
-      if (!DECL_INITIALIZED_P (decl)
-	  /* If !DECL_EXTERNAL then DECL is being defined.  In the
-	     case of a static data member initialized inside the
-	     class-specifier, there can be an initializer even if DECL
-	     is *not* defined.  */
-	  && (!DECL_EXTERNAL (decl) || init))
+      else if (!DECL_INITIALIZED_P (decl)
+	       /* If !DECL_EXTERNAL then DECL is being defined.  In the
+		  case of a static data member initialized inside the
+		  class-specifier, there can be an initializer even if DECL
+		  is *not* defined.  */
+	       && (!DECL_EXTERNAL (decl) || init))
 	{
 	  cleanups = make_tree_vector ();
 	  init = check_initializer (decl, init, flags, &cleanups);
@@ -11226,12 +11284,12 @@ grokfndecl (tree ctype,
 	   t && t != void_list_node; t = TREE_CHAIN (t))
 	if (TREE_PURPOSE (t))
 	  {
-	    diagnostic_t diag_kind = DK_PERMERROR;
+	    enum diagnostics::kind diag_kind = diagnostics::kind::permerror;
 	    /* For templates, mark the default argument as erroneous and give a
 	       hard error.  */
 	    if (processing_template_decl)
 	      {
-		diag_kind = DK_ERROR;
+		diag_kind = diagnostics::kind::error;
 		TREE_PURPOSE (t) = error_mark_node;
 	      }
 	    if (!has_errored)
@@ -11239,7 +11297,7 @@ grokfndecl (tree ctype,
 		has_errored = true;
 		emit_diagnostic (diag_kind,
 				 DECL_SOURCE_LOCATION (decl),
-				 /*diagnostic_option_id=*/0,
+				 /*diagnostics::option_id=*/0,
 				 "friend declaration of %qD specifies default "
 				 "arguments and isn%'t a definition", decl);
 	      }
@@ -11294,11 +11352,16 @@ grokfndecl (tree ctype,
 		  "cannot declare %<::main%> to be %qs", "consteval");
       if (!publicp)
 	error_at (location, "cannot declare %<::main%> to be static");
-      if (current_lang_depth () != 0)
+      if (current_lang_name != lang_name_cplusplus)
 	pedwarn (location, OPT_Wpedantic, "cannot declare %<::main%> with a"
-		 " linkage specification");
+		 " linkage specification other than %<extern \"C++\"%>");
       if (module_attach_p ())
-	error_at (location, "cannot attach %<::main%> to a named module");
+	{
+	  auto_diagnostic_group adg;
+	  error_at (location, "cannot attach %<::main%> to a named module");
+	  inform (location, "use %<extern \"C++\"%> to attach it to the "
+		  "global module instead");
+	}
       inlinep = 0;
       publicp = 1;
     }
@@ -13580,9 +13643,10 @@ grokdeclarator (const cp_declarator *declarator,
       if (typedef_p)
 	error_at (declspecs->locations[ds_typedef],
 		  "structured binding declaration cannot be %qs", "typedef");
-      if (constexpr_p && !concept_p)
-	error_at (declspecs->locations[ds_constexpr], "structured "
-		  "binding declaration cannot be %qs", "constexpr");
+      if (constexpr_p && !concept_p && cxx_dialect < cxx26)
+	pedwarn (declspecs->locations[ds_constexpr], OPT_Wc__26_extensions,
+		 "structured binding declaration can be %qs only with "
+		 "%<-std=c++2c%> or %<-std=gnu++2c%>", "constexpr");
       if (consteval_p)
 	error_at (declspecs->locations[ds_consteval], "structured "
 		  "binding declaration cannot be %qs", "consteval");
@@ -13593,8 +13657,11 @@ grokdeclarator (const cp_declarator *declarator,
 		 declspecs->gnu_thread_keyword_p
 		 ? "__thread" : "thread_local");
       if (concept_p)
-	error_at (declspecs->locations[ds_concept],
-		  "structured binding declaration cannot be %qs", "concept");
+	{
+	  error_at (declspecs->locations[ds_concept],
+		    "structured binding declaration cannot be %qs", "concept");
+	  constexpr_p = 0;
+	}
       /* [dcl.struct.bind] "A cv that includes volatile is deprecated."  */
       if (type_quals & TYPE_QUAL_VOLATILE)
 	warning_at (declspecs->locations[ds_volatile], OPT_Wvolatile,
@@ -13649,7 +13716,6 @@ grokdeclarator (const cp_declarator *declarator,
 		 "%<auto%> type %qT", type);
       inlinep = 0;
       typedef_p = 0;
-      constexpr_p = 0;
       consteval_p = 0;
       concept_p = 0;
       if (storage_class != sc_static)
@@ -17227,7 +17293,7 @@ xref_tag (enum tag_types tag_code, tree name,
       if (IDENTIFIER_LAMBDA_P (name))
 	/* Mark it as a lambda type right now.  Our caller will
 	   correct the value.  */
-	CLASSTYPE_LAMBDA_EXPR (t) = error_mark_node;
+	SET_CLASSTYPE_LAMBDA_EXPR (t, error_mark_node);
       t = pushtag (name, t, how);
     }
   else
@@ -17340,7 +17406,8 @@ xref_basetypes (tree ref, tree base_list)
 	 compatibility.  */
       if (processing_template_decl
 	  && CLASS_TYPE_P (basetype) && TYPE_BEING_DEFINED (basetype))
-	cxx_incomplete_type_diagnostic (NULL_TREE, basetype, DK_PEDWARN);
+	cxx_incomplete_type_diagnostic (NULL_TREE, basetype,
+					diagnostics::kind::pedwarn);
       if (!dependent_type_p (basetype)
 	  && !complete_type_or_else (basetype, NULL))
 	/* An incomplete type.  Remove it from the list.  */
@@ -19304,6 +19371,19 @@ finish_function (bool inline_p)
 	}
     }
 
+  if (FNDECL_USED_AUTO (fndecl)
+      && TREE_TYPE (fntype) != DECL_SAVED_AUTO_RETURN_TYPE (fndecl))
+    if (location_t fcloc = failed_completion_location (fndecl))
+      {
+	auto_diagnostic_group adg;
+	if (warning (OPT_Wsfinae_incomplete_,
+		     "defining %qD, which previously failed to be deduced "
+		     "in a SFINAE context", fndecl)
+	    && warn_sfinae_incomplete == 1)
+	  inform (fcloc, "here.  Use %qs for a diagnostic at that point",
+		  "-Wsfinae-incomplete=2");
+      }
+
   /* Remember that we were in class scope.  */
   if (current_class_name)
     ctype = current_class_type;
@@ -19421,14 +19501,14 @@ finish_function (bool inline_p)
 	    && !DECL_READ_P (decl)
 	    && DECL_NAME (decl)
 	    && !DECL_ARTIFICIAL (decl)
-	    && !warning_suppressed_p (decl,OPT_Wunused_but_set_parameter)
+	    && !warning_suppressed_p (decl, OPT_Wunused_but_set_parameter_)
 	    && !DECL_IN_SYSTEM_HEADER (decl)
 	    && TREE_TYPE (decl) != error_mark_node
 	    && !TYPE_REF_P (TREE_TYPE (decl))
 	    && (!CLASS_TYPE_P (TREE_TYPE (decl))
 	        || !TYPE_HAS_NONTRIVIAL_DESTRUCTOR (TREE_TYPE (decl))))
 	  warning_at (DECL_SOURCE_LOCATION (decl),
-		      OPT_Wunused_but_set_parameter,
+		      OPT_Wunused_but_set_parameter_,
 		      "parameter %qD set but not used", decl);
       unused_but_set_errorcount = errorcount;
     }
@@ -19454,7 +19534,8 @@ finish_function (bool inline_p)
       && !cp_function_chain->can_throw
       && !flag_non_call_exceptions
       && !decl_replaceable_p (fndecl,
-			      opt_for_fn (fndecl, flag_semantic_interposition)))
+			      opt_for_fn (fndecl, flag_semantic_interposition))
+      && !lookup_attribute ("noipa", DECL_ATTRIBUTES (fndecl)))
     TREE_NOTHROW (fndecl) = 1;
 
  cleanup:
@@ -19833,14 +19914,14 @@ cp_tree_node_structure (union lang_tree_node * t)
 {
   switch (TREE_CODE (&t->generic))
     {
-    case ARGUMENT_PACK_SELECT:  return TS_CP_ARGUMENT_PACK_SELECT;
+    case ARGUMENT_PACK_SELECT:	return TS_CP_ARGUMENT_PACK_SELECT;
     case BASELINK:		return TS_CP_BASELINK;
-    case CONSTRAINT_INFO:       return TS_CP_CONSTRAINT_INFO;
+    case CONSTRAINT_INFO:	return TS_CP_CONSTRAINT_INFO;
     case DEFERRED_NOEXCEPT:	return TS_CP_DEFERRED_NOEXCEPT;
     case DEFERRED_PARSE:	return TS_CP_DEFERRED_PARSE;
     case IDENTIFIER_NODE:	return TS_CP_IDENTIFIER;
     case LAMBDA_EXPR:		return TS_CP_LAMBDA_EXPR;
-    case BINDING_VECTOR:		return TS_CP_BINDING_VECTOR;
+    case BINDING_VECTOR:	return TS_CP_BINDING_VECTOR;
     case OVERLOAD:		return TS_CP_OVERLOAD;
     case PTRMEM_CST:		return TS_CP_PTRMEM;
     case STATIC_ASSERT:		return TS_CP_STATIC_ASSERT;
@@ -19848,6 +19929,7 @@ cp_tree_node_structure (union lang_tree_node * t)
     case TEMPLATE_INFO:		return TS_CP_TEMPLATE_INFO;
     case TEMPLATE_PARM_INDEX:	return TS_CP_TPI;
     case TRAIT_EXPR:		return TS_CP_TRAIT_EXPR;
+    case TU_LOCAL_ENTITY:	return TS_CP_TU_LOCAL_ENTITY;
     case USERDEF_LITERAL:	return TS_CP_USERDEF_LITERAL;
     default:			return TS_CP_GENERIC;
     }
@@ -19955,7 +20037,7 @@ require_deduced_type (tree decl, tsubst_flags_t complain)
 	/* We probably already complained about deduction failure.  */;
       else if (complain & tf_error)
 	error ("use of %qD before deduction of %<auto%>", decl);
-      note_failed_type_completion_for_satisfaction (decl);
+      note_failed_type_completion (decl, complain);
       return false;
     }
   return true;

@@ -1058,13 +1058,8 @@ public:
 
 	if (sle != NULL)
 	  {
-	    StructDeclaration *sd = type->baseElemOf ()->isTypeStruct ()->sym;
 	    sle->sym = build_address (this->func_->shidden);
 	    using_rvo_p = true;
-
-	    /* Fill any alignment holes in the return slot using memset.  */
-	    if (!identity_compare_p (sd) || sd->isUnionDeclaration ())
-	      add_stmt (build_memset_call (this->func_->shidden));
 	  }
 
 	if (using_rvo_p == true)
@@ -1455,7 +1450,8 @@ public:
 	    oconstraints[i] = constraint;
 
 	    if (parse_output_constraint (&constraint, i, ninputs, noutputs,
-					 &allows_mem, &allows_reg, &is_inout))
+					 &allows_mem, &allows_reg, &is_inout,
+					 nullptr))
 	      {
 		/* If the output argument is going to end up in memory.  */
 		if (!allows_reg)
@@ -1474,7 +1470,8 @@ public:
 	      = TREE_STRING_POINTER (TREE_VALUE (TREE_PURPOSE (t)));
 
 	    if (parse_input_constraint (&constraint, i, ninputs, noutputs, 0,
-					oconstraints, &allows_mem, &allows_reg))
+					oconstraints, &allows_mem, &allows_reg,
+					nullptr))
 	      {
 		/* If the input argument is going to end up in memory.  */
 		if (!allows_reg && allows_mem)

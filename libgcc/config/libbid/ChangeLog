@@ -1,3 +1,14 @@
+2025-07-15  Andrew Pinski  <quic_apinski@quicinc.com>
+
+	* bid_binarydecimal.c (__mul_10x256_to_256): Mark c3 as being
+	used.
+
+2025-05-15  liuhongt  <hongtao.liu@intel.com>
+
+	* bid128_string.c (MIN_DIGITS): New macro.
+	(bid128_from_string): Bug fix. Conversion from very long input
+	string to decimal.
+
 2024-11-14  Christophe Lyon  <christophe.lyon@linaro.org>
 
 	PR libgcc/117537

@@ -43,7 +43,7 @@ along with GCC; see the file COPYING3.  If not see
 #endif
 
 #ifndef RISCV_TUNE_STRING_DEFAULT
-#define RISCV_TUNE_STRING_DEFAULT "rocket"
+#define RISCV_TUNE_STRING_DEFAULT "generic"
 #endif
 
 extern const char *riscv_expand_arch (int argc, const char **argv);
@@ -888,7 +888,7 @@ extern enum riscv_cc get_riscv_cc (const rtx use);
 #define ASM_OUTPUT_OPCODE(STREAM, PTR)	\
   (PTR) = riscv_asm_output_opcode(STREAM, PTR)
 
-#define JUMP_TABLES_IN_TEXT_SECTION 0
+#define JUMP_TABLES_IN_TEXT_SECTION (riscv_cmodel == CM_LARGE)
 #define CASE_VECTOR_MODE SImode
 #define CASE_VECTOR_PC_RELATIVE (riscv_cmodel != CM_MEDLOW)
 

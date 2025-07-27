@@ -3088,7 +3088,7 @@ iv_can_overflow_p (class loop *loop, tree type, tree base, tree step)
   type_max = wi::max_value (type);
 
   /* Just sanity check that we don't see values out of the range of the type.
-     In this case the arithmetics bellow would overflow.  */
+     In this case the arithmetics below would overflow.  */
   gcc_checking_assert (wi::ge_p (base_min, type_min, sgn)
 		       && wi::le_p (base_max, type_max, sgn));
 
@@ -3932,11 +3932,8 @@ final_value_replacement_loop (class loop *loop)
 	  gsi2 = gsi_start (stmts);
 	  while (!gsi_end_p (gsi2))
 	    {
-	      gimple *stmt = gsi_stmt (gsi2);
-	      if (is_gimple_assign (stmt)
-		  && arith_code_with_undefined_signed_overflow
-		       (gimple_assign_rhs_code (stmt)))
-		rewrite_to_defined_overflow (&gsi2);
+	      if (gimple_needing_rewrite_undefined (gsi_stmt (gsi2)))
+		rewrite_to_defined_unconditional (&gsi2);
 	      gsi_next (&gsi2);
 	    }
 	}

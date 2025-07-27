@@ -494,6 +494,10 @@ fold_or_predicates (location_t loc, tree c1, tree c2)
 static tree
 fold_build_cond_expr (tree type, tree cond, tree rhs, tree lhs)
 {
+  /* Short cut the case where both rhs and lhs are the same. */
+  if (operand_equal_p (rhs, lhs))
+    return rhs;
+
   /* If COND is comparison r != 0 and r has boolean type, convert COND
      to SSA_NAME to accept by vect bool pattern.  */
   if (TREE_CODE (cond) == NE_EXPR)
@@ -1066,11 +1070,7 @@ if_convertible_gimple_assign_stmt_p (gimple *stmt,
 	fprintf (dump_file, "tree could trap...\n");
       return false;
     }
-  else if ((INTEGRAL_TYPE_P (TREE_TYPE (lhs))
-	    || POINTER_TYPE_P (TREE_TYPE (lhs)))
-	   && TYPE_OVERFLOW_UNDEFINED (TREE_TYPE (lhs))
-	   && arith_code_with_undefined_signed_overflow
-				(gimple_assign_rhs_code (stmt)))
+  else if (gimple_needing_rewrite_undefined (stmt))
     /* We have to rewrite stmts with undefined overflow.  */
     need_to_rewrite_undefined = true;
 
@@ -2114,6 +2114,187 @@ gen_phi_arg_condition (gphi *phi, ifcvt_arg_entry_t &arg,
   return cond;
 }
 
+/* Find the operand which is different between ARG0_OP and ARG1_OP.
+   Returns the operand num where the difference is.
+   Set NEWARG0 and NEWARG1 from the different argument.
+   Returns -1 if none is found.
+   If ARG0_OP/ARG1_OP is commutative also try swapping the
+   two commutative operands and return the operand number where
+   the difference happens in ARG0_OP. */
+
+static int
+find_different_opnum (const gimple_match_op &arg0_op,
+		      const gimple_match_op &arg1_op,
+		      tree *new_arg0, tree *new_arg1)
+{
+  unsigned opnum = -1;
+  unsigned first;
+  first = first_commutative_argument (arg1_op.code, arg1_op.type);
+  for (unsigned i = 0; i < arg0_op.num_ops; i++)
+    {
+      if (!operand_equal_for_phi_arg_p (arg0_op.ops[i],
+					arg1_op.ops[i]))
+	{
+	  /* Can handle only one non equal operand. */
+	  if (opnum != -1u)
+	    {
+	      /* Though if opnum is right before i and opnum is equal
+		 to the first communtative argument, handle communtative
+		 specially. */
+	      if (i == opnum + 1 && opnum == first)
+		goto commutative;
+	      return -1;
+	    }
+	  opnum = i;
+	}
+  }
+  /* If all operands are equal only do this is there was single
+     operand.  */
+  if (opnum == -1u)
+    {
+      if (arg0_op.num_ops != 1)
+	return -1;
+      opnum = 0;
+    }
+  *new_arg0 = arg0_op.ops[opnum];
+  *new_arg1 = arg1_op.ops[opnum];
+  return opnum;
+
+/* Handle commutative operations. */
+commutative:
+  gcc_assert (first != -1u);
+
+  /* Check the rest of the arguments to make sure they are the same. */
+  for (unsigned i = first + 2; i < arg0_op.num_ops; i++)
+    if (!operand_equal_for_phi_arg_p (arg0_op.ops[i],
+				      arg1_op.ops[i]))
+      return -1;
+
+  /* If the arg0[first+1] and arg1[first] are the same
+     then the one which is different is arg0[first] and arg1[first+1]
+     return first since this is based on arg0.  */
+  if (operand_equal_for_phi_arg_p (arg0_op.ops[first + 1],
+				   arg1_op.ops[first]))
+    {
+       *new_arg0 = arg0_op.ops[first];
+       *new_arg1 = arg1_op.ops[first + 1];
+       return first;
+    }
+  /* If the arg0[first] and arg1[first+1] are the same
+     then the one which is different is arg0[first+1] and arg1[first]
+     return first+1 since this is based on arg0.  */
+  if (operand_equal_for_phi_arg_p (arg0_op.ops[first],
+				   arg1_op.ops[first + 1]))
+    {
+       *new_arg0 = arg0_op.ops[first + 1];
+       *new_arg1 = arg1_op.ops[first];
+       return first + 1;
+    }
+  return -1;
+}
+
+/* Factors out an operation from *ARG0 and *ARG1 and
+   create the new statement at GSI. *RES is the
+   result of that new statement. Update *ARG0 and *ARG1
+   and *RES to the new values if the factoring happened.
+   Loops until all of the factoring is completed.  */
+
+static void
+factor_out_operators (tree *res, gimple_stmt_iterator *gsi,
+		      tree *arg0, tree *arg1, gphi *phi)
+{
+  gimple_match_op arg0_op, arg1_op;
+  bool repeated = false;
+
+again:
+  if (TREE_CODE (*arg0) != SSA_NAME || TREE_CODE (*arg1) != SSA_NAME)
+    return;
+
+  if (operand_equal_p (*arg0, *arg1))
+    return;
+
+  /* If either args have > 1 use, then this transformation actually
+     increases the number of expressions evaluated at runtime.  */
+  if (repeated
+      ? (!has_zero_uses (*arg0) || !has_zero_uses (*arg1))
+      : (!has_single_use (*arg0) || !has_single_use (*arg1)))
+    return;
+
+  gimple *arg0_def_stmt = SSA_NAME_DEF_STMT (*arg0);
+  if (!gimple_extract_op (arg0_def_stmt, &arg0_op))
+    return;
+
+  /* At this point there should be no ssa names occuring in abnormals.  */
+  gcc_assert (!arg0_op.operands_occurs_in_abnormal_phi ());
+
+  gimple *arg1_def_stmt = SSA_NAME_DEF_STMT (*arg1);
+  if (!gimple_extract_op (arg1_def_stmt, &arg1_op))
+    return;
+
+  /* At this point there should be no ssa names occuring in abnormals.  */
+  gcc_assert (!arg1_op.operands_occurs_in_abnormal_phi ());
+
+  /* No factoring can happen if the codes are different
+     or the number operands.  */
+  if (arg1_op.code != arg0_op.code
+      || arg1_op.num_ops != arg0_op.num_ops)
+    return;
+
+  tree new_arg0, new_arg1;
+  int opnum = find_different_opnum (arg0_op, arg1_op, &new_arg0, &new_arg1);
+  if (opnum == -1)
+    return;
+
+  if (!types_compatible_p (TREE_TYPE (new_arg0), TREE_TYPE (new_arg1)))
+    return;
+  tree new_res = make_ssa_name (TREE_TYPE (new_arg0), NULL);
+
+  /* Create the operation stmt if possible and insert it.  */
+
+  gimple_match_op new_op = arg0_op;
+  new_op.ops[opnum] = new_res;
+  gimple_seq seq = NULL;
+  tree result = *res;
+  result = maybe_push_res_to_seq (&new_op, &seq, result);
+
+  /* If we can't create the new statement, release the temp name
+     and return back.  */
+  if (!result)
+    {
+      release_ssa_name (new_res);
+      return;
+    }
+  gsi_insert_seq_before (gsi, seq, GSI_CONTINUE_LINKING);
+
+  if (dump_file && (dump_flags & TDF_DETAILS))
+    {
+      fprintf (dump_file, "PHI ");
+      print_generic_expr (dump_file, gimple_phi_result (phi));
+      fprintf (dump_file,
+	       " changed to factor operation out from COND_EXPR.\n");
+      fprintf (dump_file, "New stmt with OPERATION that defines ");
+      print_generic_expr (dump_file, result);
+      fprintf (dump_file, ".\n");
+    }
+
+  /* Remove the old operation(s) that has single use.  */
+  gimple_stmt_iterator gsi_for_def;
+
+  gsi_for_def = gsi_for_stmt (arg0_def_stmt);
+  gsi_remove (&gsi_for_def, true);
+  release_defs (arg0_def_stmt);
+  gsi_for_def = gsi_for_stmt (arg1_def_stmt);
+  gsi_remove (&gsi_for_def, true);
+  release_defs (arg1_def_stmt);
+
+  /* Update the arguments and try again.  */
+  *arg0 = new_arg0;
+  *arg1 = new_arg1;
+  *res = new_res;
+  repeated = true;
+  goto again;
+}
+
 /* Create the smallest nested conditional possible.  On pre-order we record
    which conditionals are live, and on post-order rewrite the chain by removing
    already active conditions.
@@ -2293,6 +2474,11 @@ predicate_scalar_phi (gphi *phi, gimple_stmt_iterator *gsi, bool loop_versioned)
 	  arg0 = gimple_phi_arg_def (phi, 0);
 	  arg1 = gimple_phi_arg_def (phi, 1);
 	}
+
+      /* Factor out operand if possible. This can only be done easily
+	 for PHI with 2 elements.  */
+      factor_out_operators (&res, gsi, &arg0, &arg1, phi);
+
       if (is_cond_scalar_reduction (phi, &reduc, arg0, arg1,
 				    &op0, &op1, false, &has_nop,
 				    &nop_reduc))
@@ -2830,7 +3016,6 @@ predicate_statements (loop_p loop)
       for (gsi = gsi_start_bb (bb); !gsi_end_p (gsi);)
 	{
 	  gassign *stmt = dyn_cast <gassign *> (gsi_stmt (gsi));
-	  tree lhs;
 	  if (!stmt)
 	    ;
 	  else if (is_false_predicate (cond)
@@ -2886,13 +3071,8 @@ predicate_statements (loop_p loop)
 
 	      gsi_replace (&gsi, new_stmt, true);
 	    }
-	  else if (((lhs = gimple_assign_lhs (stmt)), true)
-		   && (INTEGRAL_TYPE_P (TREE_TYPE (lhs))
-		       || POINTER_TYPE_P (TREE_TYPE (lhs)))
-		   && TYPE_OVERFLOW_UNDEFINED (TREE_TYPE (lhs))
-		   && arith_code_with_undefined_signed_overflow
-						(gimple_assign_rhs_code (stmt)))
-	    rewrite_to_defined_overflow (&gsi);
+	  else if (gimple_needing_rewrite_undefined (stmt))
+	    rewrite_to_defined_unconditional (&gsi);
 	  else if (gimple_vdef (stmt))
 	    {
 	      tree lhs = gimple_assign_lhs (stmt);
@@ -2946,7 +3126,7 @@ predicate_statements (loop_p loop)
 	      gsi_replace (&gsi, new_call, true);
 	    }
 
-	  lhs = gimple_get_lhs (gsi_stmt (gsi));
+	  tree lhs = gimple_get_lhs (gsi_stmt (gsi));
 	  if (lhs && TREE_CODE (lhs) == SSA_NAME)
 	    ssa_names.add (lhs);
 	  gsi_next (&gsi);
@@ -3014,12 +3194,10 @@ combine_blocks (class loop *loop, bool loop_versioned)
 
   /* Reset flow-sensitive info before predicating stmts or PHIs we
      might fold.  */
-  bool *predicated = XNEWVEC (bool, orig_loop_num_nodes);
   for (i = 0; i < orig_loop_num_nodes; i++)
     {
       bb = ifc_bbs[i];
-      predicated[i] = is_predicated (bb);
-      if (predicated[i])
+      if (is_predicated (bb))
 	{
 	  for (auto gsi = gsi_start_phis (bb);
 	       !gsi_end_p (gsi); gsi_next (&gsi))
@@ -3221,7 +3399,6 @@ combine_blocks (class loop *loop, bool loop_versioned)
 
   free (ifc_bbs);
   ifc_bbs = NULL;
-  free (predicated);
 }
 
 /* Version LOOP before if-converting it; the original loop

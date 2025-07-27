@@ -18,26 +18,11 @@ You should have received a copy of the GNU General Public License
 along with GCC; see the file COPYING3.  If not see
 <http://www.gnu.org/licenses/>.  */
 
-#include "config.h"
-#include "system.h"
-#include "coretypes.h"
-#include "pretty-print.h"
-#include "tree.h"
-#include "options.h"
-#include "ordered-hash-map.h"
-#include "options.h"
-#include "cgraph.h"
-#include "function.h"
-#include "cfg.h"
-#include "basic-block.h"
-#include "gimple.h"
-#include "gimple-iterator.h"
-#include "digraph.h"
-#include "analyzer/analyzer.h"
+#include "analyzer/common.h"
+
 #include "analyzer/analyzer-logging.h"
 #include "analyzer/call-string.h"
 #include "analyzer/supergraph.h"
-#include "make-unique.h"
 
 #if ENABLE_ANALYZER
 
@@ -106,11 +91,11 @@ call_string::print (pretty_printer *pp) const
 std::unique_ptr<json::value>
 call_string::to_json () const
 {
-  auto arr = ::make_unique<json::array> ();
+  auto arr = std::make_unique<json::array> ();
 
   for (const call_string::element_t &e : m_elements)
     {
-      auto e_obj = ::make_unique<json::object> ();
+      auto e_obj = std::make_unique<json::object> ();
       e_obj->set_integer ("src_snode_idx", e.m_callee->m_index);
       e_obj->set_integer ("dst_snode_idx", e.m_caller->m_index);
       e_obj->set_string ("funcname", function_name (e.m_caller->m_fun));
@@ -238,22 +223,22 @@ call_string::cmp_ptr_ptr (const void *pa, const void *pb)
 }
 
 /* Return the pointer to callee of the topmost call in the stack,
-   or NULL if stack is empty.  */
+   or nullptr if stack is empty.  */
 const supernode *
 call_string::get_callee_node () const
 {
   if(m_elements.is_empty ())
-    return NULL;
+    return nullptr;
   return m_elements[m_elements.length () - 1].m_callee;
 }
 
 /* Return the pointer to caller of the topmost call in the stack,
-   or NULL if stack is empty.  */
+   or nullptr if stack is empty.  */
 const supernode *
 call_string::get_caller_node () const
 {
   if(m_elements.is_empty ())
-    return NULL;
+    return nullptr;
   return m_elements[m_elements.length () - 1].m_caller;
 }
 
@@ -281,7 +266,7 @@ call_string::validate () const
 /* ctor for the root/empty call_string.  */
 
 call_string::call_string ()
-: m_parent (NULL), m_elements ()
+: m_parent (nullptr), m_elements ()
 {
 }
 

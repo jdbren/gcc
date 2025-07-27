@@ -48,7 +48,6 @@ along with GCC; see the file COPYING3.  If not see
 #include "alias.h"
 #include "explow.h"
 #include "expr.h"
-#include "reload.h"
 #include "langhooks.h"
 #include "gimplify.h"
 #include "builtins.h"
@@ -160,6 +159,10 @@ static void xtensa_asm_trampoline_template (FILE *);
 static void xtensa_trampoline_init (rtx, tree, rtx);
 static bool xtensa_output_addr_const_extra (FILE *, rtx);
 static bool xtensa_cannot_force_const_mem (machine_mode, rtx);
+static machine_mode xtensa_promote_function_mode (const_tree,
+						  machine_mode,
+						  int *, const_tree,
+						  int);
 
 static reg_class_t xtensa_preferred_reload_class (rtx, reg_class_t);
 static reg_class_t xtensa_preferred_output_reload_class (rtx, reg_class_t);
@@ -197,6 +200,9 @@ static void xtensa_output_mi_thunk (FILE *file, tree thunk ATTRIBUTE_UNUSED,
 				    tree function);
 
 static rtx xtensa_delegitimize_address (rtx);
+static reg_class_t xtensa_ira_change_pseudo_allocno_class (int, reg_class_t,
+							   reg_class_t);
+static HARD_REG_SET xtensa_zero_call_used_regs (HARD_REG_SET);
 
 
 
@@ -233,9 +239,7 @@ static rtx xtensa_delegitimize_address (rtx);
 #define TARGET_EXPAND_BUILTIN_VA_START xtensa_va_start
 
 #undef TARGET_PROMOTE_FUNCTION_MODE
-#define TARGET_PROMOTE_FUNCTION_MODE default_promote_function_mode_always_promote
-#undef TARGET_PROMOTE_PROTOTYPES
-#define TARGET_PROMOTE_PROTOTYPES hook_bool_const_tree_true
+#define TARGET_PROMOTE_FUNCTION_MODE xtensa_promote_function_mode
 
 #undef TARGET_RETURN_IN_MEMORY
 #define TARGET_RETURN_IN_MEMORY xtensa_return_in_memory
@@ -366,6 +370,12 @@ static rtx xtensa_delegitimize_address (rtx);
 #undef TARGET_DIFFERENT_ADDR_DISPLACEMENT_P
 #define TARGET_DIFFERENT_ADDR_DISPLACEMENT_P hook_bool_void_true
 
+#undef TARGET_IRA_CHANGE_PSEUDO_ALLOCNO_CLASS
+#define TARGET_IRA_CHANGE_PSEUDO_ALLOCNO_CLASS xtensa_ira_change_pseudo_allocno_class
+
+#undef TARGET_ZERO_CALL_USED_REGS
+#define TARGET_ZERO_CALL_USED_REGS xtensa_zero_call_used_regs
+
 struct gcc_target targetm = TARGET_INITIALIZER;
 
 
@@ -413,12 +423,13 @@ xtensa_uimm8x4 (HOST_WIDE_INT v)
 }
 
 
-static bool
-xtensa_b4const (HOST_WIDE_INT v)
+bool
+xtensa_b4const_or_zero (HOST_WIDE_INT v)
 {
   switch (v)
     {
     case -1:
+    case 0:
     case 1:
     case 2:
     case 3:
@@ -437,15 +448,6 @@ xtensa_b4const (HOST_WIDE_INT v)
       return true;
     }
   return false;
-}
-
-
-bool
-xtensa_b4const_or_zero (HOST_WIDE_INT v)
-{
-  if (v == 0)
-    return true;
-  return xtensa_b4const (v);
 }
 
 
@@ -599,8 +601,8 @@ constantpool_address_p (const_rtx addr)
 
       /* Make sure the address is word aligned.  */
       offset = XEXP (addr, 1);
-      if ((!CONST_INT_P (offset))
-	  || ((INTVAL (offset) & 3) != 0))
+      if (! CONST_INT_P (offset)
+	  || (INTVAL (offset) & 3) != 0)
 	return false;
 
       sym = XEXP (addr, 0);
@@ -609,6 +611,7 @@ constantpool_address_p (const_rtx addr)
   if (SYMBOL_REF_P (sym)
       && CONSTANT_POOL_ADDRESS_P (sym))
     return true;
+
   return false;
 }
 
@@ -1482,8 +1485,7 @@ xtensa_copy_incoming_a7 (rtx opnd)
   if (mode == DFmode || mode == DImode)
     emit_insn (gen_movsi_internal (gen_rtx_SUBREG (SImode, tmp, 0),
 				   gen_rtx_REG (SImode, A7_REG - 1)));
-  entry_insns = get_insns ();
-  end_sequence ();
+  entry_insns = end_sequence ();
 
   if (cfun->machine->vararg_a7)
     {
@@ -1644,8 +1646,7 @@ xtensa_expand_block_set_libcall (rtx dst_mem,
 		     GEN_INT (value), SImode,
 		     GEN_INT (bytes), SImode);
 
-  seq = get_insns ();
-  end_sequence ();
+  seq = end_sequence ();
 
   return seq;
 }
@@ -1706,8 +1707,7 @@ xtensa_expand_block_set_unrolled_loop (rtx dst_mem,
     }
   while (bytes > 0);
 
-  seq = get_insns ();
-  end_sequence ();
+  seq = end_sequence ();
 
   return seq;
 }
@@ -1788,8 +1788,7 @@ xtensa_expand_block_set_small_loop (rtx dst_mem,
   emit_insn (gen_addsi3 (dst, dst, GEN_INT (align)));
   emit_cmp_and_jump_insns (dst, end, NE, const0_rtx, SImode, true, label);
 
-  seq = get_insns ();
-  end_sequence ();
+  seq = end_sequence ();
 
   return seq;
 }
@@ -2467,8 +2466,7 @@ xtensa_call_tls_desc (rtx sym, rtx *retp)
   emit_move_insn (a_io, arg);
   call_insn = emit_call_insn (gen_tls_call (a_io, fn, sym, const1_rtx));
   use_reg (&CALL_INSN_FUNCTION_USAGE (call_insn), a_io);
-  insns = get_insns ();
-  end_sequence ();
+  insns = end_sequence ();
 
   *retp = a_io;
   return insns;
@@ -3048,6 +3046,8 @@ xtensa_modes_tieable_p (machine_mode mode1, machine_mode mode2)
    'K'  CONST_INT, print number of bits in mask for EXTUI
    'R'  CONST_INT, print (X & 0x1f)
    'L'  CONST_INT, print ((32 - X) & 0x1f)
+   'U', CONST_DOUBLE:SF, print (REAL_EXP (rval) - 1)
+   'V', CONST_DOUBLE:SF, print (1 - REAL_EXP (rval))
    'D'  REG, print second register of double-word register operand
    'N'  MEM, print address of next word following a memory operand
    'v'  MEM, if memory reference is volatile, output a MEMW before it
@@ -3142,6 +3142,20 @@ print_operand (FILE *file, rtx x, int letter)
 	fprintf (file, HOST_WIDE_INT_PRINT_DEC, INTVAL (x) & 0x1f);
       else
 	output_operand_lossage ("invalid %%R value");
+      break;
+
+    case 'U':
+      if (CONST_DOUBLE_P (x) && GET_MODE (x) == SFmode)
+	fprintf (file, "%d", REAL_EXP (CONST_DOUBLE_REAL_VALUE (x)) - 1);
+      else
+	output_operand_lossage ("invalid %%U value");
+      break;
+
+    case 'V':
+      if (CONST_DOUBLE_P (x) && GET_MODE (x) == SFmode)
+	fprintf (file, "%d", 1 - REAL_EXP (CONST_DOUBLE_REAL_VALUE (x)));
+      else
+	output_operand_lossage ("invalid %%V value");
       break;
 
     case 'x':
@@ -4430,17 +4444,25 @@ static int
 xtensa_register_move_cost (machine_mode mode ATTRIBUTE_UNUSED,
 			   reg_class_t from, reg_class_t to)
 {
-  if (from == to && from != BR_REGS && to != BR_REGS)
+  /* If both are equal (except for BR_REGS) or belong to AR_REGS,
+     the cost is 2 (the default value).  */
+  if ((from == to && from != BR_REGS && to != BR_REGS)
+      || (reg_class_subset_p (from, AR_REGS)
+	  && reg_class_subset_p (to, AR_REGS)))
     return 2;
-  else if (reg_class_subset_p (from, AR_REGS)
-	   && reg_class_subset_p (to, AR_REGS))
+
+  /* The cost between AR_REGS and FR_REGS is 2 (the default value).  */
+  if ((reg_class_subset_p (from, AR_REGS) && to == FP_REGS)
+      || (from == FP_REGS && reg_class_subset_p (to, AR_REGS)))
     return 2;
-  else if (reg_class_subset_p (from, AR_REGS) && to == ACC_REG)
+
+  if ((reg_class_subset_p (from, AR_REGS) && to == ACC_REG)
+      || (from == ACC_REG && reg_class_subset_p (to, AR_REGS)))
     return 3;
-  else if (from == ACC_REG && reg_class_subset_p (to, AR_REGS))
-    return 3;
-  else
-    return 10;
+
+  /* Otherwise, spills to stack (because greater than 2x the default
+     MEMORY_MOVE_COST).  */
+  return 10;
 }
 
 /* Compute a (partial) cost for rtx X.  Return true if the complete
@@ -4483,7 +4505,8 @@ xtensa_rtx_costs (rtx x, machine_mode mode, int outer_code,
 	    }
 	  break;
 	case COMPARE:
-	  if ((INTVAL (x) == 0) || xtensa_b4const (INTVAL (x)))
+	  if (xtensa_b4const_or_zero (INTVAL (x))
+	      || xtensa_b4constu (INTVAL (x)))
 	    {
 	      *total = 0;
 	      return true;
@@ -4672,29 +4695,32 @@ xtensa_rtx_costs (rtx x, machine_mode mode, int outer_code,
     }
 }
 
+/* Return TRUE if the specified insn corresponds to one or more L32R machine
+   instructions.  */
+
 static bool
 xtensa_is_insn_L32R_p (const rtx_insn *insn)
 {
-  rtx x = PATTERN (insn);
+  rtx pat, dest, src;
 
-  if (GET_CODE (x) != SET)
+  /* "PATTERN (insn)" can be used without checking, see insn_cost()
+     in gcc/rtlanal.cc.  */
+  if (GET_CODE (pat = PATTERN (insn)) != SET
+      || ! register_operand (dest = SET_DEST (pat), VOIDmode))
     return false;
 
-  x = XEXP (x, 1);
-  if (MEM_P (x))
-    {
-      x = XEXP (x, 0);
-      return (SYMBOL_REF_P (x) || CONST_INT_P (x))
-	     && CONSTANT_POOL_ADDRESS_P (x);
-    }
-
-  /* relaxed MOVI instructions, that will be converted to L32R by the
-     assembler.  */
-  if (CONST_INT_P (x)
-      && ! xtensa_simm12b (INTVAL (x)))
+  if (constantpool_mem_p (src = SET_SRC (pat)))
     return true;
 
-  return false;
+  /* Return true if:
+     - CONST16 instruction is not configured, and
+     - the source is some constant, and also
+     - negation of "the source is integer and fits into the immediate
+       field".  */
+  return (!TARGET_CONST16
+	  && CONSTANT_P (src)
+	  && ! ((GET_MODE (dest) == SImode || GET_MODE (dest) == HImode)
+		&& CONST_INT_P (src) && xtensa_simm12b (INTVAL (src))));
 }
 
 /* Compute a relative costs of RTL insns.  This is necessary in order to
@@ -4703,7 +4729,7 @@ xtensa_is_insn_L32R_p (const rtx_insn *insn)
 static int
 xtensa_insn_cost (rtx_insn *insn, bool speed)
 {
-  if (!(recog_memoized (insn) < 0))
+  if (! (recog_memoized (insn) < 0))
     {
       int len = get_attr_length (insn);
 
@@ -4716,7 +4742,7 @@ xtensa_insn_cost (rtx_insn *insn, bool speed)
 
 	  /* "L32R" may be particular slow (implementation-dependent).  */
 	  if (xtensa_is_insn_L32R_p (insn))
-	    return COSTS_N_INSNS (1 + xtensa_extra_l32r_costs);
+	    return COSTS_N_INSNS ((1 + xtensa_extra_l32r_costs) * n);
 
 	  /* Cost based on the pipeline model.  */
 	  switch (get_attr_type (insn))
@@ -4761,7 +4787,7 @@ xtensa_insn_cost (rtx_insn *insn, bool speed)
 	    {
 	      /* "L32R" itself plus constant in litpool.  */
 	      if (xtensa_is_insn_L32R_p (insn))
-		len = 3 + 4;
+		len += (len / 3) * 4;
 
 	      /* Consider fractional instruction length (for example, ".n"
 		 short instructions or "L32R" litpool constants.  */
@@ -4772,6 +4798,19 @@ xtensa_insn_cost (rtx_insn *insn, bool speed)
 
   /* Fall back.  */
   return pattern_cost (PATTERN (insn), speed);
+}
+
+/* Worker function for TARGET_PROMOTE_FUNCTION_MODE.  */
+
+static machine_mode
+xtensa_promote_function_mode (const_tree type, machine_mode mode,
+			      int *punsignedp, const_tree, int)
+{
+  if (GET_MODE_CLASS (mode) == MODE_INT
+      && GET_MODE_SIZE (mode) < GET_MODE_SIZE (SImode))
+    return SImode;
+
+  return promote_mode (type, mode, punsignedp);
 }
 
 /* Worker function for TARGET_RETURN_IN_MEMORY.  */
@@ -5426,6 +5465,74 @@ xtensa_delegitimize_address (rtx op)
       break;
     }
   return op;
+}
+
+/* Implement TARGET_IRA_CHANGE_PSEUDO_ALLOCNO_CLASS, in order to tell
+   the register allocator to avoid using ALL_REGS rclass.  */
+
+static reg_class_t
+xtensa_ira_change_pseudo_allocno_class (int regno, reg_class_t allocno_class,
+					reg_class_t best_class)
+{
+  if (allocno_class != ALL_REGS)
+    return allocno_class;
+
+  if (best_class != ALL_REGS)
+    return best_class;
+
+  return FLOAT_MODE_P (PSEUDO_REGNO_MODE (regno)) ? FP_REGS : AR_REGS;
+}
+
+/* Implement TARGET_ZERO_CALL_USED_REGS.  */
+
+static HARD_REG_SET
+xtensa_zero_call_used_regs (HARD_REG_SET selected_regs)
+{
+  unsigned int regno;
+  int zeroed_regno = -1;
+  hard_reg_set_iterator hrsi;
+  rtvec argvec, convec;
+
+  EXECUTE_IF_SET_IN_HARD_REG_SET (selected_regs, 1, regno, hrsi)
+    {
+      if (GP_REG_P (regno))
+	{
+	  emit_move_insn (gen_rtx_REG (SImode, regno), const0_rtx);
+	  if (zeroed_regno < 0)
+	    zeroed_regno = regno;
+	  continue;
+	}
+      if (TARGET_BOOLEANS && BR_REG_P (regno))
+	{
+	  gcc_assert (zeroed_regno >= 0);
+	  argvec = rtvec_alloc (1);
+	  RTVEC_ELT (argvec, 0) = gen_rtx_REG (SImode, zeroed_regno);
+	  convec = rtvec_alloc (1);
+	  RTVEC_ELT (convec, 0) = gen_rtx_ASM_INPUT (SImode, "r");
+	  emit_insn (gen_rtx_ASM_OPERANDS (VOIDmode, "wsr\t%0, BR",
+					   "", 0, argvec, convec,
+					   rtvec_alloc (0),
+					   UNKNOWN_LOCATION));
+	  continue;
+	}
+      if (TARGET_HARD_FLOAT && FP_REG_P (regno))
+	{
+	  gcc_assert (zeroed_regno >= 0);
+	  emit_move_insn (gen_rtx_REG (SFmode, regno),
+			  gen_rtx_REG (SFmode, zeroed_regno));
+	  continue;
+	}
+      if (TARGET_MAC16 && ACC_REG_P (regno))
+	{
+	  gcc_assert (zeroed_regno >= 0);
+	  emit_move_insn (gen_rtx_REG (SImode, regno),
+			  gen_rtx_REG (SImode, zeroed_regno));
+	  continue;
+	}
+      CLEAR_HARD_REG_BIT (selected_regs, regno);
+    }
+
+  return selected_regs;
 }
 
 #include "gt-xtensa.h"

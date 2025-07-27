@@ -123,7 +123,8 @@
 (define_predicate "aarch64_reg_or_and_imm"
    (ior (match_operand 0 "register_operand")
 	(and (match_code "const_vector")
-	     (match_test "aarch64_simd_valid_and_imm (op)"))))
+	     (ior (match_test "aarch64_simd_valid_and_imm (op)")
+		  (match_test "aarch64_simd_valid_and_imm_fmov (op)")))))
 
 (define_predicate "aarch64_reg_or_xor_imm"
    (ior (match_operand 0 "register_operand")
@@ -585,6 +586,11 @@
 {
   return aarch64_simd_shift_imm_p (op, mode, false);
 })
+
+(define_special_predicate "aarch64_predicate_operand"
+  (and (match_code "reg,subreg")
+       (match_test "register_operand (op, GET_MODE (op))")
+       (match_test "aarch64_sve_valid_pred_p (op, mode)")))
 
 (define_predicate "aarch64_simd_imm_zero"
   (and (match_code "const,const_vector")
@@ -1070,5 +1076,5 @@
 		    && !(INTVAL (op) & 0xf)")))
 
 (define_predicate "aarch64_maskload_else_operand"
-  (and (match_code "const_int,const_vector")
+  (and (match_code "const_vector")
        (match_test "op == CONST0_RTX (GET_MODE (op))")))

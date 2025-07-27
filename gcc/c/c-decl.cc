@@ -659,7 +659,8 @@ c_struct_hasher::hash (tree type)
   inchash::hash hstate;
 
   hstate.add_int (TREE_CODE (type));
-  hstate.add_object (TYPE_NAME (type));
+  tree tag = c_type_tag (type);
+  hstate.add_object (tag);
 
   return hstate.end ();
 }
@@ -1362,7 +1363,7 @@ pop_scope (void)
 	case VAR_DECL:
 	  /* Warnings for unused variables.  */
 	  if ((!TREE_USED (p) || !DECL_READ_P (p))
-	      && !warning_suppressed_p (p, OPT_Wunused_but_set_variable)
+	      && !warning_suppressed_p (p, OPT_Wunused_but_set_variable_)
 	      && !DECL_IN_SYSTEM_HEADER (p)
 	      && DECL_NAME (p)
 	      && !DECL_ARTIFICIAL (p)
@@ -1376,7 +1377,7 @@ pop_scope (void)
 		}
 	      else if (DECL_CONTEXT (p) == current_function_decl)
 		warning_at (DECL_SOURCE_LOCATION (p),
-			    OPT_Wunused_but_set_variable,
+			    OPT_Wunused_but_set_variable_,
 			    "variable %qD set but not used", p);
 	    }
 
@@ -2073,7 +2074,7 @@ static tree
 previous_tag (tree type)
 {
   struct c_binding *b = NULL;
-  tree name = TYPE_NAME (type);
+  tree name = c_type_tag (type);
 
   if (name)
     b = I_TAG_BINDING (name);
@@ -4546,21 +4547,23 @@ lookup_name_fuzzy (tree name, enum lookup_name_fuzzy_kind kind, location_t loc)
     = get_c_stdlib_header_for_name (IDENTIFIER_POINTER (name));
 
   if (header_hint)
-    return name_hint (NULL,
-		      new suggest_missing_header (loc,
-						  IDENTIFIER_POINTER (name),
-						  header_hint));
+    return name_hint
+      (nullptr,
+       std::make_unique<suggest_missing_header> (loc,
+						 IDENTIFIER_POINTER (name),
+						 header_hint));
 
   /* Next, look for exact matches for builtin defines that would have been
      defined if the user had passed a command-line option (e.g. -fopenmp
      for "_OPENMP").  */
-  diagnostic_option_id option_id
+  diagnostics::option_id option_id
     = get_option_for_builtin_define (IDENTIFIER_POINTER (name));
   if (option_id.m_idx > 0)
-    return name_hint (nullptr,
-		      new suggest_missing_option (loc,
-						  IDENTIFIER_POINTER (name),
-						  option_id));
+    return name_hint
+      (nullptr,
+       std::make_unique<suggest_missing_option> (loc,
+						 IDENTIFIER_POINTER (name),
+						 option_id));
 
   /* Only suggest names reserved for the implementation if NAME begins
      with an underscore.  */
@@ -5717,26 +5720,6 @@ start_decl (struct c_declarator *declarator, struct c_declspecs *declspecs,
 	;
       else if (declspecs->storage_class != csc_static)
 	DECL_EXTERNAL (decl) = !DECL_EXTERNAL (decl);
-    }
-
-  if (TREE_CODE (decl) == FUNCTION_DECL
-      && targetm.calls.promote_prototypes (TREE_TYPE (decl)))
-    {
-      struct c_declarator *ce = declarator;
-
-      if (ce->kind == cdk_pointer)
-	ce = declarator->declarator;
-      if (ce->kind == cdk_function)
-	{
-	  tree args = ce->u.arg_info->parms;
-	  for (; args; args = DECL_CHAIN (args))
-	    {
-	      tree type = TREE_TYPE (args);
-	      if (type && INTEGRAL_TYPE_P (type)
-		  && TYPE_PRECISION (type) < TYPE_PRECISION (integer_type_node))
-		DECL_ARG_TYPE (args) = c_type_promotes_to (type);
-	    }
-	}
     }
 
   if (TREE_CODE (decl) == FUNCTION_DECL
@@ -8960,12 +8943,14 @@ start_struct (location_t loc, enum tree_code code, tree name,
      within a statement expr used within sizeof, et. al.  This is not
      terribly serious as C++ doesn't permit statement exprs within
      sizeof anyhow.  */
-  if (warn_cxx_compat && (in_sizeof || in_typeof || in_alignof))
+  if (warn_cxx_compat
+      && (in_sizeof || in_typeof || in_alignof || in_countof))
     warning_at (loc, OPT_Wc___compat,
 		"defining type in %qs expression is invalid in C++",
-		(in_sizeof
-		 ? "sizeof"
-		 : (in_typeof ? "typeof" : "alignof")));
+		(in_sizeof ? "sizeof"
+		 : in_typeof ? "typeof"
+		 : in_alignof ? "alignof"
+		 : "_Countof"));
 
   if (in_underspecified_init)
     error_at (loc, "%qT defined in underspecified object initializer", ref);
@@ -9664,15 +9649,18 @@ finish_struct (location_t loc, tree t, tree fieldlist, tree attributes,
       DECL_NOT_FLEXARRAY (x) = !is_flexible_array_member_p (is_last_field, x);
 
       /* Set TYPE_INCLUDES_FLEXARRAY for the context of x, t.
-	 when x is an array and is the last field.  */
+	 when x is an array and is the last field.
+	 There is only one last_field for a structure type, but there might
+	 be multiple last_fields for a union type, therefore we should ORed
+	 the result for multiple last_fields.  */
       if (TREE_CODE (TREE_TYPE (x)) == ARRAY_TYPE)
 	TYPE_INCLUDES_FLEXARRAY (t)
-	  = is_last_field && c_flexible_array_member_type_p (TREE_TYPE (x));
+	  |= is_last_field && c_flexible_array_member_type_p (TREE_TYPE (x));
       /* Recursively set TYPE_INCLUDES_FLEXARRAY for the context of x, t
 	 when x is an union or record and is the last field.  */
       else if (RECORD_OR_UNION_TYPE_P (TREE_TYPE (x)))
 	TYPE_INCLUDES_FLEXARRAY (t)
-	  = is_last_field && TYPE_INCLUDES_FLEXARRAY (TREE_TYPE (x));
+	  |= is_last_field && TYPE_INCLUDES_FLEXARRAY (TREE_TYPE (x));
 
       if (warn_flex_array_member_not_at_end
 	  && !is_last_field
@@ -9802,12 +9790,17 @@ finish_struct (location_t loc, tree t, tree fieldlist, tree attributes,
 	len += list_length (x);
 
 	/* Use the same allocation policy here that make_node uses, to
-	  ensure that this lives as long as the rest of the struct decl.
-	  All decls in an inline function need to be saved.  */
+	   ensure that this lives as long as the rest of the struct decl.
+	   All decls in an inline function need to be saved.  */
 
-	space = ggc_cleared_alloc<struct lang_type> ();
-	space2 = (sorted_fields_type *) ggc_internal_alloc
-	  (sizeof (struct sorted_fields_type) + len * sizeof (tree));
+	space = ((struct lang_type *)
+		 ggc_internal_cleared_alloc (c_dialect_objc ()
+					     ? sizeof (struct lang_type)
+					     : offsetof (struct lang_type,
+							 info)));
+	space2 = ((sorted_fields_type *)
+		  ggc_internal_alloc (sizeof (struct sorted_fields_type)
+				      + len * sizeof (tree)));
 
 	len = 0;
 	space->s = space2;
@@ -9908,6 +9901,7 @@ finish_struct (location_t loc, tree t, tree fieldlist, tree attributes,
       C_TYPE_VARIABLE_SIZE (x) = C_TYPE_VARIABLE_SIZE (t);
       C_TYPE_VARIABLY_MODIFIED (x) = C_TYPE_VARIABLY_MODIFIED (t);
       C_TYPE_INCOMPLETE_VARS (x) = NULL_TREE;
+      TYPE_INCLUDES_FLEXARRAY (x) = TYPE_INCLUDES_FLEXARRAY (t);
     }
 
   /* Update type location to the one of the definition, instead of e.g.
@@ -9940,7 +9934,7 @@ finish_struct (location_t loc, tree t, tree fieldlist, tree attributes,
 	 struct_types.  */
       if (warn_cxx_compat
 	  && struct_parse_info != NULL
-	  && !in_sizeof && !in_typeof && !in_alignof)
+	  && !in_sizeof && !in_typeof && !in_alignof && !in_countof)
 	struct_parse_info->struct_types.safe_push (t);
      }
 
@@ -10114,12 +10108,14 @@ start_enum (location_t loc, struct c_enum_contents *the_enum, tree name,
   /* FIXME: This will issue a warning for a use of a type defined
      within sizeof in a statement expr.  This is not terribly serious
      as C++ doesn't permit statement exprs within sizeof anyhow.  */
-  if (warn_cxx_compat && (in_sizeof || in_typeof || in_alignof))
+  if (warn_cxx_compat
+      && (in_sizeof || in_typeof || in_alignof || in_countof))
     warning_at (loc, OPT_Wc___compat,
 		"defining type in %qs expression is invalid in C++",
-		(in_sizeof
-		 ? "sizeof"
-		 : (in_typeof ? "typeof" : "alignof")));
+		(in_sizeof ? "sizeof"
+		 : in_typeof ? "typeof"
+		 : in_alignof ? "alignof"
+		 : "_Countof"));
 
   if (in_underspecified_init)
     error_at (loc, "%qT defined in underspecified object initializer",
@@ -10278,7 +10274,10 @@ finish_enum (tree enumtype, tree values, tree attributes)
 
   /* Record the min/max values so that we can warn about bit-field
      enumerations that are too small for the values.  */
-  lt = ggc_cleared_alloc<struct lang_type> ();
+  lt = ((struct lang_type *)
+	ggc_internal_cleared_alloc (c_dialect_objc ()
+				    ? sizeof (struct lang_type)
+				    : offsetof (struct lang_type, info)));
   lt->enum_min = minnode;
   lt->enum_max = maxnode;
   TYPE_LANG_SPECIFIC (enumtype) = lt;
@@ -10302,6 +10301,7 @@ finish_enum (tree enumtype, tree values, tree attributes)
       TYPE_UNSIGNED (tem) = TYPE_UNSIGNED (enumtype);
       TYPE_LANG_SPECIFIC (tem) = TYPE_LANG_SPECIFIC (enumtype);
       ENUM_UNDERLYING_TYPE (tem) = ENUM_UNDERLYING_TYPE (enumtype);
+      TYPE_PACKED (tem) = TYPE_PACKED (enumtype);
     }
 
   /* Finish debugging output for this type.  */
@@ -10313,7 +10313,7 @@ finish_enum (tree enumtype, tree values, tree attributes)
      struct_types.  */
   if (warn_cxx_compat
       && struct_parse_info != NULL
-      && !in_sizeof && !in_typeof && !in_alignof)
+      && !in_sizeof && !in_typeof && !in_alignof && !in_countof)
     struct_parse_info->struct_types.safe_push (enumtype);
 
   /* Check for consistency with previous definition */
@@ -11178,13 +11178,6 @@ store_parm_decls_oldstyle (tree fndecl, const struct c_arg_info *arg_info)
 		     useful for argument types like uid_t.  */
 		  DECL_ARG_TYPE (parm) = TREE_TYPE (parm);
 
-		  if (targetm.calls.promote_prototypes (TREE_TYPE (current_function_decl))
-		      && INTEGRAL_TYPE_P (TREE_TYPE (parm))
-		      && (TYPE_PRECISION (TREE_TYPE (parm))
-			  < TYPE_PRECISION (integer_type_node)))
-		    DECL_ARG_TYPE (parm)
-		      = c_type_promotes_to (TREE_TYPE (parm));
-
 		  /* ??? Is it possible to get here with a
 		     built-in prototype or will it always have
 		     been diagnosed as conflicting with an
@@ -11412,19 +11405,6 @@ finish_function (location_t end_loc)
   if (c_dialect_objc ())
     objc_finish_function ();
 
-  if (TREE_CODE (fndecl) == FUNCTION_DECL
-      && targetm.calls.promote_prototypes (TREE_TYPE (fndecl)))
-    {
-      tree args = DECL_ARGUMENTS (fndecl);
-      for (; args; args = DECL_CHAIN (args))
-	{
-	  tree type = TREE_TYPE (args);
-	  if (INTEGRAL_TYPE_P (type)
-	      && TYPE_PRECISION (type) < TYPE_PRECISION (integer_type_node))
-	    DECL_ARG_TYPE (args) = c_type_promotes_to (type);
-	}
-    }
-
   if (DECL_INITIAL (fndecl) && DECL_INITIAL (fndecl) != error_mark_node)
     BLOCK_SUPERCONTEXT (DECL_INITIAL (fndecl)) = fndecl;
 
@@ -11485,9 +11465,9 @@ finish_function (location_t end_loc)
 	    && !DECL_READ_P (decl)
 	    && DECL_NAME (decl)
 	    && !DECL_ARTIFICIAL (decl)
-	    && !warning_suppressed_p (decl, OPT_Wunused_but_set_parameter))
+	    && !warning_suppressed_p (decl, OPT_Wunused_but_set_parameter_))
 	  warning_at (DECL_SOURCE_LOCATION (decl),
-		      OPT_Wunused_but_set_parameter,
+		      OPT_Wunused_but_set_parameter_,
 		      "parameter %qD set but not used", decl);
     }
 
@@ -13856,6 +13836,174 @@ c_check_omp_declare_reduction_r (tree *tp, int *, void *data)
   return NULL_TREE;
 }
 
+/* Return identifier to look up for omp declare mapper.  */
+
+tree
+c_omp_mapper_id (tree mapper_id)
+{
+  const char *p = NULL;
+
+  const char prefix[] = "omp declare mapper ";
+
+  if (mapper_id == NULL_TREE)
+    p = "<default>";
+  else if (TREE_CODE (mapper_id) == IDENTIFIER_NODE)
+    p = IDENTIFIER_POINTER (mapper_id);
+  else
+    return error_mark_node;
+
+  size_t lenp = sizeof (prefix);
+  size_t len = strlen (p);
+  char *name = XALLOCAVEC (char, lenp + len);
+  memcpy (name, prefix, lenp - 1);
+  memcpy (name + lenp - 1, p, len + 1);
+  return get_identifier (name);
+}
+
+/* Lookup MAPPER_ID in the current scope, or create an artificial
+   VAR_DECL, bind it into the current scope and return it.  */
+
+tree
+c_omp_mapper_decl (tree mapper_id)
+{
+  struct c_binding *b = I_SYMBOL_BINDING (mapper_id);
+  if (b != NULL && B_IN_CURRENT_SCOPE (b))
+    return b->decl;
+
+  tree decl = build_decl (BUILTINS_LOCATION, VAR_DECL,
+			  mapper_id, integer_type_node);
+  DECL_ARTIFICIAL (decl) = 1;
+  DECL_EXTERNAL (decl) = 1;
+  TREE_STATIC (decl) = 1;
+  TREE_PUBLIC (decl) = 0;
+  bind (mapper_id, decl, current_scope, true, false, BUILTINS_LOCATION);
+  return decl;
+}
+
+/* Lookup MAPPER_ID in the first scope where it has entry for TYPE.  */
+
+tree
+c_omp_mapper_lookup (tree mapper_id, tree type)
+{
+  if (!RECORD_OR_UNION_TYPE_P (type))
+    return NULL_TREE;
+
+  mapper_id = c_omp_mapper_id (mapper_id);
+
+  struct c_binding *b = I_SYMBOL_BINDING (mapper_id);
+  while (b)
+    {
+      tree t;
+      for (t = DECL_INITIAL (b->decl); t; t = TREE_CHAIN (t))
+	if (comptypes (TREE_PURPOSE (t), type))
+	  return TREE_VALUE (t);
+      b = b->shadowed;
+    }
+  return NULL_TREE;
+}
+
+/* For C, we record a pointer to the mapper itself without wrapping it in an
+   artificial function or similar.  So, just return it.  */
+
+tree
+c_omp_extract_mapper_directive (tree mapper)
+{
+  return mapper;
+}
+
+/* For now we can handle singleton OMP_ARRAY_SECTIONs with custom mappers, but
+   nothing more complicated.  */
+
+tree
+c_omp_map_array_section (location_t loc, tree t)
+{
+  tree low = TREE_OPERAND (t, 1);
+  tree len = TREE_OPERAND (t, 2);
+
+  if (len && integer_onep (len))
+    {
+      t = TREE_OPERAND (t, 0);
+
+      if (!low)
+	low = integer_zero_node;
+
+      t = build_array_ref (loc, t, low);
+    }
+
+  return t;
+}
+
+/* Helper function for below function.  */
+
+static tree
+c_omp_scan_mapper_bindings_r (tree *tp, int *walk_subtrees, void *ptr)
+{
+  tree t = *tp;
+  omp_mapper_list<tree> *mlist = (omp_mapper_list<tree> *) ptr;
+  tree aggr_type = NULL_TREE;
+
+  if (TREE_CODE (t) == SIZEOF_EXPR
+      || TREE_CODE (t) == ALIGNOF_EXPR)
+    {
+      *walk_subtrees = 0;
+      return NULL_TREE;
+    }
+
+  if (TREE_CODE (t) == OMP_CLAUSE)
+    return NULL_TREE;
+
+  if (TREE_CODE (t) == COMPONENT_REF
+      && RECORD_OR_UNION_TYPE_P (TREE_TYPE (TREE_OPERAND (t, 0))))
+    aggr_type = TREE_TYPE (TREE_OPERAND (t, 0));
+  else if ((TREE_CODE (t) == VAR_DECL
+	    || TREE_CODE (t) == PARM_DECL
+	    || TREE_CODE (t) == RESULT_DECL)
+	   && RECORD_OR_UNION_TYPE_P (TREE_TYPE (t)))
+    aggr_type = TREE_TYPE (t);
+
+  if (aggr_type)
+    {
+      tree mapper_fn = c_omp_mapper_lookup (NULL_TREE, aggr_type);
+      if (mapper_fn)
+	mlist->add_mapper (NULL_TREE, aggr_type, mapper_fn);
+    }
+
+  return NULL_TREE;
+}
+
+/* Scan an offload region's body, and record uses of struct- or union-typed
+   variables.  Add _mapper_binding_ fake clauses to *CLAUSES_PTR.  */
+
+void
+c_omp_scan_mapper_bindings (location_t loc, tree *clauses_ptr, tree body)
+{
+  hash_set<omp_name_type<tree>> seen_types;
+  auto_vec<tree> mappers;
+  omp_mapper_list<tree> mlist (&seen_types, &mappers);
+
+  walk_tree_without_duplicates (&body, c_omp_scan_mapper_bindings_r, &mlist);
+
+  unsigned int i;
+  tree mapper;
+  FOR_EACH_VEC_ELT (mappers, i, mapper)
+    c_omp_find_nested_mappers (&mlist, mapper);
+
+  FOR_EACH_VEC_ELT (mappers, i, mapper)
+    {
+      if (mapper == error_mark_node)
+	continue;
+      tree mapper_name = OMP_DECLARE_MAPPER_ID (mapper);
+      tree decl = OMP_DECLARE_MAPPER_DECL (mapper);
+
+      tree c = build_omp_clause (loc, OMP_CLAUSE__MAPPER_BINDING_);
+      OMP_CLAUSE__MAPPER_BINDING__ID (c) = mapper_name;
+      OMP_CLAUSE__MAPPER_BINDING__DECL (c) = decl;
+      OMP_CLAUSE__MAPPER_BINDING__MAPPER (c) = mapper;
+
+      OMP_CLAUSE_CHAIN (c) = *clauses_ptr;
+      *clauses_ptr = c;
+    }
+}
 
 bool
 c_check_in_current_scope (tree decl)
@@ -13898,7 +14046,8 @@ c_get_loop_names (tree before_labels, bool switch_p, tree *last_p)
 	      ++ret;
 	    }
 	}
-      else if (TREE_CODE (stmt) != CASE_LABEL_EXPR)
+      else if (TREE_CODE (stmt) != CASE_LABEL_EXPR
+	       && TREE_CODE (stmt) != DEBUG_BEGIN_STMT)
 	break;
     }
   if (last)

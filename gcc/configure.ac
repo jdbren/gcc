@@ -358,7 +358,7 @@ if test x"${DEFAULT_LINKER+set}" = x"set"; then
     AC_MSG_ERROR([cannot execute: $DEFAULT_LINKER: check --with-ld or env. var. DEFAULT_LINKER])
   elif $DEFAULT_LINKER -v < /dev/null 2>&1 | grep GNU > /dev/null; then
     gnu_ld_flag=yes
-  elif $DEFAULT_LINKER -v < /dev/null 2>&1 | grep ld64- > /dev/null; then
+  elif $DEFAULT_LINKER -v < /dev/null 2>&1 | grep 'PROJECT:ld\(64\)*-' > /dev/null; then
     ld64_flag=yes
   fi
   AC_DEFINE_UNQUOTED(DEFAULT_LINKER,"$DEFAULT_LINKER",
@@ -1397,7 +1397,7 @@ AC_CHECK_HEADERS(ext/hash_map)
 ZW_CREATE_DEPDIR
 AC_CONFIG_COMMANDS([gccdepdir],[
   ${CONFIG_SHELL-/bin/sh} $ac_aux_dir/mkinstalldirs build/$DEPDIR
-  for lang in $subdirs c-family common analyzer text-art rtl-ssa sym-exec
+  for lang in $subdirs c-family common analyzer diagnostics text-art rtl-ssa sym-exec
   do
       ${CONFIG_SHELL-/bin/sh} $ac_aux_dir/mkinstalldirs $lang/$DEPDIR
   done], [subdirs="$subdirs" ac_aux_dir=$ac_aux_dir DEPDIR=$DEPDIR])
@@ -1779,6 +1779,21 @@ AC_CHECK_DECL(O_NONBLOCK,,,[#include <fcntl.h>])
 if test $ac_cv_have_decl_O_NONBLOCK = yes; then
   AC_DEFINE(HOST_HAS_O_NONBLOCK, 1,
   [Define if O_NONBLOCK supported by fcntl.])
+fi
+
+# Check if personality and ADDR_NO_RANDOMIZE are declared
+# in sys/personality.h
+AC_CACHE_CHECK(for personality ADDR_NO_RANDOMIZE,
+	       ac_cv_personality_addr_no_randomize, [
+AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[
+#include <sys/personality.h>]], [[
+personality (personality (0xffffffffU) | ADDR_NO_RANDOMIZE);]])],
+[ac_cv_personality_addr_no_randomize=yes],
+[ac_cv_personality_addr_no_randomize=no])])
+if test $ac_cv_personality_addr_no_randomize = yes; then
+  AC_DEFINE(HOST_HAS_PERSONALITY_ADDR_NO_RANDOMIZE, 1,
+  [Define if personality and ADDR_NO_RANDOMIZE are declared in
+sys/personality.h.])
 fi
 
 
@@ -4192,6 +4207,35 @@ else
   [$tls_as_opt], [$conftest_s],,
   [set_have_as_tls=yes])
 fi
+case $target_os in
+  win32 | pe | cygwin* | mingw32*)
+    if test $set_have_as_tls = yes; then
+      # Hack to check whether ld breaks on @secrel32 for Windows
+      if test $in_tree_ld = yes; then
+	if test "$gcc_cv_gld_major_version" -eq 2 -a "$gcc_cv_gld_minor_version" -ge 44 -o "$gcc_cv_gld_major_version" -gt 2; then
+	  : # ld support for @secrel32 was fixed in this version
+	else
+	  AC_MSG_ERROR([ld version is known to have broken secrel32 relocations, configure without --enable-tls or with --disable-tls to remove this error. See https://gcc.gnu.org/bugzilla/show_bug.cgi?id=80881 for more information.])
+	fi
+      elif test x$gcc_cv_as != x -a x$gcc_cv_ld != x -a x$gcc_cv_objdump != x; then
+	echo '.text'          > conftest.s
+	echo 'foo: nop'      >> conftest.s
+	echo '.data'         >> conftest.s
+	echo '.secrel32 foo' >> conftest.s
+	if $gcc_cv_as -o conftest.o conftest.s > /dev/null 2>&1 && $gcc_cv_ld -o conftest.exe conftest.o > /dev/null; then
+	  if $gcc_cv_objdump -h conftest.exe | grep '\.reloc\>' > /dev/null; then
+	    AC_MSG_ERROR([ld has broken secrel32 relocations, configure without --enable-tls or with --disable-tls to remove this error. See https://gcc.gnu.org/bugzilla/show_bug.cgi?id=80881 for more information.])
+	  fi
+	else
+	  AC_MSG_ERROR([Error occurred while checking for broken secrel32 relocations. See https://gcc.gnu.org/bugzilla/show_bug.cgi?id=80881 for more information.])
+	fi
+	rm -f conftest.s conftest.o conftest.exe
+      else
+	AC_MSG_ERROR([Cannot check for broken secrel32 relocations to determine --enable-tls support. See https://gcc.gnu.org/bugzilla/show_bug.cgi?id=80881 for more information.])
+      fi
+    fi
+    ;;
+esac
 if test $set_have_as_tls = yes ; then
   AC_DEFINE(HAVE_AS_TLS, 1,
 	    [Define if your assembler and linker support thread-local storage.])
@@ -4423,6 +4467,15 @@ case "$target" in
 	ldr     x0, [[x2, #:gotpage_lo15:globalsym]]
     ],,[AC_DEFINE(HAVE_AS_SMALL_PIC_RELOCS, 1,
 	[Define if your assembler supports relocs needed by -fpic.])])
+    # Check if we have binutils support for AEABI build attributes.
+    gcc_GAS_CHECK_FEATURE([support of AEABI build attributes], gcc_cv_as_aarch64_aeabi_build_attributes,,
+    [
+	.aeabi_subsection aeabi_feature_and_bits, optional, ULEB128
+	.aeabi_attribute Tag_Feature_BTI, 1
+	.aeabi_attribute Tag_Feature_PAC, 1
+	.aeabi_attribute Tag_Feature_GCS, 1
+    ],,[AC_DEFINE(HAVE_AS_AEABI_BUILD_ATTRIBUTES, 1,
+	[Define if your assembler supports AEABI build attributes.])])
     # Enable Branch Target Identification Mechanism and Return Address
     # Signing by default.
     AC_ARG_ENABLE(standard-branch-protection,
@@ -6403,8 +6456,9 @@ if test x"$ld64_flag" = x"yes"; then
     # If the version was not specified, try to find it.
     AC_MSG_CHECKING(linker version)
     if test x"${gcc_cv_ld64_version}" = x; then
-      gcc_cv_ld64_version=`$gcc_cv_ld -v 2>&1 | $EGREP 'ld64|dyld' \
-      | sed -e 's/.*ld64-//' -e 's/.*dyld-//'| awk '{print $1}'`
+      gcc_cv_ld64_version=`$gcc_cv_ld -v 2>&1 | $EGREP 'ld64|dyld|PROJECT:ld' \
+      | sed -e 's/.*ld64-//' -e 's/.*dyld-//' -e 's/.*PROJECT:ld-//' \
+      | awk '{print $1}'`
     fi
     AC_MSG_RESULT($gcc_cv_ld64_version)
 
@@ -7917,6 +7971,41 @@ standards-compatible mode on s390 targets.])
   fi
   ;;
 esac
+
+# On x86-64, when profiling is enabled with shrink wrapping, the mcount
+# call may not be placed at the function entry after
+#	pushq %rbp
+#	movq %rsp,%rbp
+# As the result, the profile data may be skewed which makes PGO less
+# effective:
+# https://gcc.gnu.org/bugzilla/show_bug.cgi?id=120881
+# Enable -mfentry by default on x86-64 to put the profiling counter call
+# before the prologue.
+AC_ARG_ENABLE(x86-64-mfentry,
+  [AS_HELP_STRING([--enable-x86-64-mfentry],
+		  [enable -mfentry by default on x86-64 targets])],
+  [case "${enableval}" in
+   yes | no | auto)
+     enable_x86_64_mfentry=$enableval
+     ;;
+   *)
+     AC_MSG_ERROR(['$enable_x86_64_mfentry' is an invalid value for --enable-x86-64-mfentry.  Valid choices are 'yes', 'no' and 'auto'.])
+     ;;
+   esac],
+  [enable_x86_64_mfentry=auto])
+
+if test x"$enable_x86_64_mfentry" = xauto; then
+  case "${target}" in
+  i?86-*-*gnu* | x86_64-*-*gnu*)
+    # Enable -mfentry by default with glibc on x86.
+    enable_x86_64_mfentry=yes
+    ;;
+  esac
+fi
+
+gif=`if test x$enable_x86_64_mfentry = xyes; then echo 1; else echo 0; fi`
+AC_DEFINE_UNQUOTED(ENABLE_X86_64_MFENTRY, $gif,
+[Define to enable -mfentry by default on x86-64.])
 
 # Check if the linker supports '-z now'
 ld_now_support=no

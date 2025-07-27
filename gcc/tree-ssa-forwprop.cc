@@ -205,7 +205,6 @@ struct _vec_perm_simplify_seq
 typedef struct _vec_perm_simplify_seq *vec_perm_simplify_seq;
 
 static bool forward_propagate_addr_expr (tree, tree, bool);
-static void optimize_vector_load (gimple_stmt_iterator *);
 
 /* Set to true if we delete dead edges during the optimization.  */
 static bool cfg_changed;
@@ -523,6 +522,14 @@ forward_propagate_into_comparison (gimple_stmt_iterator *gsi)
 					     type, rhs1, rhs2);
   if (tmp && useless_type_conversion_p (type, TREE_TYPE (tmp)))
     {
+      if (dump_file)
+	{
+	  fprintf (dump_file, "  Replaced '");
+	  print_gimple_expr (dump_file, stmt, 0);
+	  fprintf (dump_file, "' with '");
+	  print_generic_expr (dump_file, tmp);
+	  fprintf (dump_file, "'\n");
+	}
       gimple_assign_set_rhs_from_tree (gsi, tmp);
       fold_stmt (gsi);
       update_stmt (gsi_stmt (*gsi));
@@ -551,9 +558,8 @@ forward_propagate_into_gimple_cond (gcond *stmt)
   tree rhs1 = gimple_cond_lhs (stmt);
   tree rhs2 = gimple_cond_rhs (stmt);
 
-  /* We can do tree combining on SSA_NAME and comparison expressions.  */
-  if (TREE_CODE_CLASS (gimple_cond_code (stmt)) != tcc_comparison)
-    return 0;
+  /* GIMPLE_COND will always be a comparison.  */
+  gcc_assert (TREE_CODE_CLASS (gimple_cond_code (stmt)) == tcc_comparison);
 
   tmp = forward_propagate_into_comparison_1 (stmt, code,
 					     boolean_type_node,
@@ -580,22 +586,8 @@ forward_propagate_into_gimple_cond (gcond *stmt)
       return (cfg_changed || is_gimple_min_invariant (tmp)) ? 2 : 1;
     }
 
-  /* Canonicalize _Bool == 0 and _Bool != 1 to _Bool != 0 by swapping edges.  */
-  if ((TREE_CODE (TREE_TYPE (rhs1)) == BOOLEAN_TYPE
-       || (INTEGRAL_TYPE_P (TREE_TYPE (rhs1))
-	   && TYPE_PRECISION (TREE_TYPE (rhs1)) == 1))
-      && ((code == EQ_EXPR
-	   && integer_zerop (rhs2))
-	  || (code == NE_EXPR
-	      && integer_onep (rhs2))))
-    {
-      basic_block bb = gimple_bb (stmt);
-      gimple_cond_set_code (stmt, NE_EXPR);
-      gimple_cond_set_rhs (stmt, build_zero_cst (TREE_TYPE (rhs1)));
-      EDGE_SUCC (bb, 0)->flags ^= (EDGE_TRUE_VALUE|EDGE_FALSE_VALUE);
-      EDGE_SUCC (bb, 1)->flags ^= (EDGE_TRUE_VALUE|EDGE_FALSE_VALUE);
-      return 1;
-    }
+  if (canonicalize_bool_cond (stmt, gimple_bb (stmt)))
+    return 1;
 
   return 0;
 }
@@ -1198,6 +1190,242 @@ constant_pointer_difference (tree p1, tree p2)
   return NULL_TREE;
 }
 
+
+/* Optimize
+   a = {};
+   b = a;
+   into
+   a = {};
+   b = {};
+   Similarly for memset (&a, ..., sizeof (a)); instead of a = {};
+   and/or memcpy (&b, &a, sizeof (a)); instead of b = a;  */
+
+static bool
+optimize_memcpy_to_memset (gimple_stmt_iterator *gsip, tree dest, tree src, tree len)
+{
+  ao_ref read;
+  gimple *stmt = gsi_stmt (*gsip);
+  if (gimple_has_volatile_ops (stmt))
+    return false;
+
+  tree src2 = NULL_TREE, len2 = NULL_TREE;
+  poly_int64 offset, offset2;
+  tree val = integer_zero_node;
+  bool len_was_null = len == NULL_TREE;
+  if (len == NULL_TREE)
+    len = (TREE_CODE (src) == COMPONENT_REF
+	   ? DECL_SIZE_UNIT (TREE_OPERAND (src, 1))
+	   : TYPE_SIZE_UNIT (TREE_TYPE (src)));
+  if (len == NULL_TREE
+      || !poly_int_tree_p (len))
+    return false;
+
+  ao_ref_init (&read, src);
+  tree vuse = gimple_vuse (stmt);
+  gimple *defstmt;
+  unsigned limit = param_sccvn_max_alias_queries_per_access;
+  do {
+    /* If the vuse is the default definition, then there is no stores beforhand. */
+    if (SSA_NAME_IS_DEFAULT_DEF (vuse))
+      return false;
+    defstmt = SSA_NAME_DEF_STMT (vuse);
+    if (is_a <gphi*>(defstmt))
+      return false;
+    if (limit-- == 0)
+      return false;
+    /* If the len was null, then we can use TBBA. */
+    if (stmt_may_clobber_ref_p_1 (defstmt, &read,
+				  /* tbaa_p = */ len_was_null))
+      break;
+    vuse = gimple_vuse (defstmt);
+  } while (true);
+
+  if (gimple_store_p (defstmt)
+      && gimple_assign_single_p (defstmt)
+      && TREE_CODE (gimple_assign_rhs1 (defstmt)) == STRING_CST
+      && !gimple_clobber_p (defstmt))
+    {
+      tree str = gimple_assign_rhs1 (defstmt);
+      src2 = gimple_assign_lhs (defstmt);
+      /* The string must contain all null char's for now.  */
+      for (int i = 0; i < TREE_STRING_LENGTH (str); i++)
+	{
+	  if (TREE_STRING_POINTER (str)[i] != 0)
+	    {
+	      src2 = NULL_TREE;
+	      break;
+	    }
+	}
+    }
+  else if (gimple_store_p (defstmt)
+      && gimple_assign_single_p (defstmt)
+      && TREE_CODE (gimple_assign_rhs1 (defstmt)) == CONSTRUCTOR
+      && !gimple_clobber_p (defstmt))
+    src2 = gimple_assign_lhs (defstmt);
+  else if (gimple_call_builtin_p (defstmt, BUILT_IN_MEMSET)
+	   && TREE_CODE (gimple_call_arg (defstmt, 0)) == ADDR_EXPR
+	   && TREE_CODE (gimple_call_arg (defstmt, 1)) == INTEGER_CST)
+    {
+      src2 = TREE_OPERAND (gimple_call_arg (defstmt, 0), 0);
+      len2 = gimple_call_arg (defstmt, 2);
+      val = gimple_call_arg (defstmt, 1);
+      /* For non-0 val, we'd have to transform stmt from assignment
+	 into memset (only if dest is addressable).  */
+      if (!integer_zerop (val) && is_gimple_assign (stmt))
+	src2 = NULL_TREE;
+    }
+
+  if (src2 == NULL_TREE)
+    return false;
+
+  if (len2 == NULL_TREE)
+    len2 = (TREE_CODE (src2) == COMPONENT_REF
+	    ? DECL_SIZE_UNIT (TREE_OPERAND (src2, 1))
+	    : TYPE_SIZE_UNIT (TREE_TYPE (src2)));
+  if (len2 == NULL_TREE
+      || !poly_int_tree_p (len2))
+    return false;
+
+  src = get_addr_base_and_unit_offset (src, &offset);
+  src2 = get_addr_base_and_unit_offset (src2, &offset2);
+  if (src == NULL_TREE
+      || src2 == NULL_TREE
+      || maybe_lt (offset, offset2))
+    return false;
+
+  if (!operand_equal_p (src, src2, 0))
+    return false;
+
+  /* [ src + offset2, src + offset2 + len2 - 1 ] is set to val.
+     Make sure that
+     [ src + offset, src + offset + len - 1 ] is a subset of that.  */
+  if (maybe_gt (wi::to_poly_offset (len) + (offset - offset2),
+		wi::to_poly_offset (len2)))
+    return false;
+
+  if (dump_file && (dump_flags & TDF_DETAILS))
+    {
+      fprintf (dump_file, "Simplified\n  ");
+      print_gimple_stmt (dump_file, stmt, 0, dump_flags);
+      fprintf (dump_file, "after previous\n  ");
+      print_gimple_stmt (dump_file, defstmt, 0, dump_flags);
+    }
+
+  /* For simplicity, don't change the kind of the stmt,
+     turn dest = src; into dest = {}; and memcpy (&dest, &src, len);
+     into memset (&dest, val, len);
+     In theory we could change dest = src into memset if dest
+     is addressable (maybe beneficial if val is not 0), or
+     memcpy (&dest, &src, len) into dest = {} if len is the size
+     of dest, dest isn't volatile.  */
+  if (is_gimple_assign (stmt))
+    {
+      tree ctor = build_constructor (TREE_TYPE (dest), NULL);
+      gimple_assign_set_rhs_from_tree (gsip, ctor);
+      update_stmt (stmt);
+      statistics_counter_event (cfun, "copy zeroing propagation of aggregate", 1);
+    }
+  else /* If stmt is memcpy, transform it into memset.  */
+    {
+      gcall *call = as_a <gcall *> (stmt);
+      tree fndecl = builtin_decl_implicit (BUILT_IN_MEMSET);
+      gimple_call_set_fndecl (call, fndecl);
+      gimple_call_set_fntype (call, TREE_TYPE (fndecl));
+      gimple_call_set_arg (call, 1, val);
+      update_stmt (stmt);
+      statistics_counter_event (cfun, "memcpy to memset changed", 1);
+    }
+
+  if (dump_file && (dump_flags & TDF_DETAILS))
+    {
+      fprintf (dump_file, "into\n  ");
+      print_gimple_stmt (dump_file, stmt, 0, dump_flags);
+    }
+  return true;
+}
+/* Optimizes
+   a = c;
+   b = a;
+   into
+   a = c;
+   b = c;
+   GSIP is the second statement and SRC is the common
+   between the statements.
+*/
+static bool
+optimize_agr_copyprop (gimple_stmt_iterator *gsip)
+{
+  gimple *stmt = gsi_stmt (*gsip);
+  if (gimple_has_volatile_ops (stmt))
+    return false;
+
+  tree dest = gimple_assign_lhs (stmt);
+  tree src = gimple_assign_rhs1 (stmt);
+  /* If the statement is `src = src;` then ignore it. */
+  if (operand_equal_p (dest, src, 0))
+    return false;
+
+  tree vuse = gimple_vuse (stmt);
+  /* If the vuse is the default definition, then there is no store beforehand.  */
+  if (SSA_NAME_IS_DEFAULT_DEF (vuse))
+    return false;
+  gimple *defstmt = SSA_NAME_DEF_STMT (vuse);
+  if (!gimple_assign_load_p (defstmt)
+      || !gimple_store_p (defstmt))
+    return false;
+  if (gimple_has_volatile_ops (defstmt))
+    return false;
+
+  tree dest2 = gimple_assign_lhs (defstmt);
+  tree src2 = gimple_assign_rhs1 (defstmt);
+
+  /* If the original store is `src2 = src2;` skip over it. */
+  if (operand_equal_p (src2, dest2, 0))
+    return false;
+  if (!operand_equal_p (src, dest2, 0))
+    return false;
+
+
+  /* For 2 memory refences and using a temporary to do the copy,
+     don't remove the temporary as the 2 memory references might overlap.
+     Note t does not need to be decl as it could be field.
+     See PR 22237 for full details.
+     E.g.
+     t = *a;
+     *b = t;
+     Cannot be convert into
+     t = *a;
+     *b = *a;
+     Though the following is allowed to be done:
+     t = *a;
+     *a = t;
+     And convert it into:
+     t = *a;
+     *a = *a;
+  */
+  if (!operand_equal_p (src2, dest, 0)
+      && !DECL_P (dest) && !DECL_P (src2))
+    return false;
+
+  if (dump_file && (dump_flags & TDF_DETAILS))
+    {
+      fprintf (dump_file, "Simplified\n  ");
+      print_gimple_stmt (dump_file, stmt, 0, dump_flags);
+      fprintf (dump_file, "after previous\n  ");
+      print_gimple_stmt (dump_file, defstmt, 0, dump_flags);
+    }
+  gimple_assign_set_rhs_from_tree (gsip, unshare_expr (src2));
+  update_stmt (stmt);
+
+  if (dump_file && (dump_flags & TDF_DETAILS))
+    {
+      fprintf (dump_file, "into\n  ");
+      print_gimple_stmt (dump_file, stmt, 0, dump_flags);
+    }
+  statistics_counter_event (cfun, "copy prop for aggregate", 1);
+  return true;
+}
+
 /* *GSI_P is a GIMPLE_CALL to a builtin function.
    Optimize
    memcpy (p, "abcd", 4);
@@ -1235,6 +1463,22 @@ simplify_builtin_call (gimple_stmt_iterator *gsi_p, tree callee2)
 
   switch (DECL_FUNCTION_CODE (callee2))
     {
+    case BUILT_IN_MEMCPY:
+      if (gimple_call_num_args (stmt2) == 3)
+	{
+	  tree dest = gimple_call_arg (stmt2, 0);
+	  tree src = gimple_call_arg (stmt2, 1);
+	  tree len = gimple_call_arg (stmt2, 2);
+	  /* Try to optimize the memcpy to memset if src
+	     and dest are addresses. */
+	  if (TREE_CODE (dest) == ADDR_EXPR
+	      && TREE_CODE (src) == ADDR_EXPR
+	      && TREE_CODE (len) == INTEGER_CST
+	      && optimize_memcpy_to_memset (gsi_p, TREE_OPERAND (dest, 0),
+					    TREE_OPERAND (src, 0), len))
+	    return true;
+	}
+    break;
     case BUILT_IN_MEMCHR:
       if (gimple_call_num_args (stmt2) == 3
 	  && (res = gimple_call_lhs (stmt2)) != nullptr
@@ -2264,16 +2508,15 @@ simplify_rotate (gimple_stmt_iterator *gsi)
 }
 
 
-/* Check whether an array contains a valid ctz table.  */
+/* Check whether an array contains a valid table according to VALIDATE_FN.  */
+template<typename ValidateFn>
 static bool
-check_ctz_array (tree ctor, unsigned HOST_WIDE_INT mulc,
-		 HOST_WIDE_INT &zero_val, unsigned shift, unsigned bits)
+check_table_array (tree ctor, HOST_WIDE_INT &zero_val, unsigned bits,
+		  ValidateFn validate_fn)
 {
   tree elt, idx;
-  unsigned HOST_WIDE_INT i, mask, raw_idx = 0;
+  unsigned HOST_WIDE_INT i, raw_idx = 0;
   unsigned matched = 0;
-
-  mask = ((HOST_WIDE_INT_1U << (bits - shift)) - 1) << shift;
 
   zero_val = 0;
 
@@ -2314,7 +2557,7 @@ check_ctz_array (tree ctor, unsigned HOST_WIDE_INT mulc,
 	  matched++;
 	}
 
-      if (val >= 0 && val < bits && (((mulc << val) & mask) >> shift) == index)
+      if (val >= 0 && val < bits && validate_fn (val, index))
 	matched++;
 
       if (matched > bits)
@@ -2324,48 +2567,86 @@ check_ctz_array (tree ctor, unsigned HOST_WIDE_INT mulc,
   return false;
 }
 
-/* Check whether a string contains a valid ctz table.  */
+/* Check whether a string contains a valid table according to VALIDATE_FN.  */
+template<typename ValidateFn>
 static bool
-check_ctz_string (tree string, unsigned HOST_WIDE_INT mulc,
-		  HOST_WIDE_INT &zero_val, unsigned shift, unsigned bits)
+check_table_string (tree string, HOST_WIDE_INT &zero_val,unsigned bits,
+		    ValidateFn validate_fn)
 {
   unsigned HOST_WIDE_INT len = TREE_STRING_LENGTH (string);
-  unsigned HOST_WIDE_INT mask;
   unsigned matched = 0;
   const unsigned char *p = (const unsigned char *) TREE_STRING_POINTER (string);
 
   if (len < bits || len > bits * 2)
     return false;
 
-  mask = ((HOST_WIDE_INT_1U << (bits - shift)) - 1) << shift;
-
   zero_val = p[0];
 
   for (unsigned i = 0; i < len; i++)
-    if (p[i] < bits && (((mulc << p[i]) & mask) >> shift) == i)
+    if (p[i] < bits && validate_fn (p[i], i))
       matched++;
 
   return matched == bits;
 }
 
-/* Recognize count trailing zeroes idiom.
+/* Check whether CTOR contains a valid table according to VALIDATE_FN.  */
+template<typename ValidateFn>
+static bool
+check_table (tree ctor, tree type, HOST_WIDE_INT &zero_val, unsigned bits,
+	     ValidateFn validate_fn)
+{
+  if (TREE_CODE (ctor) == CONSTRUCTOR)
+    return check_table_array (ctor, zero_val, bits, validate_fn);
+  else if (TREE_CODE (ctor) == STRING_CST
+	   && TYPE_PRECISION (type) == CHAR_TYPE_SIZE)
+    return check_table_string (ctor, zero_val, bits, validate_fn);
+  return false;
+}
+
+/* Match.pd function to match the ctz expression.  */
+extern bool gimple_ctz_table_index (tree, tree *, tree (*)(tree));
+extern bool gimple_clz_table_index (tree, tree *, tree (*)(tree));
+
+/* Recognize count leading and trailing zeroes idioms.
    The canonical form is array[((x & -x) * C) >> SHIFT] where C is a magic
    constant which when multiplied by a power of 2 creates a unique value
    in the top 5 or 6 bits.  This is then indexed into a table which maps it
    to the number of trailing zeroes.  Array[0] is returned so the caller can
    emit an appropriate sequence depending on whether ctz (0) is defined on
    the target.  */
+
 static bool
-optimize_count_trailing_zeroes (tree array_ref, tree x, tree mulc,
-				tree tshift, HOST_WIDE_INT &zero_val)
+simplify_count_zeroes (gimple_stmt_iterator *gsi)
 {
+  gimple *stmt = gsi_stmt (*gsi);
+  tree array_ref = gimple_assign_rhs1 (stmt);
+  tree res_ops[3];
+
+  gcc_checking_assert (TREE_CODE (array_ref) == ARRAY_REF);
+
+  internal_fn fn = IFN_LAST;
+  /* For CTZ we recognize ((x & -x) * C) >> SHIFT where the array data
+     represents the number of trailing zeros.  */
+  if (gimple_ctz_table_index (TREE_OPERAND (array_ref, 1), &res_ops[0], NULL))
+    fn = IFN_CTZ;
+  /* For CLZ we recognize
+       x |= x >> 1;
+       x |= x >> 2;
+       x |= x >> 4;
+       x |= x >> 8;
+       x |= x >> 16;
+       (x * C) >> SHIFT
+     where 31 minus the array data represents the number of leading zeros.  */
+  else if (gimple_clz_table_index (TREE_OPERAND (array_ref, 1), &res_ops[0],
+				   NULL))
+    fn = IFN_CLZ;
+  else
+    return false;
+
+  HOST_WIDE_INT zero_val;
   tree type = TREE_TYPE (array_ref);
   tree array = TREE_OPERAND (array_ref, 0);
-
-  gcc_assert (TREE_CODE (mulc) == INTEGER_CST);
-  gcc_assert (TREE_CODE (tshift) == INTEGER_CST);
-
-  tree input_type = TREE_TYPE (x);
+  tree input_type = TREE_TYPE (res_ops[0]);
   unsigned input_bits = tree_to_shwi (TYPE_SIZE (input_type));
 
   /* Check the array element type is not wider than 32 bits and the input is
@@ -2375,7 +2656,7 @@ optimize_count_trailing_zeroes (tree array_ref, tree x, tree mulc,
   if (input_bits != 32 && input_bits != 64)
     return false;
 
-  if (!direct_internal_fn_supported_p (IFN_CTZ, input_type, OPTIMIZE_FOR_BOTH))
+  if (!direct_internal_fn_supported_p (fn, input_type, OPTIMIZE_FOR_BOTH))
     return false;
 
   /* Check the lower bound of the array is zero.  */
@@ -2383,102 +2664,127 @@ optimize_count_trailing_zeroes (tree array_ref, tree x, tree mulc,
   if (!low || !integer_zerop (low))
     return false;
 
-  unsigned shiftval = tree_to_shwi (tshift);
-
   /* Check the shift extracts the top 5..7 bits.  */
+  unsigned shiftval = tree_to_shwi (res_ops[2]);
   if (shiftval < input_bits - 7 || shiftval > input_bits - 5)
     return false;
 
   tree ctor = ctor_for_folding (array);
   if (!ctor)
     return false;
-
-  unsigned HOST_WIDE_INT val = tree_to_uhwi (mulc);
-
-  if (TREE_CODE (ctor) == CONSTRUCTOR)
-    return check_ctz_array (ctor, val, zero_val, shiftval, input_bits);
-
-  if (TREE_CODE (ctor) == STRING_CST
-      && TYPE_PRECISION (type) == CHAR_TYPE_SIZE)
-    return check_ctz_string (ctor, val, zero_val, shiftval, input_bits);
-
-  return false;
-}
-
-/* Match.pd function to match the ctz expression.  */
-extern bool gimple_ctz_table_index (tree, tree *, tree (*)(tree));
-
-static bool
-simplify_count_trailing_zeroes (gimple_stmt_iterator *gsi)
-{
-  gimple *stmt = gsi_stmt (*gsi);
-  tree array_ref = gimple_assign_rhs1 (stmt);
-  tree res_ops[3];
-  HOST_WIDE_INT zero_val;
-
-  gcc_checking_assert (TREE_CODE (array_ref) == ARRAY_REF);
-
-  if (!gimple_ctz_table_index (TREE_OPERAND (array_ref, 1), &res_ops[0], NULL))
-    return false;
-
-  if (optimize_count_trailing_zeroes (array_ref, res_ops[0],
-				      res_ops[1], res_ops[2], zero_val))
+  unsigned HOST_WIDE_INT mulval = tree_to_uhwi (res_ops[1]);
+  if (fn == IFN_CTZ)
     {
-      tree type = TREE_TYPE (res_ops[0]);
-      HOST_WIDE_INT ctz_val = 0;
-      HOST_WIDE_INT type_size = tree_to_shwi (TYPE_SIZE (type));
-      bool zero_ok
-	= CTZ_DEFINED_VALUE_AT_ZERO (SCALAR_INT_TYPE_MODE (type), ctz_val) == 2;
-      int nargs = 2;
-
-      /* If the input value can't be zero, don't special case ctz (0).  */
-      if (tree_expr_nonzero_p (res_ops[0]))
+      auto checkfn = [&](unsigned data, unsigned i) -> bool
 	{
-	  zero_ok = true;
-	  zero_val = 0;
-	  ctz_val = 0;
-	  nargs = 1;
-	}
-
-      /* Skip if there is no value defined at zero, or if we can't easily
-	 return the correct value for zero.  */
-      if (!zero_ok)
+	  unsigned HOST_WIDE_INT mask
+	    = ((HOST_WIDE_INT_1U << (input_bits - shiftval)) - 1) << shiftval;
+	  return (((mulval << data) & mask) >> shiftval) == i;
+	};
+      if (!check_table (ctor, type, zero_val, input_bits, checkfn))
 	return false;
-      if (zero_val != ctz_val && !(zero_val == 0 && ctz_val == type_size))
-	return false;
-
-      gimple_seq seq = NULL;
-      gimple *g;
-      gcall *call
-	= gimple_build_call_internal (IFN_CTZ, nargs, res_ops[0],
-				      nargs == 1 ? NULL_TREE
-				      : build_int_cst (integer_type_node,
-						       ctz_val));
-      gimple_set_location (call, gimple_location (stmt));
-      gimple_set_lhs (call, make_ssa_name (integer_type_node));
-      gimple_seq_add_stmt (&seq, call);
-
-      tree prev_lhs = gimple_call_lhs (call);
-
-      /* Emit ctz (x) & 31 if ctz (0) is 32 but we need to return 0.  */
-      if (zero_val == 0 && ctz_val == type_size)
+    }
+  else if (fn == IFN_CLZ)
+    {
+      auto checkfn = [&](unsigned data, unsigned i) -> bool
 	{
-	  g = gimple_build_assign (make_ssa_name (integer_type_node),
-				   BIT_AND_EXPR, prev_lhs,
-				   build_int_cst (integer_type_node,
-						  type_size - 1));
-	  gimple_set_location (g, gimple_location (stmt));
-	  gimple_seq_add_stmt (&seq, g);
-	  prev_lhs = gimple_assign_lhs (g);
-	}
-
-      g = gimple_build_assign (gimple_assign_lhs (stmt), NOP_EXPR, prev_lhs);
-      gimple_seq_add_stmt (&seq, g);
-      gsi_replace_with_seq (gsi, seq, true);
-      return true;
+	  unsigned HOST_WIDE_INT mask
+	    = ((HOST_WIDE_INT_1U << (input_bits - shiftval)) - 1) << shiftval;
+	  return (((((HOST_WIDE_INT_1U << (data + 1)) - 1) * mulval) & mask)
+		  >> shiftval) == i;
+	};
+    if (!check_table (ctor, type, zero_val, input_bits, checkfn))
+      return false;
     }
 
-  return false;
+  HOST_WIDE_INT ctz_val = -1;
+  bool zero_ok;
+  if (fn == IFN_CTZ)
+    {
+      ctz_val = 0;
+      zero_ok = CTZ_DEFINED_VALUE_AT_ZERO (SCALAR_INT_TYPE_MODE (input_type),
+					   ctz_val) == 2;
+    }
+  else if (fn == IFN_CLZ)
+    {
+      ctz_val = 32;
+      zero_ok = CLZ_DEFINED_VALUE_AT_ZERO (SCALAR_INT_TYPE_MODE (input_type),
+					   ctz_val) == 2;
+      zero_val = input_bits - 1 - zero_val;
+    }
+  int nargs = 2;
+
+  /* If the input value can't be zero, don't special case ctz (0).  */
+  range_query *q = get_range_query (cfun);
+  if (q == get_global_range_query ())
+    q = enable_ranger (cfun);
+  int_range_max vr;
+  if (q->range_of_expr (vr, res_ops[0], stmt)
+      && !range_includes_zero_p (vr))
+    {
+      zero_ok = true;
+      zero_val = 0;
+      ctz_val = 0;
+      nargs = 1;
+    }
+
+  gimple_seq seq = NULL;
+  gimple *g;
+  gcall *call = gimple_build_call_internal (fn, nargs, res_ops[0],
+					    nargs == 1 ? NULL_TREE
+					    : build_int_cst (integer_type_node,
+							     ctz_val));
+  gimple_set_location (call, gimple_location (stmt));
+  gimple_set_lhs (call, make_ssa_name (integer_type_node));
+  gimple_seq_add_stmt (&seq, call);
+
+  tree prev_lhs = gimple_call_lhs (call);
+  if (fn == IFN_CLZ)
+    {
+      g = gimple_build_assign (make_ssa_name (integer_type_node),
+			       MINUS_EXPR,
+			       build_int_cst (integer_type_node,
+					      input_bits - 1),
+			       prev_lhs);
+      gimple_set_location (g, gimple_location (stmt));
+      gimple_seq_add_stmt (&seq, g);
+      prev_lhs = gimple_assign_lhs (g);
+    }
+
+  if (zero_ok && zero_val == ctz_val)
+    ;
+  /* Emit ctz (x) & 31 if ctz (0) is 32 but we need to return 0.  */
+  else if (zero_ok && zero_val == 0 && ctz_val == input_bits)
+    {
+      g = gimple_build_assign (make_ssa_name (integer_type_node),
+			       BIT_AND_EXPR, prev_lhs,
+			       build_int_cst (integer_type_node,
+					      input_bits - 1));
+      gimple_set_location (g, gimple_location (stmt));
+      gimple_seq_add_stmt (&seq, g);
+      prev_lhs = gimple_assign_lhs (g);
+    }
+  /* As fallback emit a conditional move.  */
+  else
+    {
+      g = gimple_build_assign (make_ssa_name (boolean_type_node), EQ_EXPR,
+			       res_ops[0], build_zero_cst (input_type));
+      gimple_set_location (g, gimple_location (stmt));
+      gimple_seq_add_stmt (&seq, g);
+      tree cond = gimple_assign_lhs (g);
+      g = gimple_build_assign (make_ssa_name (integer_type_node),
+			       COND_EXPR, cond,
+			       build_int_cst (integer_type_node, zero_val),
+			       prev_lhs);
+      gimple_set_location (g, gimple_location (stmt));
+      gimple_seq_add_stmt (&seq, g);
+      prev_lhs = gimple_assign_lhs (g);
+    }
+
+  g = gimple_build_assign (gimple_assign_lhs (stmt), NOP_EXPR, prev_lhs);
+  gimple_seq_add_stmt (&seq, g);
+  gsi_replace_with_seq (gsi, seq, true);
+  return true;
 }
 
 
@@ -3224,6 +3530,7 @@ optimize_vector_load (gimple_stmt_iterator *gsi)
   gimple *stmt = gsi_stmt (*gsi);
   tree lhs = gimple_assign_lhs (stmt);
   tree rhs = gimple_assign_rhs1 (stmt);
+  tree vuse = gimple_vuse (stmt);
 
   /* Gather BIT_FIELD_REFs to rewrite, looking through
      VEC_UNPACK_{LO,HI}_EXPR.  */
@@ -3332,6 +3639,7 @@ optimize_vector_load (gimple_stmt_iterator *gsi)
 	  gimple *new_stmt = gimple_build_assign (tem, new_rhs);
 	  location_t loc = gimple_location (use_stmt);
 	  gimple_set_location (new_stmt, loc);
+	  gimple_set_vuse (new_stmt, vuse);
 	  gsi_insert_before (gsi, new_stmt, GSI_SAME_STMT);
 	  /* Perform scalar promotion.  */
 	  new_stmt = gimple_build_assign (gimple_assign_lhs (use_stmt),
@@ -3351,6 +3659,7 @@ optimize_vector_load (gimple_stmt_iterator *gsi)
 						  new_rhs);
 	  location_t loc = gimple_location (use_stmt);
 	  gimple_set_location (new_stmt, loc);
+	  gimple_set_vuse (new_stmt, vuse);
 	  gsi_insert_before (gsi, new_stmt, GSI_SAME_STMT);
 	}
       gimple_stmt_iterator gsi2 = gsi_for_stmt (use_stmt);
@@ -4004,7 +4313,7 @@ const pass_data pass_data_forwprop =
   0, /* properties_provided */
   0, /* properties_destroyed */
   0, /* todo_flags_start */
-  TODO_update_ssa, /* todo_flags_finish */
+  0, /* todo_flags_finish */
 };
 
 class pass_forwprop : public gimple_opt_pass
@@ -4241,6 +4550,7 @@ pass_forwprop::execute (function *fun)
 	         component-wise loads.  */
 	      use_operand_p use_p;
 	      imm_use_iterator iter;
+	      tree vuse = gimple_vuse (stmt);
 	      bool rewrite = true;
 	      FOR_EACH_IMM_USE_FAST (use_p, iter, lhs)
 		{
@@ -4280,6 +4590,7 @@ pass_forwprop::execute (function *fun)
 
 		      location_t loc = gimple_location (use_stmt);
 		      gimple_set_location (new_stmt, loc);
+		      gimple_set_vuse (new_stmt, vuse);
 		      gimple_stmt_iterator gsi2 = gsi_for_stmt (use_stmt);
 		      unlink_stmt_vdef (use_stmt);
 		      gsi_remove (&gsi2, true);
@@ -4497,6 +4808,8 @@ pass_forwprop::execute (function *fun)
 		    }
 		}
 	    }
+	  if (substituted_p)
+	    update_stmt (stmt);
 	  if (substituted_p
 	      && is_gimple_assign (stmt)
 	      && gimple_assign_rhs_code (stmt) == ADDR_EXPR)
@@ -4536,17 +4849,7 @@ pass_forwprop::execute (function *fun)
 			  && !SSA_NAME_IS_DEFAULT_DEF (use))
 			bitmap_set_bit (simple_dce_worklist,
 					SSA_NAME_VERSION (use));
-		}
-
-	      if (changed || substituted_p)
-		{
-		  if (maybe_clean_or_replace_eh_stmt (orig_stmt, stmt))
-		    bitmap_set_bit (to_purge, bb->index);
-		  if (!was_noreturn
-		      && is_gimple_call (stmt) && gimple_call_noreturn_p (stmt))
-		    to_fixup.safe_push (stmt);
 		  update_stmt (stmt);
-		  substituted_p = false;
 		}
 
 	      switch (gimple_code (stmt))
@@ -4555,16 +4858,30 @@ pass_forwprop::execute (function *fun)
 		  {
 		    tree rhs1 = gimple_assign_rhs1 (stmt);
 		    enum tree_code code = gimple_assign_rhs_code (stmt);
+		    if (gimple_assign_load_p (stmt) && gimple_store_p (stmt))
+		      {
+			if (optimize_memcpy_to_memset (&gsi,
+						       gimple_assign_lhs (stmt),
+						       gimple_assign_rhs1 (stmt),
+						       /* len = */NULL_TREE))
+			  {
+			    changed = true;
+			    break;
+			  }
+			if (optimize_agr_copyprop (&gsi))
+			  {
+			    changed = true;
+			    break;
+			  }
+		      }
 
 		    if (TREE_CODE_CLASS (code) == tcc_comparison)
 		      {
 			int did_something;
 			did_something = forward_propagate_into_comparison (&gsi);
-			if (maybe_clean_or_replace_eh_stmt (stmt, gsi_stmt (gsi)))
-			  bitmap_set_bit (to_purge, bb->index);
 			if (did_something == 2)
 			  cfg_changed = true;
-			changed = did_something != 0;
+			changed |= did_something != 0;
 		      }
 		    else if ((code == PLUS_EXPR
 			      || code == BIT_IOR_EXPR
@@ -4580,15 +4897,15 @@ pass_forwprop::execute (function *fun)
 		      }
 		    else if (code == CONSTRUCTOR
 			     && TREE_CODE (TREE_TYPE (rhs1)) == VECTOR_TYPE)
-		      changed = simplify_vector_constructor (&gsi);
+		      changed |= simplify_vector_constructor (&gsi);
 		    else if (code == ARRAY_REF)
-		      changed = simplify_count_trailing_zeroes (&gsi);
+		      changed |= simplify_count_zeroes (&gsi);
 		    break;
 		  }
 
 		case GIMPLE_SWITCH:
-		  changed = simplify_gimple_switch (as_a <gswitch *> (stmt),
-						    edges_to_remove);
+		  changed |= simplify_gimple_switch (as_a <gswitch *> (stmt),
+						     edges_to_remove);
 		  break;
 
 		case GIMPLE_COND:
@@ -4597,7 +4914,7 @@ pass_forwprop::execute (function *fun)
 							(as_a <gcond *> (stmt));
 		    if (did_something == 2)
 		      cfg_changed = true;
-		    changed = did_something != 0;
+		    changed |= did_something != 0;
 		    break;
 		  }
 
@@ -4606,13 +4923,23 @@ pass_forwprop::execute (function *fun)
 		    tree callee = gimple_call_fndecl (stmt);
 		    if (callee != NULL_TREE
 			&& fndecl_built_in_p (callee, BUILT_IN_NORMAL))
-		      changed = simplify_builtin_call (&gsi, callee);
+		      changed |= simplify_builtin_call (&gsi, callee);
 		    break;
 		  }
 
 		default:;
 		}
 
+	      if (changed || substituted_p)
+		{
+		  substituted_p = false;
+		  stmt = gsi_stmt (gsi);
+		  if (maybe_clean_or_replace_eh_stmt (orig_stmt, stmt))
+		    bitmap_set_bit (to_purge, bb->index);
+		  if (!was_noreturn
+		      && is_gimple_call (stmt) && gimple_call_noreturn_p (stmt))
+		    to_fixup.safe_push (stmt);
+		}
 	      if (changed)
 		{
 		  /* If the stmt changed then re-visit it and the statements

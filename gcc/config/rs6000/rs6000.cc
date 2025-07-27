@@ -55,7 +55,6 @@
 #include "output.h"
 #include "common/common-target.h"
 #include "langhooks.h"
-#include "reload.h"
 #include "sched-int.h"
 #include "gimplify.h"
 #include "gimple-iterator.h"
@@ -4952,10 +4951,19 @@ static bool
 rs6000_builtin_support_vector_misalignment (machine_mode mode,
 					    const_tree type,
 					    int misalignment,
-					    bool is_packed)
+					    bool is_packed,
+					    bool is_gather_scatter)
 {
   if (TARGET_VSX)
     {
+      if (is_gather_scatter)
+	{
+	  if (TARGET_ALTIVEC && is_packed)
+	    return false;
+	  else
+	    return true;
+	}
+
       if (TARGET_EFFICIENT_UNALIGNED_VSX)
 	return true;
 
@@ -9259,8 +9267,7 @@ rs6000_debug_legitimize_address (rtx x, rtx oldx, machine_mode mode)
 
   start_sequence ();
   ret = rs6000_legitimize_address (x, oldx, mode);
-  insns = get_insns ();
-  end_sequence ();
+  insns = end_sequence ();
 
   if (ret != x)
     {
@@ -25314,7 +25321,6 @@ rs6000_get_function_versions_dispatcher (void *decl)
   struct cgraph_node *node = NULL;
   struct cgraph_node *default_node = NULL;
   struct cgraph_function_version_info *node_v = NULL;
-  struct cgraph_function_version_info *first_v = NULL;
 
   tree dispatch_decl = NULL;
 
@@ -25334,37 +25340,15 @@ rs6000_get_function_versions_dispatcher (void *decl)
   if (node_v->dispatcher_resolver != NULL)
     return node_v->dispatcher_resolver;
 
-  /* Find the default version and make it the first node.  */
-  first_v = node_v;
-  /* Go to the beginning of the chain.  */
-  while (first_v->prev != NULL)
-    first_v = first_v->prev;
-
-  default_version_info = first_v;
-  while (default_version_info != NULL)
-    {
-      const tree decl2 = default_version_info->this_node->decl;
-      if (is_function_default_version (decl2))
-        break;
-      default_version_info = default_version_info->next;
-    }
+  /* The default node is always the beginning of the chain.  */
+  default_version_info = node_v;
+  while (default_version_info->prev)
+    default_version_info = default_version_info->prev;
+  default_node = default_version_info->this_node;
 
   /* If there is no default node, just return NULL.  */
-  if (default_version_info == NULL)
+  if (!is_function_default_version (default_node->decl))
     return NULL;
-
-  /* Make default info the first node.  */
-  if (first_v != default_version_info)
-    {
-      default_version_info->prev->next = default_version_info->next;
-      if (default_version_info->next)
-        default_version_info->next->prev = default_version_info->prev;
-      first_v->prev = default_version_info;
-      default_version_info->next = first_v;
-      default_version_info->prev = NULL;
-    }
-
-  default_node = default_version_info->this_node;
 
 #ifndef TARGET_LIBC_PROVIDES_HWCAP_IN_TCB
   error_at (DECL_SOURCE_LOCATION (default_node->decl),
@@ -25765,10 +25749,13 @@ rs6000_can_inline_p (tree caller, tree callee)
 	}
     }
 
-  /* Ignore -mpower8-fusion and -mpower10-fusion options for inlining
-     purposes.  */
-  callee_isa &= ~(OPTION_MASK_P8_FUSION | OPTION_MASK_P10_FUSION);
-  explicit_isa &= ~(OPTION_MASK_P8_FUSION | OPTION_MASK_P10_FUSION);
+  /* Ignore -mpower8-fusion, -mpower10-fusion and -msave-toc-indirect options
+     for inlining purposes.  */
+  HOST_WIDE_INT ignored_isas = (OPTION_MASK_P8_FUSION
+				| OPTION_MASK_P10_FUSION
+				| OPTION_MASK_SAVE_TOC_INDIRECT);
+  callee_isa &= ~ignored_isas;
+  explicit_isa &= ~ignored_isas;
 
   /* The callee's options must be a subset of the caller's options, i.e.
      a vsx function may inline an altivec function, but a no-vsx function

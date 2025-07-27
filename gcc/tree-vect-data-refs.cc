@@ -734,7 +734,6 @@ vect_analyze_early_break_dependences (loop_vec_info loop_vinfo)
 
 	  stmt_vec_info stmt_vinfo
 	    = vect_stmt_to_vectorize (loop_vinfo->lookup_stmt (stmt));
-	  stmt = STMT_VINFO_STMT (stmt_vinfo);
 	  auto dr_ref = STMT_VINFO_DATA_REF (stmt_vinfo);
 	  if (!dr_ref)
 	    continue;
@@ -1203,6 +1202,97 @@ vect_slp_analyze_instance_dependence (vec_info *vinfo, slp_instance instance)
     for (unsigned k = 0; k < SLP_TREE_SCALAR_STMTS (store).length (); ++k)
       gimple_set_visited (SLP_TREE_SCALAR_STMTS (store)[k]->stmt, false);
 
+  /* If this is a SLP instance with a store check if there's a dependent
+     load that cannot be forwarded from a previous iteration of a loop
+     both are in.  This is to avoid situations like that in PR115777.  */
+  if (res && store)
+    {
+      stmt_vec_info store_info
+	= DR_GROUP_FIRST_ELEMENT (SLP_TREE_SCALAR_STMTS (store)[0]);
+      class loop *store_loop = gimple_bb (store_info->stmt)->loop_father;
+      if (! loop_outer (store_loop))
+	return res;
+      vec<loop_p> loop_nest;
+      loop_nest.create (1);
+      loop_nest.quick_push (store_loop);
+      data_reference *drs = nullptr;
+      for (slp_tree &load : SLP_INSTANCE_LOADS (instance))
+	{
+	  if (! STMT_VINFO_GROUPED_ACCESS (SLP_TREE_SCALAR_STMTS (load)[0]))
+	    continue;
+	  stmt_vec_info load_info
+	    = DR_GROUP_FIRST_ELEMENT (SLP_TREE_SCALAR_STMTS (load)[0]);
+	  if (gimple_bb (load_info->stmt)->loop_father != store_loop)
+	    continue;
+
+	  /* For now concern ourselves with write-after-read as we also
+	     only look for re-use of the store within the same SLP instance.
+	     We can still get a RAW here when the instance contais a PHI
+	     with a backedge though, thus this test.  */
+	  if (! vect_stmt_dominates_stmt_p (STMT_VINFO_STMT (load_info),
+					    STMT_VINFO_STMT (store_info)))
+	    continue;
+
+	  if (! drs)
+	    {
+	      drs = create_data_ref (loop_preheader_edge (store_loop),
+				     store_loop,
+				     DR_REF (STMT_VINFO_DATA_REF (store_info)),
+				     store_info->stmt, false, false);
+	      if (! DR_BASE_ADDRESS (drs)
+		  || TREE_CODE (DR_STEP (drs)) != INTEGER_CST)
+		break;
+	    }
+	  data_reference *drl
+	    = create_data_ref (loop_preheader_edge (store_loop),
+			       store_loop,
+			       DR_REF (STMT_VINFO_DATA_REF (load_info)),
+			       load_info->stmt, true, false);
+
+	  /* See whether the DRs have a known constant distance throughout
+	     the containing loop iteration.  */
+	  if (! DR_BASE_ADDRESS (drl)
+	      || ! operand_equal_p (DR_STEP (drs), DR_STEP (drl))
+	      || ! operand_equal_p (DR_BASE_ADDRESS (drs),
+				    DR_BASE_ADDRESS (drl))
+	      || ! operand_equal_p (DR_OFFSET (drs), DR_OFFSET (drl)))
+	    {
+	      free_data_ref (drl);
+	      continue;
+	    }
+
+	  /* If the next iteration load overlaps with a non-power-of-two offset
+	     we are surely failing any STLF attempt.  */
+	  HOST_WIDE_INT step = TREE_INT_CST_LOW (DR_STEP (drl));
+	  unsigned HOST_WIDE_INT sizes
+	    = (TREE_INT_CST_LOW (TYPE_SIZE_UNIT (TREE_TYPE (DR_REF (drs))))
+	       * DR_GROUP_SIZE (store_info));
+	  unsigned HOST_WIDE_INT sizel
+	    = (TREE_INT_CST_LOW (TYPE_SIZE_UNIT (TREE_TYPE (DR_REF (drl))))
+	       * DR_GROUP_SIZE (load_info));
+	  if (ranges_overlap_p (TREE_INT_CST_LOW (DR_INIT (drl)) + step, sizel,
+				TREE_INT_CST_LOW (DR_INIT (drs)), sizes))
+	    {
+	      unsigned HOST_WIDE_INT dist
+		= absu_hwi (TREE_INT_CST_LOW (DR_INIT (drl)) + step
+			    - TREE_INT_CST_LOW (DR_INIT (drs)));
+	      poly_uint64 loadsz = tree_to_poly_uint64
+				     (TYPE_SIZE_UNIT (SLP_TREE_VECTYPE (load)));
+	      poly_uint64 storesz = tree_to_poly_uint64
+				    (TYPE_SIZE_UNIT (SLP_TREE_VECTYPE (store)));
+	      /* When the overlap aligns with vector sizes used for the loads
+		 and the vector stores are larger or equal to the loads
+		 forwarding should work.  */
+	      if (maybe_gt (loadsz, storesz) || ! multiple_p (dist, loadsz))
+		load->avoid_stlf_fail = true;
+	    }
+	  free_data_ref (drl);
+	}
+      if (drs)
+	free_data_ref (drs);
+      loop_nest.release ();
+    }
+
   return res;
 }
 
@@ -1411,10 +1501,17 @@ vect_compute_data_ref_alignment (vec_info *vinfo, dr_vec_info *dr_info,
       /* We can only use base and misalignment information relative to
 	 an innermost loop if the misalignment stays the same throughout the
 	 execution of the loop.  As above, this is the case if the stride of
-	 the dataref evenly divides by the alignment.  */
-      poly_uint64 vf = LOOP_VINFO_VECT_FACTOR (loop_vinfo);
-      step_preserves_misalignment_p
-	= multiple_p (drb->step_alignment * vf, vect_align_c);
+	 the dataref evenly divides by the alignment.  Make sure to check
+	 previous epilogues and the main loop.  */
+      step_preserves_misalignment_p = true;
+      auto lvinfo = loop_vinfo;
+      while (lvinfo)
+	{
+	  poly_uint64 vf = LOOP_VINFO_VECT_FACTOR (lvinfo);
+	  step_preserves_misalignment_p
+	    &= multiple_p (drb->step_alignment * vf, vect_align_c);
+	  lvinfo = LOOP_VINFO_ORIG_LOOP_INFO (lvinfo);
+	}
 
       if (!step_preserves_misalignment_p && dump_enabled_p ())
 	dump_printf_loc (MSG_MISSED_OPTIMIZATION, vect_location,
@@ -1481,6 +1578,7 @@ vect_compute_data_ref_alignment (vec_info *vinfo, dr_vec_info *dr_info,
       unsigned int max_alignment;
       tree base = get_base_for_alignment (drb->base_address, &max_alignment);
       if (max_alignment < vect_align_c
+	  || (loop_vinfo && LOOP_VINFO_EPILOGUE_P (loop_vinfo))
 	  || !vect_can_force_dr_alignment_p (base,
 					     vect_align_c * BITS_PER_UNIT))
 	{
@@ -2021,9 +2119,10 @@ vect_peeling_hash_choose_best_peeling (hash_table<peel_info_hasher> *peeling_hta
    return res;
 }
 
-/* Return true if the new peeling NPEEL is supported.  */
+/* Return if vectorization is definitely, possibly, or unlikely to be
+   supportable after loop peeling.  */
 
-static bool
+static enum peeling_support
 vect_peeling_supportable (loop_vec_info loop_vinfo, dr_vec_info *dr0_info,
 			  unsigned npeel)
 {
@@ -2033,8 +2132,11 @@ vect_peeling_supportable (loop_vec_info loop_vinfo, dr_vec_info *dr0_info,
   bool dr0_alignment_known_p
     = known_alignment_for_access_p (dr0_info,
 				    STMT_VINFO_VECTYPE (dr0_info->stmt));
+  bool has_unsupported_dr_p = false;
+  unsigned int dr0_step = tree_to_shwi (DR_STEP (dr0_info->dr));
+  int known_unsupported_misalignment = DR_MISALIGNMENT_UNKNOWN;
 
-  /* Ensure that all data refs can be vectorized after the peel.  */
+  /* Check if each data ref can be vectorized after peeling.  */
   for (data_reference *dr : datarefs)
     {
       if (dr == dr0_info->dr)
@@ -2062,10 +2164,44 @@ vect_peeling_supportable (loop_vec_info loop_vinfo, dr_vec_info *dr0_info,
 	= vect_supportable_dr_alignment (loop_vinfo, dr_info, vectype,
 					 misalignment);
       if (supportable_dr_alignment == dr_unaligned_unsupported)
-	return false;
+	{
+	  has_unsupported_dr_p = true;
+
+	  /* If unaligned unsupported DRs exist, we do following checks to see
+	     if they can be mutually aligned to support vectorization.  If yes,
+	     we can try peeling and create a runtime (mutual alignment) check
+	     to guard the peeled loop.  If no, return PEELING_UNSUPPORTED.  */
+
+	  /* 1) If unaligned unsupported DRs have different alignment steps, the
+		probability of DRs being mutually aligned is very low, and it's
+		quite complex to check mutual alignment at runtime.  We return
+		PEELING_UNSUPPORTED in this case.  */
+	  if (tree_to_shwi (DR_STEP (dr)) != dr0_step)
+	    return peeling_unsupported;
+
+	  /* 2) Based on above same alignment step condition, if one known
+		misaligned DR has zero misalignment, or different misalignment
+		amount from another known misaligned DR, peeling is unable to
+		help make all these DRs aligned together.  We won't try peeling
+		with versioning anymore.  */
+	  int curr_dr_misalignment = dr_misalignment (dr_info, vectype);
+	  if (curr_dr_misalignment == 0)
+	    return peeling_unsupported;
+	  if (known_unsupported_misalignment != DR_MISALIGNMENT_UNKNOWN)
+	    {
+	      if (curr_dr_misalignment != DR_MISALIGNMENT_UNKNOWN
+		  && curr_dr_misalignment != known_unsupported_misalignment)
+		return peeling_unsupported;
+	    }
+	  else
+	    known_unsupported_misalignment = curr_dr_misalignment;
+	}
     }
 
-  return true;
+  /* Vectorization is known to be supportable with peeling alone when there is
+     no unsupported DR.  */
+  return has_unsupported_dr_p ? peeling_maybe_supported
+			      : peeling_known_supported;
 }
 
 /* Compare two data-references DRA and DRB to group them into chunks
@@ -2174,20 +2310,20 @@ dr_align_group_sort_cmp (const void *dra_, const void *drb_)
      }
 
      -- Possibility 3: combination of loop peeling and versioning:
-     for (i = 0; i < 3; i++){	# (scalar loop, not to be vectorized).
-	x = q[i];
-	p[i] = y;
-     }
-     if (p is aligned) {
-	for (i = 3; i<N; i++){	# loop 3A
+     if (p & q are mutually aligned) {
+	for (i=0; i<3; i++){	# (peeled loop iterations).
+	  x = q[i];
+	  p[i] = y;
+	}
+	for (i=3; i<N; i++){	# loop 3A
 	  x = q[i];			# DR_MISALIGNMENT(q) = 0
 	  p[i] = y;			# DR_MISALIGNMENT(p) = 0
 	}
      }
      else {
-	for (i = 3; i<N; i++){	# loop 3B
-	  x = q[i];			# DR_MISALIGNMENT(q) = 0
-	  p[i] = y;			# DR_MISALIGNMENT(p) = unaligned
+	for (i=0; i<N; i++){	# (scalar loop, not to be vectorized).
+	  x = q[i];			# DR_MISALIGNMENT(q) = 3
+	  p[i] = y;			# DR_MISALIGNMENT(p) = unknown
 	}
      }
 
@@ -2206,6 +2342,7 @@ vect_enhance_data_refs_alignment (loop_vec_info loop_vinfo)
   unsigned int i;
   bool do_peeling = false;
   bool do_versioning = false;
+  bool try_peeling_with_versioning = false;
   unsigned int npeel = 0;
   bool one_misalignment_known = false;
   bool one_misalignment_unknown = false;
@@ -2271,30 +2408,38 @@ vect_enhance_data_refs_alignment (loop_vec_info loop_vinfo)
   /* While cost model enhancements are expected in the future, the high level
      view of the code at this time is as follows:
 
-     A) If there is a misaligned access then see if peeling to align
-        this access can make all data references satisfy
-        vect_supportable_dr_alignment.  If so, update data structures
-        as needed and return true.
+     A) If there is a misaligned access then see if doing peeling alone can
+	make all data references satisfy vect_supportable_dr_alignment.  If so,
+	update data structures and return.
 
-     B) If peeling wasn't possible and there is a data reference with an
-        unknown misalignment that does not satisfy vect_supportable_dr_alignment
-        then see if loop versioning checks can be used to make all data
-        references satisfy vect_supportable_dr_alignment.  If so, update
-        data structures as needed and return true.
+     B) If peeling alone wasn't possible and there is a data reference with an
+	unknown misalignment that does not satisfy vect_supportable_dr_alignment
+	then we may use either of the following two approaches.
 
-     C) If neither peeling nor versioning were successful then return false if
-        any data reference does not satisfy vect_supportable_dr_alignment.
+	B1) Try peeling with versioning: Add a runtime loop versioning check to
+	    see if all unsupportable data references are mutually aligned, which
+	    means they will be uniformly aligned after a certain amount of loop
+	    peeling.  If peeling and versioning can be used together, set
+	    LOOP_VINFO_ALLOW_MUTUAL_ALIGNMENT_P to TRUE and return.
 
-     D) Return true (all data references satisfy vect_supportable_dr_alignment).
+	B2) Try versioning alone: Add a runtime loop versioning check to see if
+	    all unsupportable data references are already uniformly aligned
+	    without loop peeling.  If versioning can be applied alone, set
+	    LOOP_VINFO_ALLOW_MUTUAL_ALIGNMENT_P to FALSE and return.
 
-     Note, Possibility 3 above (which is peeling and versioning together) is not
-     being done at this time.  */
+	Above B1 is more powerful and more likely to be adopted than B2.  But B2
+	is still available and useful in some cases, for example, the cost model
+	does not allow much peeling.
+
+     C) If none of above was successful then the alignment was not enhanced,
+	just return.  */
 
   /* (1) Peeling to force alignment.  */
 
-  /* (1.1) Decide whether to perform peeling, and how many iterations to peel:
+  /* (1.1) Decide whether to perform peeling, how many iterations to peel, and
+     if vectorization may be supported by peeling with versioning.
      Considerations:
-     + How many accesses will become aligned due to the peeling
+     - How many accesses will become aligned due to the peeling
      - How many accesses will become unaligned due to the peeling,
        and the cost of misaligned accesses.
      - The cost of peeling (the extra runtime checks, the increase
@@ -2642,9 +2787,27 @@ vect_enhance_data_refs_alignment (loop_vec_info loop_vinfo)
                              "Try peeling by %d\n", npeel);
         }
 
-      /* Ensure that all datarefs can be vectorized after the peel.  */
-      if (!vect_peeling_supportable (loop_vinfo, dr0_info, npeel))
-	do_peeling = false;
+      /* Check how peeling for alignment can support vectorization.  Function
+	 vect_peeling_supportable returns one of the three possible values:
+	 - PEELING_KNOWN_SUPPORTED: indicates that we know all unsupported
+	   datarefs can be aligned after peeling.  We can use peeling alone.
+	 - PEELING_MAYBE_SUPPORTED: indicates that peeling may be able to make
+	   these datarefs aligned but we are not sure about it at compile time.
+	   We will try peeling with versioning to add a runtime check to guard
+	   the peeled loop.
+	 - PEELING_UNSUPPORTED: indicates that peeling is almost impossible to
+	   support vectorization.  We will stop trying peeling.  */
+      switch (vect_peeling_supportable (loop_vinfo, dr0_info, npeel))
+	{
+	case peeling_known_supported:
+	  break;
+	case peeling_maybe_supported:
+	  try_peeling_with_versioning = true;
+	  break;
+	case peeling_unsupported:
+	  do_peeling = false;
+	  break;
+	}
 
       /* Check if all datarefs are supportable and log.  */
       if (do_peeling
@@ -2721,7 +2884,11 @@ vect_enhance_data_refs_alignment (loop_vec_info loop_vinfo)
 
 		vect_update_misalignment_for_peel (dr_info, dr0_info, npeel);
 	      }
+	}
 
+      if (do_peeling && !try_peeling_with_versioning)
+	{
+	  /* Update data structures if peeling will be applied alone.  */
           LOOP_VINFO_UNALIGNED_DR (loop_vinfo) = dr0_info;
           if (npeel)
             LOOP_VINFO_PEELING_FOR_ALIGNMENT (loop_vinfo) = npeel;
@@ -2849,6 +3016,11 @@ vect_enhance_data_refs_alignment (loop_vec_info loop_vinfo)
         LOOP_VINFO_MAY_MISALIGN_STMTS (loop_vinfo).truncate (0);
     }
 
+  /* If we are trying peeling with versioning but versioning is disabled for
+     some reason, peeling should be turned off together.  */
+  if (try_peeling_with_versioning && !do_versioning)
+    do_peeling = false;
+
   if (do_versioning)
     {
       const vec<stmt_vec_info> &may_misalign_stmts
@@ -2868,12 +3040,28 @@ vect_enhance_data_refs_alignment (loop_vec_info loop_vinfo)
                              "Alignment of access forced using versioning.\n");
         }
 
-      if (dump_enabled_p ())
-        dump_printf_loc (MSG_NOTE, vect_location,
-                         "Versioning for alignment will be applied.\n");
-
-      /* Peeling and versioning can't be done together at this time.  */
-      gcc_assert (! (do_peeling && do_versioning));
+      if (do_peeling)
+	{
+	  /* This point is reached if peeling and versioning are used together
+	     to ensure alignment.  Update data structures to make sure the loop
+	     is correctly peeled and a right runtime check is added for loop
+	     versioning.  */
+	  gcc_assert (try_peeling_with_versioning);
+	  LOOP_VINFO_UNALIGNED_DR (loop_vinfo) = dr0_info;
+	  LOOP_VINFO_PEELING_FOR_ALIGNMENT (loop_vinfo) = -1;
+	  LOOP_VINFO_ALLOW_MUTUAL_ALIGNMENT (loop_vinfo) = true;
+	  if (dump_enabled_p ())
+	    dump_printf_loc (MSG_NOTE, vect_location,
+			     "Both peeling and versioning will be applied.\n");
+	}
+      else
+	{
+	  /* This point is reached if versioning is used alone.  */
+	  LOOP_VINFO_ALLOW_MUTUAL_ALIGNMENT (loop_vinfo) = false;
+	  if (dump_enabled_p ())
+	    dump_printf_loc (MSG_NOTE, vect_location,
+			     "Versioning for alignment will be applied.\n");
+	}
 
       return opt_result::success ();
     }
@@ -3592,6 +3780,13 @@ vect_analyze_data_ref_accesses (vec_info *vinfo,
 		      != type_size_a))
 		break;
 
+	      /* For datarefs with big gap, it's better to split them into different
+		 groups.
+		 .i.e a[0], a[1], a[2], .. a[7], a[100], a[101],..., a[107]  */
+	      if ((unsigned HOST_WIDE_INT)(init_b - init_prev)
+		  > MAX_BITSIZE_MODE_ANY_MODE / BITS_PER_UNIT)
+		break;
+
 	      /* If the step (if not zero or non-constant) is smaller than the
 		 difference between data-refs' inits this splits groups into
 		 suitable sizes.  */
@@ -3761,8 +3956,7 @@ vect_vfa_access_size (vec_info *vinfo, dr_vec_info *dr_info)
     }
   tree vectype = STMT_VINFO_VECTYPE (stmt_vinfo);
   int misalignment;
-  if (STMT_VINFO_VEC_STMTS (stmt_vinfo).exists ()
-      && ((misalignment = dr_misalignment (dr_info, vectype)), true)
+  if (((misalignment = dr_misalignment (dr_info, vectype)), true)
       && (vect_supportable_dr_alignment (vinfo, dr_info, vectype, misalignment)
 	  == dr_explicit_realign_optimized))
     {
@@ -4344,10 +4538,14 @@ vect_describe_gather_scatter_call (stmt_vec_info stmt_info,
   info->ifn = gimple_call_internal_fn (call);
   info->decl = NULL_TREE;
   info->base = gimple_call_arg (call, 0);
-  info->offset = gimple_call_arg (call, 1);
+  info->alias_ptr = gimple_call_arg
+		     (call, internal_fn_alias_ptr_index (info->ifn));
+  info->offset = gimple_call_arg
+		  (call, internal_fn_offset_index (info->ifn));
   info->offset_dt = vect_unknown_def_type;
   info->offset_vectype = NULL_TREE;
-  info->scale = TREE_INT_CST_LOW (gimple_call_arg (call, 2));
+  info->scale = TREE_INT_CST_LOW (gimple_call_arg
+				  (call, internal_fn_scale_index (info->ifn)));
   info->element_type = TREE_TYPE (vectype);
   info->memory_type = TREE_TYPE (DR_REF (dr));
 }
@@ -4472,25 +4670,18 @@ vect_check_gather_scatter (stmt_vec_info stmt_info, loop_vec_info loop_vinfo,
   if (off == NULL_TREE)
     off = size_zero_node;
 
-  /* If base is not loop invariant, either off is 0, then we start with just
-     the constant offset in the loop invariant BASE and continue with base
-     as OFF, otherwise give up.
-     We could handle that case by gimplifying the addition of base + off
-     into some SSA_NAME and use that as off, but for now punt.  */
+  /* BASE must be loop invariant.  If it is not invariant, but OFF is, then we
+   * can fix that by swapping BASE and OFF.  */
   if (!expr_invariant_in_loop_p (loop, base))
     {
-      if (!integer_zerop (off))
+      if (!expr_invariant_in_loop_p (loop, off))
 	return false;
-      off = base;
-      base = size_int (pbytepos);
+
+      std::swap (base, off);
     }
-  /* Otherwise put base + constant offset into the loop invariant BASE
-     and continue with OFF.  */
-  else
-    {
-      base = fold_convert (sizetype, base);
-      base = size_binop (PLUS_EXPR, base, size_int (pbytepos));
-    }
+
+  base = fold_convert (sizetype, base);
+  base = size_binop (PLUS_EXPR, base, size_int (pbytepos));
 
   /* OFF at this point may be either a SSA_NAME or some tree expression
      from get_inner_reference.  Try to peel off loop invariants from it
@@ -4669,9 +4860,17 @@ vect_check_gather_scatter (stmt_vec_info stmt_info, loop_vec_info loop_vinfo,
       offset_vectype = NULL_TREE;
     }
 
+  gcc_checking_assert (expr_invariant_in_loop_p (loop, base));
+  gcc_checking_assert (!expr_invariant_in_loop_p (loop, off));
+
   info->ifn = ifn;
   info->decl = decl;
   info->base = base;
+
+  info->alias_ptr = build_int_cst
+    (reference_alias_ptr_type (DR_REF (dr)),
+     get_object_alignment (DR_REF (dr)));
+
   info->offset = off;
   info->offset_dt = vect_unknown_def_type;
   info->offset_vectype = offset_vectype;
@@ -4861,7 +5060,7 @@ vect_find_stmt_data_reference (loop_p loop, gimple *stmt,
 */
 
 opt_result
-vect_analyze_data_refs (vec_info *vinfo, poly_uint64 *min_vf, bool *fatal)
+vect_analyze_data_refs (vec_info *vinfo, bool *fatal)
 {
   class loop *loop = NULL;
   unsigned int i;
@@ -4880,7 +5079,6 @@ vect_analyze_data_refs (vec_info *vinfo, poly_uint64 *min_vf, bool *fatal)
   FOR_EACH_VEC_ELT (datarefs, i, dr)
     {
       enum { SG_NONE, GATHER, SCATTER } gatherscatter = SG_NONE;
-      poly_uint64 vf;
 
       gcc_assert (DR_REF (dr));
       stmt_vec_info stmt_info = vinfo->lookup_stmt (DR_STMT (dr));
@@ -5071,11 +5269,6 @@ vect_analyze_data_refs (vec_info *vinfo, poly_uint64 *min_vf, bool *fatal)
 			     "got vectype for stmt: %G%T\n",
 			     stmt_info->stmt, vectype);
 	}
-
-      /* Adjust the minimal vectorization factor according to the
-	 vector type.  */
-      vf = TYPE_VECTOR_SUBPARTS (vectype);
-      *min_vf = upper_bound (*min_vf, vf);
 
       /* Leave the BB vectorizer to pick the vector type later, based on
 	 the final dataref group size and SLP node size.  */
@@ -5533,8 +5726,7 @@ vect_create_data_ref_ptr (vec_info *vinfo, stmt_vec_info stmt_info,
       standard_iv_increment_position (loop, &incr_gsi, &insert_after);
 
       create_iv (aggr_ptr_init, PLUS_EXPR,
-		 fold_convert (aggr_ptr_type, iv_step),
-		 aggr_ptr, loop, &incr_gsi, insert_after,
+		 iv_step, aggr_ptr, loop, &incr_gsi, insert_after,
 		 &indx_before_incr, &indx_after_incr);
       incr = gsi_stmt (incr_gsi);
 
@@ -5562,7 +5754,7 @@ vect_create_data_ref_ptr (vec_info *vinfo, stmt_vec_info stmt_info,
     {
       standard_iv_increment_position (containing_loop, &incr_gsi,
 				      &insert_after);
-      create_iv (aptr, PLUS_EXPR, fold_convert (aggr_ptr_type, DR_STEP (dr)),
+      create_iv (aptr, PLUS_EXPR, DR_STEP (dr),
 		 aggr_ptr, containing_loop, &incr_gsi, insert_after,
 		 &indx_before_incr, &indx_after_incr);
       incr = gsi_stmt (incr_gsi);
@@ -5884,204 +6076,6 @@ vect_store_lanes_supported (tree vectype, unsigned HOST_WIDE_INT count,
   return IFN_LAST;
 }
 
-
-/* Function vect_permute_store_chain.
-
-   Given a chain of interleaved stores in DR_CHAIN of LENGTH that must be
-   a power of 2 or equal to 3, generate interleave_high/low stmts to reorder
-   the data correctly for the stores.  Return the final references for stores
-   in RESULT_CHAIN.
-
-   E.g., LENGTH is 4 and the scalar type is short, i.e., VF is 8.
-   The input is 4 vectors each containing 8 elements.  We assign a number to
-   each element, the input sequence is:
-
-   1st vec:   0  1  2  3  4  5  6  7
-   2nd vec:   8  9 10 11 12 13 14 15
-   3rd vec:  16 17 18 19 20 21 22 23
-   4th vec:  24 25 26 27 28 29 30 31
-
-   The output sequence should be:
-
-   1st vec:  0  8 16 24  1  9 17 25
-   2nd vec:  2 10 18 26  3 11 19 27
-   3rd vec:  4 12 20 28  5 13 21 30
-   4th vec:  6 14 22 30  7 15 23 31
-
-   i.e., we interleave the contents of the four vectors in their order.
-
-   We use interleave_high/low instructions to create such output.  The input of
-   each interleave_high/low operation is two vectors:
-   1st vec    2nd vec
-   0 1 2 3    4 5 6 7
-   the even elements of the result vector are obtained left-to-right from the
-   high/low elements of the first vector.  The odd elements of the result are
-   obtained left-to-right from the high/low elements of the second vector.
-   The output of interleave_high will be:   0 4 1 5
-   and of interleave_low:                   2 6 3 7
-
-
-   The permutation is done in log LENGTH stages.  In each stage interleave_high
-   and interleave_low stmts are created for each pair of vectors in DR_CHAIN,
-   where the first argument is taken from the first half of DR_CHAIN and the
-   second argument from it's second half.
-   In our example,
-
-   I1: interleave_high (1st vec, 3rd vec)
-   I2: interleave_low (1st vec, 3rd vec)
-   I3: interleave_high (2nd vec, 4th vec)
-   I4: interleave_low (2nd vec, 4th vec)
-
-   The output for the first stage is:
-
-   I1:  0 16  1 17  2 18  3 19
-   I2:  4 20  5 21  6 22  7 23
-   I3:  8 24  9 25 10 26 11 27
-   I4: 12 28 13 29 14 30 15 31
-
-   The output of the second stage, i.e. the final result is:
-
-   I1:  0  8 16 24  1  9 17 25
-   I2:  2 10 18 26  3 11 19 27
-   I3:  4 12 20 28  5 13 21 30
-   I4:  6 14 22 30  7 15 23 31.  */
-
-void
-vect_permute_store_chain (vec_info *vinfo, vec<tree> &dr_chain,
-			  unsigned int length,
-			  stmt_vec_info stmt_info,
-			  gimple_stmt_iterator *gsi,
-			  vec<tree> *result_chain)
-{
-  tree vect1, vect2, high, low;
-  gimple *perm_stmt;
-  tree vectype = STMT_VINFO_VECTYPE (stmt_info);
-  tree perm_mask_low, perm_mask_high;
-  tree data_ref;
-  tree perm3_mask_low, perm3_mask_high;
-  unsigned int i, j, n, log_length = exact_log2 (length);
-
-  result_chain->quick_grow (length);
-  memcpy (result_chain->address (), dr_chain.address (),
-	  length * sizeof (tree));
-
-  if (length == 3)
-    {
-      /* vect_grouped_store_supported ensures that this is constant.  */
-      unsigned int nelt = TYPE_VECTOR_SUBPARTS (vectype).to_constant ();
-      unsigned int j0 = 0, j1 = 0, j2 = 0;
-
-      vec_perm_builder sel (nelt, nelt, 1);
-      sel.quick_grow (nelt);
-      vec_perm_indices indices;
-      for (j = 0; j < 3; j++)
-        {
-	  int nelt0 = ((3 - j) * nelt) % 3;
-	  int nelt1 = ((3 - j) * nelt + 1) % 3;
-	  int nelt2 = ((3 - j) * nelt + 2) % 3;
-
-	  for (i = 0; i < nelt; i++)
-	    {
-	      if (3 * i + nelt0 < nelt)
-		sel[3 * i + nelt0] = j0++;
-	      if (3 * i + nelt1 < nelt)
-		sel[3 * i + nelt1] = nelt + j1++;
-	      if (3 * i + nelt2 < nelt)
-		sel[3 * i + nelt2] = 0;
-	    }
-	  indices.new_vector (sel, 2, nelt);
-	  perm3_mask_low = vect_gen_perm_mask_checked (vectype, indices);
-
-	  for (i = 0; i < nelt; i++)
-	    {
-	      if (3 * i + nelt0 < nelt)
-		sel[3 * i + nelt0] = 3 * i + nelt0;
-	      if (3 * i + nelt1 < nelt)
-		sel[3 * i + nelt1] = 3 * i + nelt1;
-	      if (3 * i + nelt2 < nelt)
-		sel[3 * i + nelt2] = nelt + j2++;
-	    }
-	  indices.new_vector (sel, 2, nelt);
-	  perm3_mask_high = vect_gen_perm_mask_checked (vectype, indices);
-
-	  vect1 = dr_chain[0];
-	  vect2 = dr_chain[1];
-
-	  /* Create interleaving stmt:
-	     low = VEC_PERM_EXPR <vect1, vect2,
-				  {j, nelt, *, j + 1, nelt + j + 1, *,
-				   j + 2, nelt + j + 2, *, ...}>  */
-	  data_ref = make_temp_ssa_name (vectype, NULL, "vect_shuffle3_low");
-	  perm_stmt = gimple_build_assign (data_ref, VEC_PERM_EXPR, vect1,
-					   vect2, perm3_mask_low);
-	  vect_finish_stmt_generation (vinfo, stmt_info, perm_stmt, gsi);
-
-	  vect1 = data_ref;
-	  vect2 = dr_chain[2];
-	  /* Create interleaving stmt:
-	     low = VEC_PERM_EXPR <vect1, vect2,
-				  {0, 1, nelt + j, 3, 4, nelt + j + 1,
-				   6, 7, nelt + j + 2, ...}>  */
-	  data_ref = make_temp_ssa_name (vectype, NULL, "vect_shuffle3_high");
-	  perm_stmt = gimple_build_assign (data_ref, VEC_PERM_EXPR, vect1,
-					   vect2, perm3_mask_high);
-	  vect_finish_stmt_generation (vinfo, stmt_info, perm_stmt, gsi);
-	  (*result_chain)[j] = data_ref;
-	}
-    }
-  else
-    {
-      /* If length is not equal to 3 then only power of 2 is supported.  */
-      gcc_assert (pow2p_hwi (length));
-
-      /* The encoding has 2 interleaved stepped patterns.  */
-      poly_uint64 nelt = TYPE_VECTOR_SUBPARTS (vectype);
-      vec_perm_builder sel (nelt, 2, 3);
-      sel.quick_grow (6);
-      for (i = 0; i < 3; i++)
-	{
-	  sel[i * 2] = i;
-	  sel[i * 2 + 1] = i + nelt;
-	}
-	vec_perm_indices indices (sel, 2, nelt);
-	perm_mask_high = vect_gen_perm_mask_checked (vectype, indices);
-
-	for (i = 0; i < 6; i++)
-	  sel[i] += exact_div (nelt, 2);
-	indices.new_vector (sel, 2, nelt);
-	perm_mask_low = vect_gen_perm_mask_checked (vectype, indices);
-
-	for (i = 0, n = log_length; i < n; i++)
-	  {
-	    for (j = 0; j < length/2; j++)
-	      {
-		vect1 = dr_chain[j];
-		vect2 = dr_chain[j+length/2];
-
-		/* Create interleaving stmt:
-		   high = VEC_PERM_EXPR <vect1, vect2, {0, nelt, 1, nelt+1,
-							...}>  */
-		high = make_temp_ssa_name (vectype, NULL, "vect_inter_high");
-		perm_stmt = gimple_build_assign (high, VEC_PERM_EXPR, vect1,
-						 vect2, perm_mask_high);
-		vect_finish_stmt_generation (vinfo, stmt_info, perm_stmt, gsi);
-		(*result_chain)[2*j] = high;
-
-		/* Create interleaving stmt:
-		   low = VEC_PERM_EXPR <vect1, vect2,
-					{nelt/2, nelt*3/2, nelt/2+1, nelt*3/2+1,
-					 ...}>  */
-		low = make_temp_ssa_name (vectype, NULL, "vect_inter_low");
-		perm_stmt = gimple_build_assign (low, VEC_PERM_EXPR, vect1,
-						 vect2, perm_mask_low);
-		vect_finish_stmt_generation (vinfo, stmt_info, perm_stmt, gsi);
-		(*result_chain)[2*j+1] = low;
-	      }
-	    memcpy (dr_chain.address (), result_chain->address (),
-		    length * sizeof (tree));
-	  }
-    }
-}
 
 /* Function vect_setup_realignment
 
@@ -6513,633 +6507,6 @@ vect_load_lanes_supported (tree vectype, unsigned HOST_WIDE_INT count,
   return IFN_LAST;
 }
 
-/* Function vect_permute_load_chain.
-
-   Given a chain of interleaved loads in DR_CHAIN of LENGTH that must be
-   a power of 2 or equal to 3, generate extract_even/odd stmts to reorder
-   the input data correctly.  Return the final references for loads in
-   RESULT_CHAIN.
-
-   E.g., LENGTH is 4 and the scalar type is short, i.e., VF is 8.
-   The input is 4 vectors each containing 8 elements. We assign a number to each
-   element, the input sequence is:
-
-   1st vec:   0  1  2  3  4  5  6  7
-   2nd vec:   8  9 10 11 12 13 14 15
-   3rd vec:  16 17 18 19 20 21 22 23
-   4th vec:  24 25 26 27 28 29 30 31
-
-   The output sequence should be:
-
-   1st vec:  0 4  8 12 16 20 24 28
-   2nd vec:  1 5  9 13 17 21 25 29
-   3rd vec:  2 6 10 14 18 22 26 30
-   4th vec:  3 7 11 15 19 23 27 31
-
-   i.e., the first output vector should contain the first elements of each
-   interleaving group, etc.
-
-   We use extract_even/odd instructions to create such output.  The input of
-   each extract_even/odd operation is two vectors
-   1st vec    2nd vec
-   0 1 2 3    4 5 6 7
-
-   and the output is the vector of extracted even/odd elements.  The output of
-   extract_even will be:   0 2 4 6
-   and of extract_odd:     1 3 5 7
-
-
-   The permutation is done in log LENGTH stages.  In each stage extract_even
-   and extract_odd stmts are created for each pair of vectors in DR_CHAIN in
-   their order.  In our example,
-
-   E1: extract_even (1st vec, 2nd vec)
-   E2: extract_odd (1st vec, 2nd vec)
-   E3: extract_even (3rd vec, 4th vec)
-   E4: extract_odd (3rd vec, 4th vec)
-
-   The output for the first stage will be:
-
-   E1:  0  2  4  6  8 10 12 14
-   E2:  1  3  5  7  9 11 13 15
-   E3: 16 18 20 22 24 26 28 30
-   E4: 17 19 21 23 25 27 29 31
-
-   In order to proceed and create the correct sequence for the next stage (or
-   for the correct output, if the second stage is the last one, as in our
-   example), we first put the output of extract_even operation and then the
-   output of extract_odd in RESULT_CHAIN (which is then copied to DR_CHAIN).
-   The input for the second stage is:
-
-   1st vec (E1):  0  2  4  6  8 10 12 14
-   2nd vec (E3): 16 18 20 22 24 26 28 30
-   3rd vec (E2):  1  3  5  7  9 11 13 15
-   4th vec (E4): 17 19 21 23 25 27 29 31
-
-   The output of the second stage:
-
-   E1: 0 4  8 12 16 20 24 28
-   E2: 2 6 10 14 18 22 26 30
-   E3: 1 5  9 13 17 21 25 29
-   E4: 3 7 11 15 19 23 27 31
-
-   And RESULT_CHAIN after reordering:
-
-   1st vec (E1):  0 4  8 12 16 20 24 28
-   2nd vec (E3):  1 5  9 13 17 21 25 29
-   3rd vec (E2):  2 6 10 14 18 22 26 30
-   4th vec (E4):  3 7 11 15 19 23 27 31.  */
-
-static void
-vect_permute_load_chain (vec_info *vinfo, vec<tree> dr_chain,
-			 unsigned int length,
-			 stmt_vec_info stmt_info,
-			 gimple_stmt_iterator *gsi,
-			 vec<tree> *result_chain)
-{
-  tree data_ref, first_vect, second_vect;
-  tree perm_mask_even, perm_mask_odd;
-  tree perm3_mask_low, perm3_mask_high;
-  gimple *perm_stmt;
-  tree vectype = STMT_VINFO_VECTYPE (stmt_info);
-  unsigned int i, j, log_length = exact_log2 (length);
-
-  result_chain->quick_grow (length);
-  memcpy (result_chain->address (), dr_chain.address (),
-	  length * sizeof (tree));
-
-  if (length == 3)
-    {
-      /* vect_grouped_load_supported ensures that this is constant.  */
-      unsigned nelt = TYPE_VECTOR_SUBPARTS (vectype).to_constant ();
-      unsigned int k;
-
-      vec_perm_builder sel (nelt, nelt, 1);
-      sel.quick_grow (nelt);
-      vec_perm_indices indices;
-      for (k = 0; k < 3; k++)
-	{
-	  for (i = 0; i < nelt; i++)
-	    if (3 * i + k < 2 * nelt)
-	      sel[i] = 3 * i + k;
-	    else
-	      sel[i] = 0;
-	  indices.new_vector (sel, 2, nelt);
-	  perm3_mask_low = vect_gen_perm_mask_checked (vectype, indices);
-
-	  for (i = 0, j = 0; i < nelt; i++)
-	    if (3 * i + k < 2 * nelt)
-	      sel[i] = i;
-	    else
-	      sel[i] = nelt + ((nelt + k) % 3) + 3 * (j++);
-	  indices.new_vector (sel, 2, nelt);
-	  perm3_mask_high = vect_gen_perm_mask_checked (vectype, indices);
-
-	  first_vect = dr_chain[0];
-	  second_vect = dr_chain[1];
-
-	  /* Create interleaving stmt (low part of):
-	     low = VEC_PERM_EXPR <first_vect, second_vect2, {k, 3 + k, 6 + k,
-							     ...}>  */
-	  data_ref = make_temp_ssa_name (vectype, NULL, "vect_shuffle3_low");
-	  perm_stmt = gimple_build_assign (data_ref, VEC_PERM_EXPR, first_vect,
-					   second_vect, perm3_mask_low);
-	  vect_finish_stmt_generation (vinfo, stmt_info, perm_stmt, gsi);
-
-	  /* Create interleaving stmt (high part of):
-	     high = VEC_PERM_EXPR <first_vect, second_vect2, {k, 3 + k, 6 + k,
-							      ...}>  */
-	  first_vect = data_ref;
-	  second_vect = dr_chain[2];
-	  data_ref = make_temp_ssa_name (vectype, NULL, "vect_shuffle3_high");
-	  perm_stmt = gimple_build_assign (data_ref, VEC_PERM_EXPR, first_vect,
-					   second_vect, perm3_mask_high);
-	  vect_finish_stmt_generation (vinfo, stmt_info, perm_stmt, gsi);
-	  (*result_chain)[k] = data_ref;
-	}
-    }
-  else
-    {
-      /* If length is not equal to 3 then only power of 2 is supported.  */
-      gcc_assert (pow2p_hwi (length));
-
-      /* The encoding has a single stepped pattern.  */
-      poly_uint64 nelt = TYPE_VECTOR_SUBPARTS (vectype);
-      vec_perm_builder sel (nelt, 1, 3);
-      sel.quick_grow (3);
-      for (i = 0; i < 3; ++i)
-	sel[i] = i * 2;
-      vec_perm_indices indices (sel, 2, nelt);
-      perm_mask_even = vect_gen_perm_mask_checked (vectype, indices);
-
-      for (i = 0; i < 3; ++i)
-	sel[i] = i * 2 + 1;
-      indices.new_vector (sel, 2, nelt);
-      perm_mask_odd = vect_gen_perm_mask_checked (vectype, indices);
-
-      for (i = 0; i < log_length; i++)
-	{
-	  for (j = 0; j < length; j += 2)
-	    {
-	      first_vect = dr_chain[j];
-	      second_vect = dr_chain[j+1];
-
-	      /* data_ref = permute_even (first_data_ref, second_data_ref);  */
-	      data_ref = make_temp_ssa_name (vectype, NULL, "vect_perm_even");
-	      perm_stmt = gimple_build_assign (data_ref, VEC_PERM_EXPR,
-					       first_vect, second_vect,
-					       perm_mask_even);
-	      vect_finish_stmt_generation (vinfo, stmt_info, perm_stmt, gsi);
-	      (*result_chain)[j/2] = data_ref;
-
-	      /* data_ref = permute_odd (first_data_ref, second_data_ref);  */
-	      data_ref = make_temp_ssa_name (vectype, NULL, "vect_perm_odd");
-	      perm_stmt = gimple_build_assign (data_ref, VEC_PERM_EXPR,
-					       first_vect, second_vect,
-					       perm_mask_odd);
-	      vect_finish_stmt_generation (vinfo, stmt_info, perm_stmt, gsi);
-	      (*result_chain)[j/2+length/2] = data_ref;
-	    }
-	  memcpy (dr_chain.address (), result_chain->address (),
-		  length * sizeof (tree));
-	}
-    }
-}
-
-/* Function vect_shift_permute_load_chain.
-
-   Given a chain of loads in DR_CHAIN of LENGTH 2 or 3, generate
-   sequence of stmts to reorder the input data accordingly.
-   Return the final references for loads in RESULT_CHAIN.
-   Return true if successed, false otherwise.
-
-   E.g., LENGTH is 3 and the scalar type is short, i.e., VF is 8.
-   The input is 3 vectors each containing 8 elements.  We assign a
-   number to each element, the input sequence is:
-
-   1st vec:   0  1  2  3  4  5  6  7
-   2nd vec:   8  9 10 11 12 13 14 15
-   3rd vec:  16 17 18 19 20 21 22 23
-
-   The output sequence should be:
-
-   1st vec:  0 3 6  9 12 15 18 21
-   2nd vec:  1 4 7 10 13 16 19 22
-   3rd vec:  2 5 8 11 14 17 20 23
-
-   We use 3 shuffle instructions and 3 * 3 - 1 shifts to create such output.
-
-   First we shuffle all 3 vectors to get correct elements order:
-
-   1st vec:  ( 0  3  6) ( 1  4  7) ( 2  5)
-   2nd vec:  ( 8 11 14) ( 9 12 15) (10 13)
-   3rd vec:  (16 19 22) (17 20 23) (18 21)
-
-   Next we unite and shift vector 3 times:
-
-   1st step:
-     shift right by 6 the concatenation of:
-     "1st vec" and  "2nd vec"
-       ( 0  3  6) ( 1  4  7) |( 2  5) _ ( 8 11 14) ( 9 12 15)| (10 13)
-     "2nd vec" and  "3rd vec"
-       ( 8 11 14) ( 9 12 15) |(10 13) _ (16 19 22) (17 20 23)| (18 21)
-     "3rd vec" and  "1st vec"
-       (16 19 22) (17 20 23) |(18 21) _ ( 0  3  6) ( 1  4  7)| ( 2  5)
-			     | New vectors                   |
-
-     So that now new vectors are:
-
-     1st vec:  ( 2  5) ( 8 11 14) ( 9 12 15)
-     2nd vec:  (10 13) (16 19 22) (17 20 23)
-     3rd vec:  (18 21) ( 0  3  6) ( 1  4  7)
-
-   2nd step:
-     shift right by 5 the concatenation of:
-     "1st vec" and  "3rd vec"
-       ( 2  5) ( 8 11 14) |( 9 12 15) _ (18 21) ( 0  3  6)| ( 1  4  7)
-     "2nd vec" and  "1st vec"
-       (10 13) (16 19 22) |(17 20 23) _ ( 2  5) ( 8 11 14)| ( 9 12 15)
-     "3rd vec" and  "2nd vec"
-       (18 21) ( 0  3  6) |( 1  4  7) _ (10 13) (16 19 22)| (17 20 23)
-			  | New vectors                   |
-
-     So that now new vectors are:
-
-     1st vec:  ( 9 12 15) (18 21) ( 0  3  6)
-     2nd vec:  (17 20 23) ( 2  5) ( 8 11 14)
-     3rd vec:  ( 1  4  7) (10 13) (16 19 22) READY
-
-   3rd step:
-     shift right by 5 the concatenation of:
-     "1st vec" and  "1st vec"
-       ( 9 12 15) (18 21) |( 0  3  6) _ ( 9 12 15) (18 21)| ( 0  3  6)
-     shift right by 3 the concatenation of:
-     "2nd vec" and  "2nd vec"
-               (17 20 23) |( 2  5) ( 8 11 14) _ (17 20 23)| ( 2  5) ( 8 11 14)
-			  | New vectors                   |
-
-     So that now all vectors are READY:
-     1st vec:  ( 0  3  6) ( 9 12 15) (18 21)
-     2nd vec:  ( 2  5) ( 8 11 14) (17 20 23)
-     3rd vec:  ( 1  4  7) (10 13) (16 19 22)
-
-   This algorithm is faster than one in vect_permute_load_chain if:
-     1.  "shift of a concatination" is faster than general permutation.
-	 This is usually so.
-     2.  The TARGET machine can't execute vector instructions in parallel.
-	 This is because each step of the algorithm depends on previous.
-	 The algorithm in vect_permute_load_chain is much more parallel.
-
-   The algorithm is applicable only for LOAD CHAIN LENGTH less than VF.
-*/
-
-static bool
-vect_shift_permute_load_chain (vec_info *vinfo, vec<tree> dr_chain,
-			       unsigned int length,
-			       stmt_vec_info stmt_info,
-			       gimple_stmt_iterator *gsi,
-			       vec<tree> *result_chain)
-{
-  tree vect[3], vect_shift[3], data_ref, first_vect, second_vect;
-  tree perm2_mask1, perm2_mask2, perm3_mask;
-  tree select_mask, shift1_mask, shift2_mask, shift3_mask, shift4_mask;
-  gimple *perm_stmt;
-
-  tree vectype = STMT_VINFO_VECTYPE (stmt_info);
-  machine_mode vmode = TYPE_MODE (vectype);
-  unsigned int i;
-  loop_vec_info loop_vinfo = dyn_cast <loop_vec_info> (vinfo);
-
-  unsigned HOST_WIDE_INT nelt, vf;
-  if (!TYPE_VECTOR_SUBPARTS (vectype).is_constant (&nelt)
-      || !LOOP_VINFO_VECT_FACTOR (loop_vinfo).is_constant (&vf))
-    /* Not supported for variable-length vectors.  */
-    return false;
-
-  vec_perm_builder sel (nelt, nelt, 1);
-  sel.quick_grow (nelt);
-
-  result_chain->quick_grow (length);
-  memcpy (result_chain->address (), dr_chain.address (),
-	  length * sizeof (tree));
-
-  if (pow2p_hwi (length) && vf > 4)
-    {
-      unsigned int j, log_length = exact_log2 (length);
-      for (i = 0; i < nelt / 2; ++i)
-	sel[i] = i * 2;
-      for (i = 0; i < nelt / 2; ++i)
-	sel[nelt / 2 + i] = i * 2 + 1;
-      vec_perm_indices indices (sel, 2, nelt);
-      if (!can_vec_perm_const_p (vmode, vmode, indices))
-	{
-	  if (dump_enabled_p ())
-	    dump_printf_loc (MSG_MISSED_OPTIMIZATION, vect_location,
-			     "shuffle of 2 fields structure is not \
-			      supported by target\n");
-	  return false;
-	}
-      perm2_mask1 = vect_gen_perm_mask_checked (vectype, indices);
-
-      for (i = 0; i < nelt / 2; ++i)
-	sel[i] = i * 2 + 1;
-      for (i = 0; i < nelt / 2; ++i)
-	sel[nelt / 2 + i] = i * 2;
-      indices.new_vector (sel, 2, nelt);
-      if (!can_vec_perm_const_p (vmode, vmode, indices))
-	{
-	  if (dump_enabled_p ())
-	    dump_printf_loc (MSG_MISSED_OPTIMIZATION, vect_location,
-			     "shuffle of 2 fields structure is not \
-			      supported by target\n");
-	  return false;
-	}
-      perm2_mask2 = vect_gen_perm_mask_checked (vectype, indices);
-
-      /* Generating permutation constant to shift all elements.
-	 For vector length 8 it is {4 5 6 7 8 9 10 11}.  */
-      for (i = 0; i < nelt; i++)
-	sel[i] = nelt / 2 + i;
-      indices.new_vector (sel, 2, nelt);
-      if (!can_vec_perm_const_p (vmode, vmode, indices))
-	{
-	  if (dump_enabled_p ())
-	    dump_printf_loc (MSG_MISSED_OPTIMIZATION, vect_location,
-			     "shift permutation is not supported by target\n");
-	  return false;
-	}
-      shift1_mask = vect_gen_perm_mask_checked (vectype, indices);
-
-      /* Generating permutation constant to select vector from 2.
-	 For vector length 8 it is {0 1 2 3 12 13 14 15}.  */
-      for (i = 0; i < nelt / 2; i++)
-	sel[i] = i;
-      for (i = nelt / 2; i < nelt; i++)
-	sel[i] = nelt + i;
-      indices.new_vector (sel, 2, nelt);
-      if (!can_vec_perm_const_p (vmode, vmode, indices))
-	{
-	  if (dump_enabled_p ())
-	    dump_printf_loc (MSG_MISSED_OPTIMIZATION, vect_location,
-			     "select is not supported by target\n");
-	  return false;
-	}
-      select_mask = vect_gen_perm_mask_checked (vectype, indices);
-
-      for (i = 0; i < log_length; i++)
-	{
-	  for (j = 0; j < length; j += 2)
-	    {
-	      first_vect = dr_chain[j];
-	      second_vect = dr_chain[j + 1];
-
-	      data_ref = make_temp_ssa_name (vectype, NULL, "vect_shuffle2");
-	      perm_stmt = gimple_build_assign (data_ref, VEC_PERM_EXPR,
-					       first_vect, first_vect,
-					       perm2_mask1);
-	      vect_finish_stmt_generation (vinfo, stmt_info, perm_stmt, gsi);
-	      vect[0] = data_ref;
-
-	      data_ref = make_temp_ssa_name (vectype, NULL, "vect_shuffle2");
-	      perm_stmt = gimple_build_assign (data_ref, VEC_PERM_EXPR,
-					       second_vect, second_vect,
-					       perm2_mask2);
-	      vect_finish_stmt_generation (vinfo, stmt_info, perm_stmt, gsi);
-	      vect[1] = data_ref;
-
-	      data_ref = make_temp_ssa_name (vectype, NULL, "vect_shift");
-	      perm_stmt = gimple_build_assign (data_ref, VEC_PERM_EXPR,
-					       vect[0], vect[1], shift1_mask);
-	      vect_finish_stmt_generation (vinfo, stmt_info, perm_stmt, gsi);
-	      (*result_chain)[j/2 + length/2] = data_ref;
-
-	      data_ref = make_temp_ssa_name (vectype, NULL, "vect_select");
-	      perm_stmt = gimple_build_assign (data_ref, VEC_PERM_EXPR,
-					       vect[0], vect[1], select_mask);
-	      vect_finish_stmt_generation (vinfo, stmt_info, perm_stmt, gsi);
-	      (*result_chain)[j/2] = data_ref;
-	    }
-	  memcpy (dr_chain.address (), result_chain->address (),
-		  length * sizeof (tree));
-	}
-      return true;
-    }
-  if (length == 3 && vf > 2)
-    {
-      unsigned int k = 0, l = 0;
-
-      /* Generating permutation constant to get all elements in rigth order.
-	 For vector length 8 it is {0 3 6 1 4 7 2 5}.  */
-      for (i = 0; i < nelt; i++)
-	{
-	  if (3 * k + (l % 3) >= nelt)
-	    {
-	      k = 0;
-	      l += (3 - (nelt % 3));
-	    }
-	  sel[i] = 3 * k + (l % 3);
-	  k++;
-	}
-      vec_perm_indices indices (sel, 2, nelt);
-      if (!can_vec_perm_const_p (vmode, vmode, indices))
-	{
-	  if (dump_enabled_p ())
-	    dump_printf_loc (MSG_MISSED_OPTIMIZATION, vect_location,
-			     "shuffle of 3 fields structure is not \
-			      supported by target\n");
-	  return false;
-	}
-      perm3_mask = vect_gen_perm_mask_checked (vectype, indices);
-
-      /* Generating permutation constant to shift all elements.
-	 For vector length 8 it is {6 7 8 9 10 11 12 13}.  */
-      for (i = 0; i < nelt; i++)
-	sel[i] = 2 * (nelt / 3) + (nelt % 3) + i;
-      indices.new_vector (sel, 2, nelt);
-      if (!can_vec_perm_const_p (vmode, vmode, indices))
-	{
-	  if (dump_enabled_p ())
-	    dump_printf_loc (MSG_MISSED_OPTIMIZATION, vect_location,
-			     "shift permutation is not supported by target\n");
-	  return false;
-	}
-      shift1_mask = vect_gen_perm_mask_checked (vectype, indices);
-
-      /* Generating permutation constant to shift all elements.
-	 For vector length 8 it is {5 6 7 8 9 10 11 12}.  */
-      for (i = 0; i < nelt; i++)
-	sel[i] = 2 * (nelt / 3) + 1 + i;
-      indices.new_vector (sel, 2, nelt);
-      if (!can_vec_perm_const_p (vmode, vmode, indices))
-	{
-	  if (dump_enabled_p ())
-	    dump_printf_loc (MSG_MISSED_OPTIMIZATION, vect_location,
-			     "shift permutation is not supported by target\n");
-	  return false;
-	}
-      shift2_mask = vect_gen_perm_mask_checked (vectype, indices);
-
-      /* Generating permutation constant to shift all elements.
-	 For vector length 8 it is {3 4 5 6 7 8 9 10}.  */
-      for (i = 0; i < nelt; i++)
-	sel[i] = (nelt / 3) + (nelt % 3) / 2 + i;
-      indices.new_vector (sel, 2, nelt);
-      if (!can_vec_perm_const_p (vmode, vmode, indices))
-	{
-	  if (dump_enabled_p ())
-	    dump_printf_loc (MSG_MISSED_OPTIMIZATION, vect_location,
-			     "shift permutation is not supported by target\n");
-	  return false;
-	}
-      shift3_mask = vect_gen_perm_mask_checked (vectype, indices);
-
-      /* Generating permutation constant to shift all elements.
-	 For vector length 8 it is {5 6 7 8 9 10 11 12}.  */
-      for (i = 0; i < nelt; i++)
-	sel[i] = 2 * (nelt / 3) + (nelt % 3) / 2 + i;
-      indices.new_vector (sel, 2, nelt);
-      if (!can_vec_perm_const_p (vmode, vmode, indices))
-	{
-	  if (dump_enabled_p ())
-	    dump_printf_loc (MSG_MISSED_OPTIMIZATION, vect_location,
-			     "shift permutation is not supported by target\n");
-	  return false;
-	}
-      shift4_mask = vect_gen_perm_mask_checked (vectype, indices);
-
-      for (k = 0; k < 3; k++)
-	{
-	  data_ref = make_temp_ssa_name (vectype, NULL, "vect_shuffle3");
-	  perm_stmt = gimple_build_assign (data_ref, VEC_PERM_EXPR,
-					   dr_chain[k], dr_chain[k],
-					   perm3_mask);
-	  vect_finish_stmt_generation (vinfo, stmt_info, perm_stmt, gsi);
-	  vect[k] = data_ref;
-	}
-
-      for (k = 0; k < 3; k++)
-	{
-	  data_ref = make_temp_ssa_name (vectype, NULL, "vect_shift1");
-	  perm_stmt = gimple_build_assign (data_ref, VEC_PERM_EXPR,
-					   vect[k % 3], vect[(k + 1) % 3],
-					   shift1_mask);
-	  vect_finish_stmt_generation (vinfo, stmt_info, perm_stmt, gsi);
-	  vect_shift[k] = data_ref;
-	}
-
-      for (k = 0; k < 3; k++)
-	{
-	  data_ref = make_temp_ssa_name (vectype, NULL, "vect_shift2");
-	  perm_stmt = gimple_build_assign (data_ref, VEC_PERM_EXPR,
-					   vect_shift[(4 - k) % 3],
-					   vect_shift[(3 - k) % 3],
-					   shift2_mask);
-	  vect_finish_stmt_generation (vinfo, stmt_info, perm_stmt, gsi);
-	  vect[k] = data_ref;
-	}
-
-      (*result_chain)[3 - (nelt % 3)] = vect[2];
-
-      data_ref = make_temp_ssa_name (vectype, NULL, "vect_shift3");
-      perm_stmt = gimple_build_assign (data_ref, VEC_PERM_EXPR, vect[0],
-				       vect[0], shift3_mask);
-      vect_finish_stmt_generation (vinfo, stmt_info, perm_stmt, gsi);
-      (*result_chain)[nelt % 3] = data_ref;
-
-      data_ref = make_temp_ssa_name (vectype, NULL, "vect_shift4");
-      perm_stmt = gimple_build_assign (data_ref, VEC_PERM_EXPR, vect[1],
-				       vect[1], shift4_mask);
-      vect_finish_stmt_generation (vinfo, stmt_info, perm_stmt, gsi);
-      (*result_chain)[0] = data_ref;
-      return true;
-    }
-  return false;
-}
-
-/* Function vect_transform_grouped_load.
-
-   Given a chain of input interleaved data-refs (in DR_CHAIN), build statements
-   to perform their permutation and ascribe the result vectorized statements to
-   the scalar statements.
-*/
-
-void
-vect_transform_grouped_load (vec_info *vinfo, stmt_vec_info stmt_info,
-			     vec<tree> dr_chain,
-			     int size, gimple_stmt_iterator *gsi)
-{
-  machine_mode mode;
-  vec<tree> result_chain = vNULL;
-
-  /* DR_CHAIN contains input data-refs that are a part of the interleaving.
-     RESULT_CHAIN is the output of vect_permute_load_chain, it contains permuted
-     vectors, that are ready for vector computation.  */
-  result_chain.create (size);
-
-  /* If reassociation width for vector type is 2 or greater target machine can
-     execute 2 or more vector instructions in parallel.  Otherwise try to
-     get chain for loads group using vect_shift_permute_load_chain.  */
-  mode = TYPE_MODE (STMT_VINFO_VECTYPE (stmt_info));
-  if (targetm.sched.reassociation_width (VEC_PERM_EXPR, mode) > 1
-      || pow2p_hwi (size)
-      || !vect_shift_permute_load_chain (vinfo, dr_chain, size, stmt_info,
-					 gsi, &result_chain))
-    vect_permute_load_chain (vinfo, dr_chain,
-			     size, stmt_info, gsi, &result_chain);
-  vect_record_grouped_load_vectors (vinfo, stmt_info, result_chain);
-  result_chain.release ();
-}
-
-/* RESULT_CHAIN contains the output of a group of grouped loads that were
-   generated as part of the vectorization of STMT_INFO.  Assign the statement
-   for each vector to the associated scalar statement.  */
-
-void
-vect_record_grouped_load_vectors (vec_info *, stmt_vec_info stmt_info,
-				  vec<tree> result_chain)
-{
-  stmt_vec_info first_stmt_info = DR_GROUP_FIRST_ELEMENT (stmt_info);
-  unsigned int i, gap_count;
-  tree tmp_data_ref;
-
-  /* Put a permuted data-ref in the VECTORIZED_STMT field.
-     Since we scan the chain starting from it's first node, their order
-     corresponds the order of data-refs in RESULT_CHAIN.  */
-  stmt_vec_info next_stmt_info = first_stmt_info;
-  gap_count = 1;
-  FOR_EACH_VEC_ELT (result_chain, i, tmp_data_ref)
-    {
-      if (!next_stmt_info)
-	break;
-
-      /* Skip the gaps.  Loads created for the gaps will be removed by dead
-       code elimination pass later.  No need to check for the first stmt in
-       the group, since it always exists.
-       DR_GROUP_GAP is the number of steps in elements from the previous
-       access (if there is no gap DR_GROUP_GAP is 1).  We skip loads that
-       correspond to the gaps.  */
-      if (next_stmt_info != first_stmt_info
-	  && gap_count < DR_GROUP_GAP (next_stmt_info))
-	{
-	  gap_count++;
-	  continue;
-	}
-
-      /* ???  The following needs cleanup after the removal of
-         DR_GROUP_SAME_DR_STMT.  */
-      if (next_stmt_info)
-        {
-	  gimple *new_stmt = SSA_NAME_DEF_STMT (tmp_data_ref);
-	  /* We assume that if VEC_STMT is not NULL, this is a case of multiple
-	     copies, and we put the new vector statement last.  */
-	  STMT_VINFO_VEC_STMTS (next_stmt_info).safe_push (new_stmt);
-
-	  next_stmt_info = DR_GROUP_NEXT_ELEMENT (next_stmt_info);
-	  gap_count = 1;
-        }
-    }
-}
-
 /* Function vect_force_dr_alignment_p.
 
    Returns whether the alignment of a DECL can be forced to be aligned
@@ -7152,7 +6519,8 @@ vect_can_force_dr_alignment_p (const_tree decl, poly_uint64 alignment)
     return false;
 
   if (decl_in_symtab_p (decl)
-      && !symtab_node::get (decl)->can_increase_alignment_p ())
+      && (!symtab_node::get (decl)
+	  || !symtab_node::get (decl)->can_increase_alignment_p ()))
     return false;
 
   if (TREE_STATIC (decl))
@@ -7166,13 +6534,14 @@ vect_can_force_dr_alignment_p (const_tree decl, poly_uint64 alignment)
    alignment.
    If CHECK_ALIGNED_ACCESSES is TRUE, check if the access is supported even
    it is aligned, i.e., check if it is possible to vectorize it with different
-   alignment.  */
+   alignment.  If GS_INFO is passed we are dealing with a gather/scatter.  */
 
 enum dr_alignment_support
 vect_supportable_dr_alignment (vec_info *vinfo, dr_vec_info *dr_info,
-			       tree vectype, int misalignment)
+			       tree vectype, int misalignment,
+			       gather_scatter_info *gs_info)
 {
-  data_reference *dr = dr_info->dr;
+  data_reference *dr = dr_info ? dr_info->dr : nullptr;
   stmt_vec_info stmt_info = dr_info->stmt;
   machine_mode mode = TYPE_MODE (vectype);
   loop_vec_info loop_vinfo = dyn_cast <loop_vec_info> (vinfo);
@@ -7183,14 +6552,6 @@ vect_supportable_dr_alignment (vec_info *vinfo, dr_vec_info *dr_info,
     return dr_aligned;
   else if (dr_safe_speculative_read_required (stmt_info))
     return dr_unaligned_unsupported;
-
-  /* For now assume all conditional loads/stores support unaligned
-     access without any special code.  */
-  if (gcall *stmt = dyn_cast <gcall *> (stmt_info->stmt))
-    if (gimple_call_internal_p (stmt)
-	&& (gimple_call_internal_fn (stmt) == IFN_MASK_LOAD
-	    || gimple_call_internal_fn (stmt) == IFN_MASK_STORE))
-      return dr_unaligned_supported;
 
   if (loop_vinfo)
     {
@@ -7261,7 +6622,7 @@ vect_supportable_dr_alignment (vec_info *vinfo, dr_vec_info *dr_info,
         }
     } */
 
-  if (DR_IS_READ (dr))
+  if (dr && DR_IS_READ (dr))
     {
       if (can_implement_p (vec_realign_load_optab, mode)
 	  && (!targetm.vectorize.builtin_mask_for_load
@@ -7289,10 +6650,43 @@ vect_supportable_dr_alignment (vec_info *vinfo, dr_vec_info *dr_info,
 
   bool is_packed = false;
   tree type = TREE_TYPE (DR_REF (dr));
+  bool is_gather_scatter = gs_info != nullptr;
   if (misalignment == DR_MISALIGNMENT_UNKNOWN)
-    is_packed = not_size_aligned (DR_REF (dr));
+    {
+      if (!is_gather_scatter || dr != nullptr)
+	is_packed = not_size_aligned (DR_REF (dr));
+      else
+	{
+	  /* Gather-scatter accesses normally perform only component accesses
+	     so alignment is irrelevant for them.  Targets like riscv do care
+	     about scalar alignment in vector accesses, though, so check scalar
+	     alignment here.  We determined the alias pointer as well as the
+	     base alignment during pattern recognition and can re-use it here.
+
+	     As we do not have an analyzed dataref we only know the alignment
+	     of the reference itself and nothing about init, steps, etc.
+	     For now don't try harder to determine misalignment and
+	     just assume it is unknown.  We consider the type packed if its
+	     scalar alignment is lower than the natural alignment of a vector
+	     element's type.  */
+
+	  gcc_assert (!GATHER_SCATTER_LEGACY_P (*gs_info));
+	  gcc_assert (dr == nullptr);
+
+	  tree inner_vectype = TREE_TYPE (vectype);
+
+	  unsigned HOST_WIDE_INT scalar_align
+	    = tree_to_uhwi (gs_info->alias_ptr);
+	  unsigned HOST_WIDE_INT inner_vectype_sz
+	    = tree_to_uhwi (TYPE_SIZE (inner_vectype));
+
+	  bool is_misaligned = scalar_align < inner_vectype_sz;
+	  is_packed = scalar_align > 1 && is_misaligned;
+	}
+    }
   if (targetm.vectorize.support_vector_misalignment (mode, type, misalignment,
-						     is_packed))
+						     is_packed,
+						     is_gather_scatter))
     return dr_unaligned_supported;
 
   /* Unsupported.  */

@@ -32,7 +32,7 @@ along with GCC; see the file COPYING3.  If not see
 #include "flags.h"
 #include "toplev.h"
 #include "langhooks.h"
-#include "diagnostic-macro-unwinding.h" /* for virt_loc_aware_diagnostic_finalizer */
+#include "diagnostics/macro-unwinding.h" /* for virt_loc_aware_diagnostic_finalizer */
 #include "intl.h"
 #include "cppdefault.h"
 #include "incpath.h"
@@ -43,7 +43,7 @@ along with GCC; see the file COPYING3.  If not see
 #include "dumpfile.h"
 #include "file-prefix-map.h"    /* add_*_prefix_map()  */
 #include "context.h"
-#include "diagnostic-format-text.h"
+#include "diagnostics/text-sink.h"
 
 #ifndef DOLLARS_IN_IDENTIFIERS
 # define DOLLARS_IN_IDENTIFIERS true
@@ -169,9 +169,9 @@ c_common_option_lang_mask (void)
 
 /* Diagnostic finalizer for C/C++/Objective-C/Objective-C++.  */
 static void
-c_diagnostic_text_finalizer (diagnostic_text_output_format &text_output,
-			     const diagnostic_info *diagnostic,
-			     diagnostic_t)
+c_diagnostic_text_finalizer (diagnostics::text_sink &text_output,
+			     const diagnostics::diagnostic_info *diagnostic,
+			     enum diagnostics::kind)
 {
   pretty_printer *const pp = text_output.get_printer ();
   char *saved_prefix = pp_take_prefix (pp);
@@ -179,20 +179,20 @@ c_diagnostic_text_finalizer (diagnostic_text_output_format &text_output,
   pp_newline (pp);
   diagnostic_show_locus (&text_output.get_context (),
 			 text_output.get_source_printing_options (),
-			 diagnostic->richloc, diagnostic->kind, pp);
+			 diagnostic->m_richloc, diagnostic->m_kind, pp);
   /* By default print macro expansion contexts in the diagnostic
      finalizer -- for tokens resulting from macro expansion.  */
-  virt_loc_aware_diagnostic_finalizer (text_output, diagnostic);
+  diagnostics::virt_loc_aware_text_finalizer (text_output, diagnostic);
   pp_set_prefix (pp, saved_prefix);
   pp_flush (pp);
 }
 
 /* Common default settings for diagnostics.  */
 void
-c_common_diagnostics_set_defaults (diagnostic_context *context)
+c_common_diagnostics_set_defaults (diagnostics::context *context)
 {
-  diagnostic_text_finalizer (context) = c_diagnostic_text_finalizer;
-  context->m_opt_permissive = OPT_fpermissive;
+  diagnostics::text_finalizer (context) = c_diagnostic_text_finalizer;
+  context->set_permissive_option (OPT_fpermissive);
 }
 
 /* Input charset configuration for diagnostics.  */
@@ -278,7 +278,7 @@ c_common_init_options (unsigned int decoded_options_count,
   if (c_dialect_cxx ())
     set_std_cxx17 (/*ISO*/false);
 
-  global_dc->m_source_printing.colorize_source_p = true;
+  global_dc->get_source_printing_options ().colorize_source_p = true;
 }
 
 /* Handle switch SCODE with argument ARG.  VALUE is true, unless no-
@@ -1084,13 +1084,22 @@ c_common_post_options (const char **pfilename)
 
   /* Change flag_abi_version to be the actual current ABI level, for the
      benefit of c_cpp_builtins, and to make comparison simpler.  */
-  const int latest_abi_version = 20;
-  /* Generate compatibility aliases for ABI v13 (8.2) by default.  */
-  const int abi_compat_default = 13;
+  const int latest_abi_version = 21;
+  /* Possibly different for non-default ABI fixes within a release.  */
+  const int default_abi_version = latest_abi_version;
+  /* Generate compatibility aliases for ABI v18 (GCC 13) by default.  */
+  const int abi_compat_default = 18;
+
+  if (flag_abi_version > latest_abi_version)
+    warning (0, "%<-fabi-version=%d%> is not supported, using =%d",
+	     flag_abi_version, latest_abi_version);
+
+  SET_OPTION_IF_UNSET (&global_options, &global_options_set,
+		       flag_abi_version, default_abi_version);
 
 #define clamp(X) if (X == 0 || X > latest_abi_version) X = latest_abi_version
   clamp (flag_abi_version);
-  clamp (warn_abi_version);
+  /* Don't clamp warn_abi_version, let it be 0 or out of bounds.  */
   clamp (flag_abi_compat_version);
 #undef clamp
 
@@ -1101,23 +1110,16 @@ c_common_post_options (const char **pfilename)
     flag_abi_compat_version = warn_abi_version;
   else if (warn_abi_version == -1 && flag_abi_compat_version == -1)
     {
-      warn_abi_version = latest_abi_version;
-      if (flag_abi_version == latest_abi_version)
-	{
-	  auto_diagnostic_group d;
-	  if (warning (OPT_Wabi, "%<-Wabi%> won%'t warn about anything"))
-	    {
-	      inform (input_location, "%<-Wabi%> warns about differences "
-		      "from the most up-to-date ABI, which is also used "
-		      "by default");
-	      inform (input_location, "use e.g. %<-Wabi=11%> to warn about "
-		      "changes from GCC 7");
-	    }
-	  flag_abi_compat_version = abi_compat_default;
-	}
+      warn_abi_version = 0;
+      if (flag_abi_version == default_abi_version)
+	flag_abi_compat_version = abi_compat_default;
       else
 	flag_abi_compat_version = latest_abi_version;
     }
+
+  /* Allow warnings vs ABI versions beyond what we currently support.  */
+  if (warn_abi_version == 0)
+    warn_abi_version = 1000;
 
   /* By default, enable the new inheriting constructor semantics along with ABI
      11.  New and old should coexist fine, but it is a change in what
@@ -1163,6 +1165,9 @@ c_common_post_options (const char **pfilename)
       warn_cxx20_compat = 0;
       cpp_opts->cpp_warn_cxx20_compat = 0;
     }
+  if (cxx_dialect >= cxx26)
+    /* Don't warn about C++26 compatibility changes in C++26 or later.  */
+    warn_cxx26_compat = 0;
 
   /* C++17 has stricter evaluation order requirements; let's use some of them
      for earlier C++ as well, so chaining works as expected.  */
@@ -1213,9 +1218,24 @@ c_common_post_options (const char **pfilename)
   if (cxx_dialect >= cxx20)
     flag_concepts = 1;
 
+  /* Coroutines are also a C++20 feature.  */
+  SET_OPTION_IF_UNSET (&global_options, &global_options_set,
+		       flag_coroutines, cxx_dialect >= cxx20);
+
   /* Enable lifetime extension of range based for temporaries for C++23.  */
   SET_OPTION_IF_UNSET (&global_options, &global_options_set,
 		       flag_range_for_ext_temps, cxx_dialect >= cxx23);
+
+  /* EnabledBy unfortunately can't specify value to use if set and
+     LangEnabledBy can't specify multiple options with &&.  For -Wunused
+     or -Wunused -Wextra we want these to default to 3 unless user specified
+     some other level explicitly.  */
+  if (warn_unused_but_set_parameter == 1)
+    SET_OPTION_IF_UNSET (&global_options, &global_options_set,
+			 warn_unused_but_set_parameter, 3);
+  if (warn_unused_but_set_variable == 1)
+    SET_OPTION_IF_UNSET (&global_options, &global_options_set,
+			 warn_unused_but_set_variable, 3);
 
   /* -fimmediate-escalation has no effect when immediate functions are not
      supported.  */
@@ -2007,8 +2027,6 @@ set_std_cxx20 (int iso)
   flag_isoc94 = 1;
   flag_isoc99 = 1;
   flag_isoc11 = 1;
-  /* C++20 includes coroutines. */
-  flag_coroutines = true;
   cxx_dialect = cxx20;
   lang_hooks.name = "GNU C++20";
 }
@@ -2025,8 +2043,6 @@ set_std_cxx23 (int iso)
   flag_isoc94 = 1;
   flag_isoc99 = 1;
   flag_isoc11 = 1;
-  /* C++23 includes coroutines.  */
-  flag_coroutines = true;
   cxx_dialect = cxx23;
   lang_hooks.name = "GNU C++23";
 }
@@ -2043,8 +2059,6 @@ set_std_cxx26 (int iso)
   flag_isoc94 = 1;
   flag_isoc99 = 1;
   flag_isoc11 = 1;
-  /* C++26 includes coroutines.  */
-  flag_coroutines = true;
   cxx_dialect = cxx26;
   lang_hooks.name = "GNU C++26";
 }

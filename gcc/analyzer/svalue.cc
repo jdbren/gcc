@@ -18,39 +18,22 @@ You should have received a copy of the GNU General Public License
 along with GCC; see the file COPYING3.  If not see
 <http://www.gnu.org/licenses/>.  */
 
-#include "config.h"
-#define INCLUDE_VECTOR
-#include "system.h"
-#include "coretypes.h"
-#include "tree.h"
-#include "diagnostic-core.h"
-#include "gimple-pretty-print.h"
-#include "function.h"
-#include "basic-block.h"
-#include "gimple.h"
-#include "gimple-iterator.h"
-#include "diagnostic-core.h"
-#include "graphviz.h"
-#include "options.h"
-#include "cgraph.h"
-#include "tree-dfa.h"
-#include "stringpool.h"
-#include "convert.h"
-#include "target.h"
-#include "fold-const.h"
+#include "analyzer/common.h"
+
 #include "tree-pretty-print.h"
-#include "bitmap.h"
-#include "analyzer/analyzer.h"
+#include "gimple-pretty-print.h"
+#include "fold-const.h"
+#include "diagnostic.h"
+#include "tree-diagnostic.h"
+
+#include "text-art/dump.h"
+
 #include "analyzer/analyzer-logging.h"
 #include "analyzer/call-string.h"
 #include "analyzer/program-point.h"
 #include "analyzer/store.h"
 #include "analyzer/svalue.h"
 #include "analyzer/region-model.h"
-#include "diagnostic.h"
-#include "tree-diagnostic.h"
-#include "make-unique.h"
-#include "text-art/dump.h"
 
 #if ENABLE_ANALYZER
 
@@ -107,7 +90,7 @@ std::unique_ptr<json::value>
 svalue::to_json () const
 {
   label_text desc = get_desc (true);
-  auto sval_js = ::make_unique<json::string> (desc.get ());
+  auto sval_js = std::make_unique<json::string> (desc.get ());
   return sval_js;
 }
 
@@ -264,7 +247,7 @@ svalue::maybe_get_constant () const
 }
 
 /* If this svalue is a region_svalue, return the region it points to.
-   Otherwise return NULL.  */
+   Otherwise return nullptr.  */
 
 const region *
 svalue::maybe_get_region () const
@@ -272,12 +255,12 @@ svalue::maybe_get_region () const
   if (const region_svalue *region_sval = dyn_cast_region_svalue ())
     return region_sval->get_pointee ();
   else
-    return NULL;
+    return nullptr;
 }
 
 /* If this svalue is a cast (i.e a unaryop NOP_EXPR or VIEW_CONVERT_EXPR),
    return the underlying svalue.
-   Otherwise return NULL.  */
+   Otherwise return nullptr.  */
 
 const svalue *
 svalue::maybe_undo_cast () const
@@ -288,7 +271,7 @@ svalue::maybe_undo_cast () const
       if (op == NOP_EXPR || op == VIEW_CONVERT_EXPR)
 	return unaryop_sval->get_arg ();
     }
-  return NULL;
+  return nullptr;
 }
 
 /* If this svalue is an unmergeable decorator around another svalue, return
@@ -304,7 +287,7 @@ svalue::unwrap_any_unmergeable () const
 }
 
 /* Attempt to merge THIS with OTHER, returning the merged svalue.
-   Return NULL if not mergeable.  */
+   Return nullptr if not mergeable.  */
 
 const svalue *
 svalue::can_merge_p (const svalue *other,
@@ -312,22 +295,22 @@ svalue::can_merge_p (const svalue *other,
 		     model_merger *merger) const
 {
   if (!(get_type () && other->get_type ()))
-    return NULL;
+    return nullptr;
 
   if (!types_compatible_p (get_type (), other->get_type ()))
-    return NULL;
+    return nullptr;
 
   /* Reject attempts to merge unmergeable svalues.  */
   if ((get_kind () == SK_UNMERGEABLE)
       || (other->get_kind () == SK_UNMERGEABLE))
-    return NULL;
+    return nullptr;
 
   /* Reject attempts to merge poisoned svalues with other svalues
      (either non-poisoned, or other kinds of poison), so that e.g.
      we identify paths in which a variable is conditionally uninitialized.  */
   if (get_kind () == SK_POISONED
       || other->get_kind () == SK_POISONED)
-    return NULL;
+    return nullptr;
 
   /* Reject attempts to merge NULL pointers with not-NULL-pointers.  */
   if (POINTER_TYPE_P (get_type ()))
@@ -341,16 +324,16 @@ svalue::can_merge_p (const svalue *other,
 	if (zerop (cst1))
 	  null1 = true;
       if (null0 != null1)
-	return NULL;
+	return nullptr;
     }
 
   /* Reject merging svalues that have non-purgable sm-state,
      to avoid falsely reporting memory leaks by merging them
      with something else.  */
   if (!merger->mergeable_svalue_p (this))
-    return NULL;
+    return nullptr;
   if (!merger->mergeable_svalue_p (other))
-    return NULL;
+    return nullptr;
 
   /* Widening.  */
   /* Merge: (new_cst, existing_cst) -> widen (existing, new).  */
@@ -427,7 +410,7 @@ svalue::can_merge_p (const svalue *other,
 
 /* Determine if this svalue is either within LIVE_SVALUES, or is implicitly
    live with respect to LIVE_SVALUES and MODEL.
-   LIVE_SVALUES can be NULL, in which case determine if this svalue is
+   LIVE_SVALUES can be nullptr, in which case determine if this svalue is
    intrinsically live.  */
 
 bool
@@ -572,8 +555,8 @@ svalue::cmp_ptr (const svalue *sval1, const svalue *sval2)
       {
 	const poisoned_svalue *poisoned_sval1 = (const poisoned_svalue *)sval1;
 	const poisoned_svalue *poisoned_sval2 = (const poisoned_svalue *)sval2;
-	return (poisoned_sval1->get_poison_kind ()
-		- poisoned_sval2->get_poison_kind ());
+	return (static_cast<int> (poisoned_sval1->get_poison_kind ())
+		- static_cast<int> (poisoned_sval2->get_poison_kind ()));
       }
       break;
     case SK_SETJMP:
@@ -823,7 +806,7 @@ svalue::maybe_fold_bits_within (tree,
 				region_model_manager *) const
 {
   /* By default, don't fold.  */
-  return NULL;
+  return nullptr;
 }
 
 /* Base implementation of svalue::all_zeroes_p.
@@ -836,7 +819,7 @@ svalue::all_zeroes_p () const
 }
 
 /* If this svalue is a pointer, attempt to determine the base region it points
-   to.  Return NULL on any problems.  */
+   to.  Return nullptr on any problems.  */
 
 const region *
 svalue::maybe_get_deref_base_region () const
@@ -847,7 +830,7 @@ svalue::maybe_get_deref_base_region () const
       switch (iter->get_kind ())
 	{
 	default:
-	  return NULL;
+	  return nullptr;
 
 	case SK_REGION:
 	  {
@@ -869,12 +852,25 @@ svalue::maybe_get_deref_base_region () const
 		continue;
 
 	      default:
-		return NULL;
+		return nullptr;
 	      }
-	    return NULL;
+	    return nullptr;
 	  }
 	}
     }
+}
+
+/* If this svalue is a pointer to the typeinfo instance for a particular
+   type, return that type.  Otherwise return NULL_TREE.  */
+
+tree
+svalue::maybe_get_type_from_typeinfo () const
+{
+  if (const region *reg = maybe_get_region ())
+    if (const decl_region *decl_reg = reg->dyn_cast_decl_region ())
+      return TREE_TYPE (DECL_NAME (decl_reg->get_decl ()));
+
+  return NULL_TREE;
 }
 
 /* class region_svalue : public svalue.  */
@@ -1151,7 +1147,7 @@ constant_svalue::maybe_fold_bits_within (tree type,
     }
 
   /* Otherwise, don't fold.  */
-  return NULL;
+  return nullptr;
 }
 
 /* Implementation of svalue::all_zeroes_p for constant_svalue.  */
@@ -1234,13 +1230,13 @@ poison_kind_to_str (enum poison_kind kind)
     {
     default:
       gcc_unreachable ();
-    case POISON_KIND_UNINIT:
+    case poison_kind::uninit:
       return "uninit";
-    case POISON_KIND_FREED:
+    case poison_kind::freed:
       return "freed";
-    case POISON_KIND_DELETED:
+    case poison_kind::deleted:
       return "deleted";
-    case POISON_KIND_POPPED_STACK:
+    case poison_kind::popped_stack:
       return "popped stack";
     }
 }
@@ -1378,7 +1374,7 @@ initial_svalue::implicitly_live_p (const svalue_set *,
      a popped stack frame.  */
   if (model->region_exists_p (m_reg))
     {
-      const svalue *reg_sval = model->get_store_value (m_reg, NULL);
+      const svalue *reg_sval = model->get_store_value (m_reg, nullptr);
       if (reg_sval == this)
 	return true;
     }
@@ -1388,7 +1384,7 @@ initial_svalue::implicitly_live_p (const svalue_set *,
      live in the external caller.  */
   if (initial_value_of_param_p ())
     if (const frame_region *frame_reg = m_reg->maybe_get_frame_region ())
-      if (frame_reg->get_calling_frame () == NULL)
+      if (frame_reg->get_calling_frame () == nullptr)
 	return true;
 
   return false;
@@ -1512,7 +1508,7 @@ unaryop_svalue::maybe_fold_bits_within (tree type,
       break;
     }
   /* Otherwise, don't fold.  */
-  return NULL;
+  return nullptr;
 }
 
 /* class binop_svalue : public svalue.  */
@@ -1841,7 +1837,7 @@ repeated_svalue::maybe_fold_bits_within (tree type,
 	}
     }
 
-  return NULL;
+  return nullptr;
 }
 
 /* class bits_within_svalue : public svalue.  */
@@ -2397,7 +2393,7 @@ compound_svalue::maybe_fold_bits_within (tree type,
 	}
       else
 	/* If we have any symbolic keys we can't get it as bits.  */
-	return NULL;
+	return nullptr;
     }
   return mgr->get_or_create_compound_svalue (type, result_map);
 }

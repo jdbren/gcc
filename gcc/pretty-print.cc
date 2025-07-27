@@ -27,10 +27,10 @@ along with GCC; see the file COPYING3.  If not see
 #include "pretty-print-format-impl.h"
 #include "pretty-print-markup.h"
 #include "pretty-print-urlifier.h"
-#include "diagnostic-color.h"
-#include "diagnostic-event-id.h"
+#include "diagnostics/color.h"
+#include "diagnostics/event-id.h"
 #include "diagnostic-highlight-colors.h"
-#include "make-unique.h"
+#include "auto-obstack.h"
 #include "selftest.h"
 
 #if HAVE_ICONV
@@ -715,7 +715,7 @@ static int
 decode_utf8_char (const unsigned char *, size_t len, unsigned int *);
 static void pp_quoted_string (pretty_printer *, const char *, size_t = -1);
 
-static void
+extern void
 default_token_printer (pretty_printer *pp,
 		       const pp_token_list &tokens);
 
@@ -1328,6 +1328,15 @@ pp_token_list::push_back_text (label_text &&text)
 }
 
 void
+pp_token_list::push_back_byte (char ch)
+{
+  char buf[2];
+  buf[0] = ch;
+  buf[1] = '\0';
+  push_back_text (label_text::take (xstrdup (buf)));
+}
+
+void
 pp_token_list::push_back (std::unique_ptr<pp_token> tok)
 {
   if (!m_first)
@@ -1640,7 +1649,7 @@ push_back_any_text (pp_token_list *tok_list,
    %@: diagnostic_event_id_ptr, for which event_id->known_p () must be true.
    %.*s: a substring the length of which is specified by an argument
 	 integer.
-   %Ns: likewise, but length specified as constant in the format string.
+   %.Ns: likewise, but length specified as constant in the format string.
    Flag 'q': quote formatted text (must come immediately after '%').
    %Z: Requires two arguments - array of int, and len. Prints elements
    of the array.
@@ -2035,6 +2044,16 @@ format_phase_2 (pretty_printer *pp,
 	    pp_string (pp, va_arg (*text.m_args_ptr, const char *));
 	  break;
 
+	case 'B':
+	  {
+	    string_slice s = *va_arg (*text.m_args_ptr, string_slice *);
+	    if (quote)
+	      pp_quoted_string (pp, s.begin (), s.size ());
+	    else
+	      pp_string_n (pp, s.begin (), s.size ());
+	    break;
+	  }
+
 	case 'p':
 	  pp_pointer (pp, va_arg (*text.m_args_ptr, void *));
 	  break;
@@ -2178,38 +2197,6 @@ format_phase_2 (pretty_printer *pp,
       gcc_assert (!formatters[argno]);
 }
 
-struct auto_obstack
-{
-  auto_obstack ()
-  {
-    obstack_init (&m_obstack);
-  }
-
-  ~auto_obstack ()
-  {
-    obstack_free (&m_obstack, NULL);
-  }
-
-  operator obstack & () { return m_obstack; }
-
-  void grow (const void *src, size_t length)
-  {
-    obstack_grow (&m_obstack, src, length);
-  }
-
-  void *object_base () const
-  {
-    return m_obstack.object_base;
-  }
-
-  size_t object_size () const
-  {
-    return obstack_object_size (&m_obstack);
-  }
-
-  obstack m_obstack;
-};
-
 /* Phase 3 of formatting a message (phases 1 and 2 done by pp_format).
 
    Pop a pp_formatted_chunks from chunk_obstack, collecting all the tokens from
@@ -2262,7 +2249,7 @@ pp_output_formatted_text (pretty_printer *pp,
 
 /* Default implementation of token printing.  */
 
-static void
+void
 default_token_printer (pretty_printer *pp,
 		       const pp_token_list &tokens)
 {
@@ -2462,7 +2449,7 @@ pretty_printer::pretty_printer (int maximum_length)
     m_indent_skip (0),
     m_wrapping (),
     m_format_decoder (nullptr),
-    m_format_postprocessor (NULL),
+    m_format_postprocessor (nullptr),
     m_token_printer (nullptr),
     m_emitted_prefix (false),
     m_need_newline (false),
@@ -2488,7 +2475,7 @@ pretty_printer::pretty_printer (const pretty_printer &other)
   m_indent_skip (other.m_indent_skip),
   m_wrapping (other.m_wrapping),
   m_format_decoder (other.m_format_decoder),
-  m_format_postprocessor (NULL),
+  m_format_postprocessor (nullptr),
   m_token_printer (other.m_token_printer),
   m_emitted_prefix (other.m_emitted_prefix),
   m_need_newline (other.m_need_newline),
@@ -2509,8 +2496,6 @@ pretty_printer::pretty_printer (const pretty_printer &other)
 
 pretty_printer::~pretty_printer ()
 {
-  if (m_format_postprocessor)
-    delete m_format_postprocessor;
   m_buffer->~output_buffer ();
   XDELETE (m_buffer);
   free (m_prefix);
@@ -2521,7 +2506,7 @@ pretty_printer::~pretty_printer ()
 std::unique_ptr<pretty_printer>
 pretty_printer::clone () const
 {
-  return ::make_unique<pretty_printer> (*this);
+  return std::make_unique<pretty_printer> (*this);
 }
 
 /* Append a string delimited by START and END to the output area of
@@ -3192,6 +3177,29 @@ pp_markup::context::end_highlight_color ()
 }
 
 void
+pp_markup::context::begin_url (const char *url)
+{
+  push_back_any_text ();
+  m_formatted_token_list->push_back<pp_token_begin_url>
+    (label_text::take (xstrdup (url)));
+}
+
+void
+pp_markup::context::end_url ()
+{
+  push_back_any_text ();
+  m_formatted_token_list->push_back<pp_token_end_url> ();
+}
+
+void
+pp_markup::context::add_event_id (diagnostic_event_id_t event_id)
+{
+  gcc_assert (event_id.known_p ());
+  push_back_any_text ();
+  m_formatted_token_list->push_back<pp_token_event_id> (event_id);
+}
+
+void
 pp_markup::context::push_back_any_text ()
 {
   obstack *cur_obstack = m_buf.m_obstack;
@@ -3405,8 +3413,8 @@ test_pp_format ()
 			    "foo", 0x12345678);
   /* Verify "%@".  */
   {
-    diagnostic_event_id_t first (2);
-    diagnostic_event_id_t second (7);
+    diagnostics::paths::event_id_t first (2);
+    diagnostics::paths::event_id_t second (7);
 
     ASSERT_PP_FORMAT_2 ("first `free' at (3); second `free' at (8)",
 			"first %<free%> at %@; second %<free%> at %@",
@@ -3542,7 +3550,7 @@ test_custom_tokens_1 ()
 
     void add_to_phase_2 (pp_markup::context &ctxt) final override
     {
-      auto val_ptr = make_unique<value> (*this);
+      auto val_ptr = std::make_unique<value> (*this);
       ctxt.m_formatted_token_list->push_back<pp_token_custom_data>
 	(std::move (val_ptr));
     }
@@ -3622,7 +3630,7 @@ test_custom_tokens_2 ()
 
     void add_to_phase_2 (pp_markup::context &ctxt) final override
     {
-      auto val_ptr = make_unique<value> (*this);
+      auto val_ptr = std::make_unique<value> (*this);
       ctxt.m_formatted_token_list->push_back<pp_token_custom_data>
 	(std::move (val_ptr));
     }

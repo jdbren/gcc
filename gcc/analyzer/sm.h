@@ -28,6 +28,7 @@ namespace ana {
 class state_machine;
 class sm_context;
 class pending_diagnostic;
+class analyzer_state_graph;
 
 extern bool any_pointer_p (tree expr);
 extern bool any_pointer_p (const svalue *sval);
@@ -75,7 +76,7 @@ public:
 			   const svalue *,
 			   const extrinsic_state &) const
   {
-    return NULL;
+    return nullptr;
   }
 
   virtual bool
@@ -136,7 +137,9 @@ public:
 
   /* Called when VAR leaks (and !can_purge_p).  */
   virtual std::unique_ptr<pending_diagnostic>
-  on_leak (tree var ATTRIBUTE_UNUSED) const;
+  on_leak (tree var ATTRIBUTE_UNUSED,
+	   const program_state *old_state,
+	   const program_state *new_state) const;
 
   /* Return true if S should be reset to "start" for values passed (or reachable
      from) calls to unknown functions.  IS_MUTABLE is true for pointers as
@@ -152,7 +155,7 @@ public:
   }
 
   /* Attempt to get a state for the merger of STATE_A and STATE_B,
-     or return NULL if merging shouldn't occur, so that differences
+     or return nullptr if merging shouldn't occur, so that differences
      between sm-state will lead to separate exploded nodes.
 
      Most state machines will only merge equal states, but can
@@ -173,7 +176,7 @@ public:
 				    state_t state_b ATTRIBUTE_UNUSED) const
   {
     /* By default, non-equal sm states should inhibit merger of enodes.  */
-    return NULL;
+    return nullptr;
   }
 
   void validate (state_t s) const;
@@ -183,6 +186,15 @@ public:
   std::unique_ptr<json::object> to_json () const;
 
   state_t get_start_state () const { return m_start; }
+
+  virtual void
+  add_state_to_state_graph (analyzer_state_graph &out_state_graph,
+			    const svalue &sval,
+			    state_machine::state_t state) const;
+
+  virtual void
+  add_global_state_to_state_graph (analyzer_state_graph &out_state_graph,
+				   state_machine::state_t state) const;
 
 protected:
   state_t add_state (const char *name);
@@ -235,7 +247,7 @@ public:
      Use in preference to gimple_call_fndecl (and gimple_call_addr_fndecl),
      since it can look through function pointer assignments and
      other callback handling.  */
-  virtual tree get_fndecl_for_call (const gcall *call) = 0;
+  virtual tree get_fndecl_for_call (const gcall &call) = 0;
 
   /* Get the old state of VAR at STMT.  */
   virtual state_machine::state_t get_state (const gimple *stmt,
@@ -318,7 +330,7 @@ public:
 
   virtual path_context *get_path_context () const
   {
-    return NULL;
+    return nullptr;
   }
 
   /* Are we handling an external function with unknown side effects?  */
@@ -341,17 +353,17 @@ protected:
 /* The various state_machine subclasses are hidden in their respective
    implementation files.  */
 
-extern void make_checkers (auto_delete_vec <state_machine> &out,
-			   logger *logger);
+extern std::vector<std::unique_ptr<state_machine>>
+make_checkers (logger *logger);
 
-extern state_machine *make_malloc_state_machine (logger *logger);
-extern state_machine *make_fileptr_state_machine (logger *logger);
-extern state_machine *make_taint_state_machine (logger *logger);
-extern state_machine *make_sensitive_state_machine (logger *logger);
-extern state_machine *make_signal_state_machine (logger *logger);
-extern state_machine *make_pattern_test_state_machine (logger *logger);
-extern state_machine *make_va_list_state_machine (logger *logger);
-extern state_machine *make_fd_state_machine (logger *logger);
+extern std::unique_ptr<state_machine> make_malloc_state_machine (logger *);
+extern std::unique_ptr<state_machine> make_fileptr_state_machine (logger *);
+extern std::unique_ptr<state_machine> make_taint_state_machine (logger *);
+extern std::unique_ptr<state_machine> make_sensitive_state_machine (logger *);
+extern std::unique_ptr<state_machine> make_signal_state_machine (logger *);
+extern std::unique_ptr<state_machine> make_pattern_test_state_machine (logger *);
+extern std::unique_ptr<state_machine> make_va_list_state_machine (logger *);
+extern std::unique_ptr<state_machine> make_fd_state_machine (logger *);
 
 } // namespace ana
 

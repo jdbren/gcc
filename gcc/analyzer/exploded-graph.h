@@ -49,17 +49,17 @@ class impl_region_model_context : public region_model_context
 			     path_context *path_ctxt,
 
 			     const gimple *stmt,
-			     stmt_finder *stmt_finder = NULL,
+			     stmt_finder *stmt_finder = nullptr,
 
 			     bool *out_could_have_done_work = nullptr);
 
   impl_region_model_context (program_state *state,
 			     const extrinsic_state &ext_state,
 			     uncertainty_t *uncertainty,
-			     logger *logger = NULL);
+			     logger *logger = nullptr);
 
   bool warn (std::unique_ptr<pending_diagnostic> d,
-	     const stmt_finder *custom_finder = NULL) final override;
+	     const stmt_finder *custom_finder = nullptr) final override;
   void add_note (std::unique_ptr<pending_note> pn) final override;
   void add_event (std::unique_ptr<checker_event> event) final override;
   void on_svalue_leak (const svalue *) override;
@@ -111,6 +111,8 @@ class impl_region_model_context : public region_model_context
 
   const gimple *get_stmt () const override { return m_stmt; }
   const exploded_graph *get_eg () const override { return m_eg; }
+
+  const program_state *get_state () const override { return m_new_state; }
 
   void maybe_did_work () override;
   bool checking_for_infinite_loop_p () const override { return false; }
@@ -206,20 +208,24 @@ class exploded_node : public dnode<eg_traits>
      This allows us to distinguish enodes that were merged during
      worklist-handling, and thus never had process_node called on them
      (in favor of processing the merged node).  */
-  enum status
+  enum class status
   {
     /* Node is in the worklist.  */
-    STATUS_WORKLIST,
+    worklist,
 
     /* Node has had exploded_graph::process_node called on it.  */
-    STATUS_PROCESSED,
+    processed,
+
+    /* Node was excluded from worklist on creation.
+       e.g. for handling exception-unwinding.  */
+    special,
 
     /* Node was left unprocessed due to merger; it won't have had
        exploded_graph::process_node called on it.  */
-    STATUS_MERGER,
+    merger,
 
     /* Node was processed by maybe_process_run_of_before_supernode_enodes.  */
-    STATUS_BULK_MERGED
+    bulk_merged
   };
   static const char * status_to_str (enum status s);
 
@@ -282,7 +288,7 @@ class exploded_node : public dnode<eg_traits>
 
   on_stmt_flags replay_call_summaries (exploded_graph &eg,
 				       const supernode *snode,
-				       const gcall *call_stmt,
+				       const gcall &call_stmt,
 				       program_state *state,
 				       path_context *path_ctxt,
 				       const function &called_fn,
@@ -290,11 +296,11 @@ class exploded_node : public dnode<eg_traits>
 				       region_model_context *ctxt);
   void replay_call_summary (exploded_graph &eg,
 			    const supernode *snode,
-			    const gcall *call_stmt,
+			    const gcall &call_stmt,
 			    program_state *state,
 			    path_context *path_ctxt,
 			    const function &called_fn,
-			    call_summary *summary,
+			    call_summary &summary,
 			    region_model_context *ctxt);
 
   bool on_edge (exploded_graph &eg,
@@ -303,9 +309,18 @@ class exploded_node : public dnode<eg_traits>
 		program_state *next_state,
 		uncertainty_t *uncertainty);
   void on_longjmp (exploded_graph &eg,
-		   const gcall *call,
+		   const gcall &call,
 		   program_state *new_state,
 		   region_model_context *ctxt);
+  void on_throw (exploded_graph &eg,
+		 const gcall &call,
+		 program_state *new_state,
+		 bool is_rethrow,
+		 region_model_context *ctxt);
+  void on_resx (exploded_graph &eg,
+		const gresx &resx,
+		program_state *new_state,
+		region_model_context *ctxt);
 
   void detect_leaks (exploded_graph &eg);
 
@@ -333,10 +348,10 @@ class exploded_node : public dnode<eg_traits>
   void dump_succs_and_preds (FILE *outf) const;
 
   enum status get_status () const { return m_status; }
-  void set_status (enum status status)
+  void set_status (enum status s)
   {
-    gcc_assert (m_status == STATUS_WORKLIST);
-    m_status = status;
+    gcc_assert (m_status == status::worklist);
+    m_status = s;
   }
 
   void add_diagnostic (const saved_diagnostic *sd)
@@ -392,7 +407,7 @@ class exploded_edge : public dedge<eg_traits>
   //private:
   const superedge *const m_sedge;
 
-  /* NULL for most edges; will be non-NULL for special cases
+  /* nullptr for most edges; will be non-NULL for special cases
      such as an unwind from a longjmp to a setjmp, or when
      a signal is delivered to a signal-handler.  */
   std::unique_ptr<custom_edge_info> m_custom_info;
@@ -424,7 +439,7 @@ private:
 class dynamic_call_info_t : public custom_edge_info
 {
 public:
-  dynamic_call_info_t (const gcall *dynamic_call,
+  dynamic_call_info_t (const gcall &dynamic_call,
   		       const bool is_returning_call = false)
   : m_dynamic_call (dynamic_call),
     m_is_returning_call (is_returning_call)
@@ -445,7 +460,7 @@ public:
   void add_events_to_path (checker_path *emission_path,
 			   const exploded_edge &eedge) const final override;
 private:
-  const gcall *m_dynamic_call;
+  const gcall &m_dynamic_call;
   const bool m_is_returning_call;
 };
 
@@ -457,7 +472,7 @@ class rewind_info_t : public custom_edge_info
 {
 public:
   rewind_info_t (const setjmp_record &setjmp_record,
-		 const gcall *longjmp_call)
+		 const gcall &longjmp_call)
   : m_setjmp_record (setjmp_record),
     m_longjmp_call (longjmp_call)
   {}
@@ -486,12 +501,12 @@ public:
     return origin_point;
   }
 
-  const gcall *get_setjmp_call () const
+  const gcall &get_setjmp_call () const
   {
-    return m_setjmp_record.m_setjmp_call;
+    return *m_setjmp_record.m_setjmp_call;
   }
 
-  const gcall *get_longjmp_call () const
+  const gcall &get_longjmp_call () const
   {
     return m_longjmp_call;
   }
@@ -503,7 +518,7 @@ public:
 
 private:
   setjmp_record m_setjmp_record;
-  const gcall *m_longjmp_call;
+  const gcall &m_longjmp_call;
 };
 
 /* Statistics about aspects of an exploded_graph.  */
@@ -533,14 +548,14 @@ struct eg_hash_map_traits
 
   static inline hashval_t hash (const key_type &k)
   {
-    gcc_assert (k != NULL);
+    gcc_assert (k != nullptr);
     gcc_assert (k != reinterpret_cast<key_type> (1));
     return k->hash ();
   }
   static inline bool equal_keys (const key_type &k1, const key_type &k2)
   {
-    gcc_assert (k1 != NULL);
-    gcc_assert (k2 != NULL);
+    gcc_assert (k1 != nullptr);
+    gcc_assert (k2 != nullptr);
     gcc_assert (k1 != reinterpret_cast<key_type> (1));
     gcc_assert (k2 != reinterpret_cast<key_type> (1));
     if (k1 && k2)
@@ -562,7 +577,7 @@ struct eg_hash_map_traits
   template <typename T>
   static inline void mark_empty (T &entry)
   {
-    entry.m_key = NULL;
+    entry.m_key = nullptr;
   }
   template <typename T>
   static inline bool is_deleted (const T &entry)
@@ -572,7 +587,7 @@ struct eg_hash_map_traits
   template <typename T>
   static inline bool is_empty (const T &entry)
   {
-    return entry.m_key == NULL;
+    return entry.m_key == nullptr;
   }
   static const bool empty_zero_p = false;
 };
@@ -603,14 +618,14 @@ struct eg_point_hash_map_traits
 
   static inline hashval_t hash (const key_type &k)
   {
-    gcc_assert (k != NULL);
+    gcc_assert (k != nullptr);
     gcc_assert (k != reinterpret_cast<key_type> (1));
     return k->hash ();
   }
   static inline bool equal_keys (const key_type &k1, const key_type &k2)
   {
-    gcc_assert (k1 != NULL);
-    gcc_assert (k2 != NULL);
+    gcc_assert (k1 != nullptr);
+    gcc_assert (k2 != nullptr);
     gcc_assert (k1 != reinterpret_cast<key_type> (1));
     gcc_assert (k2 != reinterpret_cast<key_type> (1));
     if (k1 && k2)
@@ -632,7 +647,7 @@ struct eg_point_hash_map_traits
   template <typename T>
   static inline void mark_empty (T &entry)
   {
-    entry.m_key = NULL;
+    entry.m_key = nullptr;
   }
   template <typename T>
   static inline bool is_deleted (const T &entry)
@@ -642,7 +657,7 @@ struct eg_point_hash_map_traits
   template <typename T>
   static inline bool is_empty (const T &entry)
   {
-    return entry.m_key == NULL;
+    return entry.m_key == nullptr;
   }
   static const bool empty_zero_p = false;
 };
@@ -763,7 +778,7 @@ private:
     int get_scc_id (const exploded_node *enode) const
     {
       const supernode *snode = enode->get_supernode ();
-      if (snode == NULL)
+      if (snode == nullptr)
 	return 0;
       return m_worklist.m_scc.get_scc_id (snode->m_index);
     }
@@ -817,7 +832,7 @@ public:
   bool maybe_process_run_of_before_supernode_enodes (exploded_node *node);
   void process_node (exploded_node *node);
 
-  bool maybe_create_dynamic_call (const gcall *call,
+  bool maybe_create_dynamic_call (const gcall &call,
                                   tree fn_decl,
                                   exploded_node *node,
                                   program_state next_state,
@@ -827,10 +842,11 @@ public:
 
   exploded_node *get_or_create_node (const program_point &point,
 				     const program_state &state,
-				     exploded_node *enode_for_diag);
+				     exploded_node *enode_for_diag,
+				     bool add_to_worklist = true);
   exploded_edge *add_edge (exploded_node *src, exploded_node *dest,
 			   const superedge *sedge, bool could_do_work,
-			   std::unique_ptr<custom_edge_info> custom = NULL);
+			   std::unique_ptr<custom_edge_info> custom = nullptr);
 
   per_program_point_data *
   get_or_create_per_program_point_data (const program_point &);
@@ -880,6 +896,10 @@ public:
   }
 
   void on_escaped_function (tree fndecl);
+
+  void unwind_from_exception (exploded_node &enode,
+			      const gimple *stmt,
+			      region_model_context *ctxt);
 
   /* In infinite-loop.cc */
   void detect_infinite_loops ();
@@ -959,7 +979,7 @@ public:
   void dump_to_pp (pretty_printer *pp,
 		   const extrinsic_state *ext_state) const;
   void dump (FILE *fp, const extrinsic_state *ext_state) const;
-  void dump (const extrinsic_state *ext_state = NULL) const;
+  void dump (const extrinsic_state *ext_state = nullptr) const;
   void dump_to_file (const char *filename,
 		     const extrinsic_state &ext_state) const;
 
@@ -1024,7 +1044,7 @@ private:
 
 typedef shortest_paths<eg_traits, exploded_path> shortest_exploded_paths;
 
-/* Abstract base class for use when passing NULL as the stmt for
+/* Abstract base class for use when passing nullptr as the stmt for
    a possible warning, allowing the choice of stmt to be deferred
    until after we have an emission path (and know we're emitting a
    warning).  */

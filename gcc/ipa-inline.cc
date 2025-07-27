@@ -587,7 +587,7 @@ can_inline_edge_by_limits_p (struct cgraph_edge *e, int flags)
 		      || check_maybe_down (flag_unsafe_math_optimizations)
 		      || check_maybe_down (flag_finite_math_only)
 		      || check_maybe_up (flag_signaling_nans)
-		      || check_maybe_down (flag_cx_limited_range)
+		      || check_maybe_up (flag_complex_method)
 		      || check_maybe_up (flag_signed_zeros)
 		      || check_maybe_down (flag_associative_math)
 		      || check_maybe_down (flag_reciprocal_math)
@@ -782,14 +782,6 @@ want_early_inline_function_p (struct cgraph_edge *e)
 
   if (DECL_DISREGARD_INLINE_LIMITS (callee->decl))
     ;
-  /* For AutoFDO, we need to make sure that before profile summary, all
-     hot paths' IR look exactly the same as profiled binary. As a result,
-     in einliner, we will disregard size limit and inline those callsites
-     that are:
-       * inlined in the profiled binary, and
-       * the cloned callee has enough samples to be considered "hot".  */
-  else if (flag_auto_profile && afdo_callsite_hot_enough_for_early_inline (e))
-    ;
   else if (!DECL_DECLARED_INLINE_P (callee->decl)
 	   && !opt_for_fn (e->caller->decl, flag_inline_small_functions))
     {
@@ -931,6 +923,18 @@ inlining_speedup (struct cgraph_edge *edge,
   return speedup;
 }
 
+/* Return expected speedup of the callee function alone
+   (i.e. not estimate of call overhead and also no scalling
+    by call frequency.  */
+
+static sreal
+callee_speedup (struct cgraph_edge *e)
+{
+  sreal unspec_time;
+  sreal spec_time = estimate_edge_time (e, &unspec_time);
+  return unspec_time - spec_time;
+}
+
 /* Return true if the speedup for inlining E is bigger than
    param_inline_min_speedup.  */
 
@@ -968,28 +972,39 @@ want_inline_small_function_p (struct cgraph_edge *e, bool report)
   if (cgraph_inline_failed_type (e->inline_failed) == CIF_FINAL_ERROR)
     want_inline = false;
   else if (DECL_DISREGARD_INLINE_LIMITS (callee->decl))
-    ;
+    return true;
   else if (!DECL_DECLARED_INLINE_P (callee->decl)
 	   && !opt_for_fn (e->caller->decl, flag_inline_small_functions))
     {
       e->inline_failed = CIF_FUNCTION_NOT_INLINE_CANDIDATE;
       want_inline = false;
     }
+
+  /* Early return before lookup of summaries.  */
+  if (!want_inline)
+    {
+      if (report)
+	report_inline_failed_reason (e);
+      return false;
+    }
+
+  ipa_fn_summary *callee_info = ipa_fn_summaries->get (callee);
+  ipa_call_summary *call_info = ipa_call_summaries->get (e);
+
   /* Do fast and conservative check if the function can be good
      inline candidate.  */
-  else if ((!DECL_DECLARED_INLINE_P (callee->decl)
-	   && (!e->count.ipa ().initialized_p () || !e->maybe_hot_p ()))
-	   && ipa_fn_summaries->get (callee)->min_size
-		- ipa_call_summaries->get (e)->call_stmt_size
-	      > inline_insns_auto (e->caller, true, true))
+  if ((!DECL_DECLARED_INLINE_P (callee->decl)
+      && (!e->count.ipa ().initialized_p ()
+	  || !e->maybe_hot_p (callee_info->time)))
+      && callee_info->min_size - call_info->call_stmt_size
+	 > inline_insns_auto (e->caller, true, true))
     {
       e->inline_failed = CIF_MAX_INLINE_INSNS_AUTO_LIMIT;
       want_inline = false;
     }
   else if ((DECL_DECLARED_INLINE_P (callee->decl)
 	    || e->count.ipa ().nonzero_p ())
-	   && ipa_fn_summaries->get (callee)->min_size
-		- ipa_call_summaries->get (e)->call_stmt_size
+	   && callee_info->min_size - call_info->call_stmt_size
 	      > inline_insns_single (e->caller, true, true))
     {
       e->inline_failed = (DECL_DECLARED_INLINE_P (callee->decl)
@@ -1060,7 +1075,7 @@ want_inline_small_function_p (struct cgraph_edge *e, bool report)
  	    }
 	}
       /* If call is cold, do not inline when function body would grow. */
-      else if (!e->maybe_hot_p ()
+      else if (!e->maybe_hot_p (callee_speedup (e))
 	       && (growth >= inline_insns_single (e->caller, false, false)
 		   || growth_positive_p (callee, e, growth)))
 	{
@@ -1842,7 +1857,7 @@ recursive_inlining (struct cgraph_edge *edge,
 	{
 	  /* We need original clone to copy around.  */
 	  master_clone = node->create_clone (node->decl, node->count,
-	    false, vNULL, true, NULL, NULL);
+	    false, vNULL, true, NULL, NULL, NULL);
 	  for (e = master_clone->callees; e; e = e->next_callee)
 	    if (!e->inline_failed)
 	      clone_inlined_nodes (e, true, false, NULL);
@@ -2207,6 +2222,7 @@ inline_small_functions (void)
 
   gcc_assert (in_lto_p
 	      || !(max_count > 0)
+	      || flag_auto_profile
 	      || (profile_info && flag_branch_probabilities));
 
   while (!edge_heap.empty ())
@@ -3094,6 +3110,99 @@ early_inline_small_functions (struct cgraph_node *node)
   return inlined;
 }
 
+/* With auto-fdo inline all functions that was inlined in the train run
+   and inlining seems useful.  That is there are enough samples in the callee
+   function.
+
+   Unlike early inlining, we inline recursively.  Profile data is also used
+   to produce speculative calls which we then inline.  In the case some
+   speculatin was introduced, set SPECULATIVE_CALLS.  */
+
+static bool
+inline_functions_by_afdo (struct cgraph_node *node, bool *speculative_calls)
+{
+  if (!flag_auto_profile || !flag_auto_profile_inlining)
+    return false;
+  struct cgraph_edge *e;
+  bool inlined = false;
+
+  *speculative_calls |= afdo_vpt_for_early_inline (node);
+
+  cgraph_edge *next;
+  for (e = node->callees; e; e = next)
+    {
+      next = e->next_callee;
+
+      if (!e->inline_failed)
+	{
+	  inlined |= inline_functions_by_afdo (e->callee, speculative_calls);
+	  continue;
+	}
+      if (!afdo_callsite_hot_enough_for_early_inline (e))
+	{
+	  /* If we do not want to inline, remove the speculation.  */
+	  if (e->speculative)
+	    cgraph_edge::resolve_speculation (e);
+	  continue;
+	}
+
+      struct cgraph_node *callee = e->callee->ultimate_alias_target ();
+      if (callee->definition
+	  && !ipa_fn_summaries->get (callee))
+	compute_fn_summary (callee, true);
+
+      if (!can_early_inline_edge_p (e))
+	{
+	  if (dump_enabled_p ())
+	    dump_printf_loc (MSG_MISSED_OPTIMIZATION, e->call_stmt,
+			     "Not inlining %C -> %C using auto-profile, %s.",
+			     e->caller, e->callee,
+			     cgraph_inline_failed_string (e->inline_failed));
+	  /* If we do not want to inline, remove the speculation.  */
+	  if (e->speculative)
+	    cgraph_edge::resolve_speculation (e);
+	  continue;
+	}
+      /* We can handle recursive inlining by first producing
+	 inline clone.  */
+      if (e->recursive_p ())
+	{
+	  if (dump_enabled_p ())
+	    dump_printf_loc (MSG_MISSED_OPTIMIZATION, e->call_stmt,
+			     "Not inlining %C recursively"
+			     " using auto-profile.\n",
+			     e->callee);
+	  /* If we do not want to inline, remove the speculation.  */
+	  if (e->speculative)
+	    cgraph_edge::resolve_speculation (e);
+	  continue;
+	}
+
+      if (dump_enabled_p ())
+	{
+	  if (e->caller->inlined_to)
+	    dump_printf_loc (MSG_OPTIMIZED_LOCATIONS, e->call_stmt,
+			     "Inlining using auto-profile %C into %C "
+			     "which is transitively inlined to %C.\n",
+			     callee, e->caller, e->caller->inlined_to);
+	  else
+	    dump_printf_loc (MSG_OPTIMIZED_LOCATIONS, e->call_stmt,
+			     "Inlining using auto-profile %C into %C.\n",
+			     callee, e->caller);
+	}
+      if (e->speculative)
+	remove_afdo_speculative_target (e);
+      inline_call (e, true, NULL, NULL, false);
+      inlined |= inline_functions_by_afdo (e->callee, speculative_calls);
+      inlined = true;
+    }
+
+  if (inlined && !node->inlined_to)
+    ipa_update_overall_fn_summary (node);
+
+  return inlined;
+}
+
 unsigned int
 early_inliner (function *fun)
 {
@@ -3169,10 +3278,23 @@ early_inliner (function *fun)
       /* We iterate incremental inlining to get trivial cases of indirect
 	 inlining.  */
       while (iterations < opt_for_fn (node->decl,
-				      param_early_inliner_max_iterations)
-	     && early_inline_small_functions (node))
+				      param_early_inliner_max_iterations))
 	{
+	  bool inlined = early_inline_small_functions (node);
+	  bool speculative_calls = false;
+	  inlined |= inline_functions_by_afdo (node, &speculative_calls);
+	  if (!inlined)
+	    break;
 	  timevar_push (TV_INTEGRATION);
+	  if (speculative_calls)
+	    {
+	      cgraph_edge *next;
+	      for (cgraph_edge *e = node->callees; e; e = next)
+		{
+		  next = e->next_callee;
+		  cgraph_edge::redirect_call_stmt_to_callee (e);
+		}
+	    }
 	  todo |= optimize_inline_calls (current_function_decl);
 
 	  /* Technically we ought to recompute inline parameters so the new
@@ -3197,6 +3319,25 @@ early_inliner (function *fun)
 	}
       if (dump_file)
 	fprintf (dump_file, "Iterations: %i\n", iterations);
+    }
+
+  /* do AFDO inlining in case it was not done as part of early inlining.  */
+  if (optimize
+      && !flag_no_inline
+      && !flag_early_inlining
+      && flag_auto_profile_inlining)
+    {
+      bool speculative_calls = false;
+      inlined |= inline_functions_by_afdo (node, &speculative_calls);
+      if (speculative_calls)
+	{
+	  cgraph_edge *next;
+	  for (cgraph_edge *e = node->callees; e; e = next)
+	    {
+	      next = e->next_callee;
+	      cgraph_edge::redirect_call_stmt_to_callee (e);
+	    }
+	}
     }
 
   if (inlined)

@@ -55,7 +55,6 @@ along with GCC; see the file COPYING3.  If not see
 #include "opts-diagnostic.h"
 #include "opt-suggestions.h"
 #include "opts-jobserver.h"
-#include "make-unique.h"
 #include "lto-ltrans-cache.h"
 
 /* Environment variable, used for passing the names of offload targets from GCC
@@ -2275,13 +2274,13 @@ public:
   : gcc_diagnostic_option_manager (0 /* lang_mask */)
   {
   }
-  int option_enabled_p (diagnostic_option_id) const final override
+  int option_enabled_p (diagnostics::option_id) const final override
   {
     return true;
   }
-  char *make_option_name (diagnostic_option_id,
-			  diagnostic_t,
-			  diagnostic_t) const final override
+  char *make_option_name (diagnostics::option_id,
+			  enum diagnostics::kind,
+			  enum diagnostics::kind) const final override
   {
     return nullptr;
   }

@@ -41,7 +41,7 @@
 #include <bits/max_size_type.h>
 #include <bits/version.h>
 
-#if __glibcxx_ranges_to_container // C++ >= 23
+#if __glibcxx_containers_ranges // C++ >= 23
 # include <bits/utility.h> // for tuple_element_t
 #endif
 
@@ -81,16 +81,6 @@ namespace ranges
       __to_unsigned_like(_Tp __t) noexcept
       { return static_cast<make_unsigned_t<_Tp>>(__t); }
 
-#if defined __STRICT_ANSI__ && defined __SIZEOF_INT128__
-    constexpr unsigned __int128
-    __to_unsigned_like(__int128 __t) noexcept
-    { return __t; }
-
-    constexpr unsigned __int128
-    __to_unsigned_like(unsigned __int128 __t) noexcept
-    { return __t; }
-#endif
-
     template<typename _Tp>
       using __make_unsigned_like_t
 	= decltype(__detail::__to_unsigned_like(std::declval<_Tp>()));
@@ -119,9 +109,9 @@ namespace ranges
 	  if constexpr (is_array_v<remove_reference_t<_Tp>>)
 	    return true;
 	  else if constexpr (__member_begin<_Tp>)
-	    return noexcept(__decay_copy(std::declval<_Tp&>().begin()));
+	    return noexcept(_GLIBCXX_AUTO_CAST(std::declval<_Tp&>().begin()));
 	  else
-	    return noexcept(__decay_copy(begin(std::declval<_Tp&>())));
+	    return noexcept(_GLIBCXX_AUTO_CAST(begin(std::declval<_Tp&>())));
 	}
 
     public:
@@ -146,7 +136,7 @@ namespace ranges
     template<typename _Tp>
       concept __member_end = requires(_Tp& __t)
 	{
-	  { __decay_copy(__t.end()) } -> sentinel_for<__range_iter_t<_Tp>>;
+	  { _GLIBCXX_AUTO_CAST(__t.end()) } -> sentinel_for<__range_iter_t<_Tp>>;
 	};
 
     // Poison pill so that unqualified lookup doesn't find std::end.
@@ -156,7 +146,7 @@ namespace ranges
       concept __adl_end = __class_or_enum<remove_reference_t<_Tp>>
 	&& requires(_Tp& __t)
 	{
-	  { __decay_copy(end(__t)) } -> sentinel_for<__range_iter_t<_Tp>>;
+	  { _GLIBCXX_AUTO_CAST(end(__t)) } -> sentinel_for<__range_iter_t<_Tp>>;
 	};
 
     struct _End
@@ -169,9 +159,9 @@ namespace ranges
 	  if constexpr (is_bounded_array_v<remove_reference_t<_Tp>>)
 	    return true;
 	  else if constexpr (__member_end<_Tp>)
-	    return noexcept(__decay_copy(std::declval<_Tp&>().end()));
+	    return noexcept(_GLIBCXX_AUTO_CAST(std::declval<_Tp&>().end()));
 	  else
-	    return noexcept(__decay_copy(end(std::declval<_Tp&>())));
+	    return noexcept(_GLIBCXX_AUTO_CAST(end(std::declval<_Tp&>())));
 	}
 
     public:
@@ -196,7 +186,7 @@ namespace ranges
     template<typename _Tp>
       concept __member_rbegin = requires(_Tp& __t)
 	{
-	  { __decay_copy(__t.rbegin()) } -> input_or_output_iterator;
+	  { _GLIBCXX_AUTO_CAST(__t.rbegin()) } -> input_or_output_iterator;
 	};
 
     void rbegin() = delete;
@@ -205,7 +195,7 @@ namespace ranges
       concept __adl_rbegin = __class_or_enum<remove_reference_t<_Tp>>
 	&& requires(_Tp& __t)
 	{
-	  { __decay_copy(rbegin(__t)) } -> input_or_output_iterator;
+	  { _GLIBCXX_AUTO_CAST(rbegin(__t)) } -> input_or_output_iterator;
 	};
 
     template<typename _Tp>
@@ -223,9 +213,9 @@ namespace ranges
 	_S_noexcept()
 	{
 	  if constexpr (__member_rbegin<_Tp>)
-	    return noexcept(__decay_copy(std::declval<_Tp&>().rbegin()));
+	    return noexcept(_GLIBCXX_AUTO_CAST(std::declval<_Tp&>().rbegin()));
 	  else if constexpr (__adl_rbegin<_Tp>)
-	    return noexcept(__decay_copy(rbegin(std::declval<_Tp&>())));
+	    return noexcept(_GLIBCXX_AUTO_CAST(rbegin(std::declval<_Tp&>())));
 	  else
 	    {
 	      if constexpr (noexcept(_End{}(std::declval<_Tp&>())))
@@ -258,7 +248,7 @@ namespace ranges
     template<typename _Tp>
       concept __member_rend = requires(_Tp& __t)
 	{
-	  { __decay_copy(__t.rend()) }
+	  { _GLIBCXX_AUTO_CAST(__t.rend()) }
 	    -> sentinel_for<decltype(_RBegin{}(std::forward<_Tp>(__t)))>;
 	};
 
@@ -268,7 +258,7 @@ namespace ranges
       concept __adl_rend = __class_or_enum<remove_reference_t<_Tp>>
 	&& requires(_Tp& __t)
 	{
-	  { __decay_copy(rend(__t)) }
+	  { _GLIBCXX_AUTO_CAST(rend(__t)) }
 	    -> sentinel_for<decltype(_RBegin{}(std::forward<_Tp>(__t)))>;
 	};
 
@@ -280,9 +270,9 @@ namespace ranges
 	_S_noexcept()
 	{
 	  if constexpr (__member_rend<_Tp>)
-	    return noexcept(__decay_copy(std::declval<_Tp&>().rend()));
+	    return noexcept(_GLIBCXX_AUTO_CAST(std::declval<_Tp&>().rend()));
 	  else if constexpr (__adl_rend<_Tp>)
-	    return noexcept(__decay_copy(rend(std::declval<_Tp&>())));
+	    return noexcept(_GLIBCXX_AUTO_CAST(rend(std::declval<_Tp&>())));
 	  else
 	    {
 	      if constexpr (noexcept(_Begin{}(std::declval<_Tp&>())))
@@ -316,7 +306,7 @@ namespace ranges
       concept __member_size = !disable_sized_range<remove_cvref_t<_Tp>>
 	&& requires(_Tp& __t)
 	{
-	  { __decay_copy(__t.size()) } -> __detail::__is_integer_like;
+	  { _GLIBCXX_AUTO_CAST(__t.size()) } -> __detail::__is_integer_like;
 	};
 
     void size() = delete;
@@ -326,7 +316,7 @@ namespace ranges
 	&& !disable_sized_range<remove_cvref_t<_Tp>>
 	&& requires(_Tp& __t)
 	{
-	  { __decay_copy(size(__t)) } -> __detail::__is_integer_like;
+	  { _GLIBCXX_AUTO_CAST(size(__t)) } -> __detail::__is_integer_like;
 	};
 
     template<typename _Tp>
@@ -351,9 +341,9 @@ namespace ranges
 	  if constexpr (is_bounded_array_v<remove_reference_t<_Tp>>)
 	    return true;
 	  else if constexpr (__member_size<_Tp>)
-	    return noexcept(__decay_copy(std::declval<_Tp&>().size()));
+	    return noexcept(_GLIBCXX_AUTO_CAST(std::declval<_Tp&>().size()));
 	  else if constexpr (__adl_size<_Tp>)
-	    return noexcept(__decay_copy(size(std::declval<_Tp&>())));
+	    return noexcept(_GLIBCXX_AUTO_CAST(size(std::declval<_Tp&>())));
 	  else if constexpr (__sentinel_size<_Tp>)
 	    return noexcept(_End{}(std::declval<_Tp&>())
 			    - _Begin{}(std::declval<_Tp&>()));
@@ -398,11 +388,6 @@ namespace ranges
 	      else
 		return static_cast<make_signed_t<__size_type>>(__size);
 	    }
-#if defined __STRICT_ANSI__ && defined __SIZEOF_INT128__
-	  // For strict-ansi modes integral<__int128> is false
-	  else if constexpr (__detail::__is_int128<__size_type>)
-	    return static_cast<__int128>(__size);
-#endif
 	  else // Must be one of __max_diff_type or __max_size_type.
 	    return __detail::__max_diff_type(__size);
 	}
@@ -463,7 +448,7 @@ namespace ranges
     template<typename _Tp>
       concept __member_data = requires(_Tp& __t)
 	{
-	  { __decay_copy(__t.data()) } -> __pointer_to_object;
+	  { _GLIBCXX_AUTO_CAST(__t.data()) } -> __pointer_to_object;
 	};
 
     template<typename _Tp>
@@ -477,7 +462,7 @@ namespace ranges
 	_S_noexcept()
 	{
 	  if constexpr (__member_data<_Tp>)
-	    return noexcept(__decay_copy(std::declval<_Tp&>().data()));
+	    return noexcept(_GLIBCXX_AUTO_CAST(std::declval<_Tp&>().data()));
 	  else
 	    return noexcept(_Begin{}(std::declval<_Tp&>()));
 	}
@@ -894,10 +879,17 @@ namespace ranges
       {
 	if constexpr (sized_sentinel_for<_Sent, _It>)
 	  {
-	    const auto __diff = __bound - __it;
+	    const iter_difference_t<_It> __diff = __bound - __it;
 
 	    if (__diff == 0)
-	      return __n;
+	      {
+		// inline any possible side effects of advance(it, bound)
+		if constexpr (assignable_from<_It&, _Sent>)
+		  __it = std::move(__bound);
+		else if constexpr (random_access_iterator<_It>)
+		  __it += 0;
+		return __n;
+	      }
 	    else if (__diff > 0 ? __n >= __diff : __n <= __diff)
 	      {
 		(*this)(__it, __bound);
@@ -912,9 +904,14 @@ namespace ranges
 		return 0;
 	      }
 	    else
-	      return 0;
+	      {
+		// inline any possible side effects of advance(it, n)
+		if constexpr (random_access_iterator<_It>)
+		  __it += 0;
+		return 0;
+	      }
 	  }
-	else if (__it == __bound || __n == 0)
+	else if (__n == 0 || __it == __bound)
 	  return __n;
 	else if (__n > 0)
 	  {
@@ -1085,7 +1082,9 @@ namespace ranges
 #if __glibcxx_ranges_to_container // C++ >= 23
   struct from_range_t { explicit from_range_t() = default; };
   inline constexpr from_range_t from_range{};
+#endif
 
+#if __glibcxx_containers_ranges // C++ >= 23
 /// @cond undocumented
   template<typename _T1, typename _T2>
     struct pair;
@@ -1101,11 +1100,11 @@ namespace __detail
   // 4223. Deduction guides for maps are mishandling tuples and references
   template<ranges::input_range _Range>
     using __range_key_type
-      = remove_const_t<tuple_element_t<0, ranges::range_value_t<_Range>>>;
+      = remove_cvref_t<tuple_element_t<0, ranges::range_value_t<_Range>>>;
 
   template<ranges::input_range _Range>
     using __range_mapped_type
-      = tuple_element_t<1, ranges::range_value_t<_Range>>;
+      = remove_cvref_t<tuple_element_t<1, ranges::range_value_t<_Range>>>;
 
   // The allocator's value_type for map-like containers.
   template<ranges::input_range _Range>

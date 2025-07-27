@@ -179,6 +179,141 @@ cgraph_node::function_version (void)
   return cgraph_fnver_htab->find (&key);
 }
 
+/* If profile is IPA, turn it into local one.  */
+void
+cgraph_node::make_profile_local ()
+{
+  if (!count.ipa ().initialized_p ())
+    return;
+  if (!(count == profile_count::zero ()))
+    count = count.guessed_local ();
+  for (cgraph_edge *e = callees; e; e = e->next_callee)
+    {
+      if (!e->inline_failed)
+	e->callee->make_profile_local ();
+      if (!(e->count == profile_count::zero ()))
+	e->count = e->count.guessed_local ();
+    }
+  for (cgraph_edge *e = indirect_calls; e; e = e->next_callee)
+    if (!(e->count == profile_count::zero ()))
+      e->count = e->count.guessed_local ();
+}
+
+/* Turn profile to global0.  Walk into inlined functions.
+   QUALITY must be GUESSED_GLOBAL0, GUESSED_GLOBAL0_ADJUSTED
+   or GUESSED_GLOBAL0_AFDO  */
+void
+cgraph_node::make_profile_global0 (profile_quality quality)
+{
+  if (count == profile_count::zero ())
+    ;
+  else if (quality == GUESSED_GLOBAL0)
+    {
+      if (count.quality () == GUESSED_GLOBAL0)
+	return;
+      count = count.global0 ();
+    }
+  else if (quality == GUESSED_GLOBAL0_ADJUSTED)
+    {
+      if (count.quality () == GUESSED_GLOBAL0
+	  || count.quality () == GUESSED_GLOBAL0_ADJUSTED)
+	return;
+      count = count.global0adjusted ();
+    }
+  else if (quality == GUESSED_GLOBAL0_AFDO)
+    {
+      if (count.quality () == GUESSED_GLOBAL0
+	  || count.quality () == GUESSED_GLOBAL0_ADJUSTED
+	  || count.quality () == GUESSED_GLOBAL0_AFDO)
+	return;
+      count = count.global0afdo ();
+    }
+  else
+    gcc_unreachable ();
+  for (cgraph_edge *e = callees; e; e = e->next_callee)
+    {
+      if (!e->inline_failed)
+	e->callee->make_profile_global0 (quality);
+      if (e->count == profile_count::zero ())
+	;
+      else if (quality == GUESSED_GLOBAL0)
+	e->count = e->count.global0 ();
+      else if (quality == GUESSED_GLOBAL0_ADJUSTED)
+	e->count = e->count.global0adjusted ();
+      else if (quality == GUESSED_GLOBAL0_AFDO)
+	e->count = e->count.global0afdo ();
+      else
+	gcc_unreachable ();
+    }
+  for (cgraph_edge *e = indirect_calls; e; e = e->next_callee)
+    if (e->count == profile_count::zero ())
+      ;
+    else if (quality == GUESSED_GLOBAL0)
+      e->count = e->count.global0 ();
+    else if (quality == GUESSED_GLOBAL0_ADJUSTED)
+      e->count = e->count.global0adjusted ();
+    else if (quality == GUESSED_GLOBAL0_AFDO)
+      e->count = e->count.global0afdo ();
+    else
+      gcc_unreachable ();
+}
+
+/* Scale profile by NUM/DEN.  Walk into inlined functions.  */
+
+void
+cgraph_node::apply_scale (profile_count num, profile_count den)
+{
+  if (num == den && !(num == profile_count::zero ()))
+    return;
+
+  for (cgraph_edge *e = callees; e; e = e->next_callee)
+    {
+      if (!e->inline_failed)
+	e->callee->apply_scale (num, den);
+      e->count = e->count.apply_scale (num, den);
+    }
+  for (cgraph_edge *e = indirect_calls; e; e = e->next_callee)
+    e->count = e->count.apply_scale (num, den);
+  count = count.apply_scale (num, den);
+}
+
+/* Scale profile to given IPA_COUNT.
+   IPA_COUNT should pass ipa_p () with a single exception.
+   It can be also GUESSED_LOCAL in case we want to
+   drop any IPA info about the profile.  */
+
+void
+cgraph_node::scale_profile_to (profile_count ipa_count)
+{
+  /* If we do not know the adjustment, it is better to keep profile
+     as it is.  */
+  if (!ipa_count.initialized_p ()
+      || ipa_count == count)
+    return;
+  /* ipa-cp converts value to guessed-local in case it believes
+     that we lost track of IPA profile.  */
+  if (ipa_count.quality () == GUESSED_LOCAL)
+    {
+      make_profile_local ();
+      return;
+    }
+  if (ipa_count == profile_count::zero ())
+    {
+      make_profile_global0 (GUESSED_GLOBAL0);
+      return;
+    }
+  if (ipa_count == profile_count::adjusted_zero ())
+    {
+      make_profile_global0 (GUESSED_GLOBAL0_ADJUSTED);
+      return;
+    }
+  gcc_assert (ipa_count.ipa () == ipa_count
+	      && !inlined_to);
+  profile_count num = count.combine_with_ipa_count (ipa_count);
+  profile_count den = count;
+  profile_count::adjust_for_ipa_scaling (&num, &den);
+}
+
 /* Insert a new cgraph_function_version_info node into cgraph_fnver_htab
    corresponding to cgraph_node NODE.  */
 cgraph_function_version_info *
@@ -231,45 +366,60 @@ cgraph_node::delete_function_version_by_decl (tree decl)
   decl_node->remove ();
 }
 
-/* Record that DECL1 and DECL2 are semantically identical function
+/* Add decl to the structure of semantically identical function versions.
+   The node is inserted at the point maintaining the priority ordering on the
    versions.  */
 void
-cgraph_node::record_function_versions (tree decl1, tree decl2)
+cgraph_node::add_function_version (cgraph_function_version_info *fn_v,
+				   tree decl)
 {
-  cgraph_node *decl1_node = cgraph_node::get_create (decl1);
-  cgraph_node *decl2_node = cgraph_node::get_create (decl2);
-  cgraph_function_version_info *decl1_v = NULL;
-  cgraph_function_version_info *decl2_v = NULL;
-  cgraph_function_version_info *before;
-  cgraph_function_version_info *after;
+  cgraph_node *decl_node = cgraph_node::get_create (decl);
+  cgraph_function_version_info *decl_v = NULL;
 
-  gcc_assert (decl1_node != NULL && decl2_node != NULL);
-  decl1_v = decl1_node->function_version ();
-  decl2_v = decl2_node->function_version ();
+  gcc_assert (decl_node != NULL);
 
-  if (decl1_v != NULL && decl2_v != NULL)
+  decl_v = decl_node->function_version ();
+
+  /* If the nodes are already linked, skip.  */
+  if (decl_v != NULL && (decl_v->next || decl_v->prev))
     return;
 
-  if (decl1_v == NULL)
-    decl1_v = decl1_node->insert_new_function_version ();
+  if (decl_v == NULL)
+    decl_v = decl_node->insert_new_function_version ();
 
-  if (decl2_v == NULL)
-    decl2_v = decl2_node->insert_new_function_version ();
+  gcc_assert (decl_v);
+  gcc_assert (fn_v);
 
-  /* Chain decl2_v and decl1_v.  All semantically identical versions
-     will be chained together.  */
+  /* Go to start of the FMV structure.  */
+  while (fn_v->prev)
+    fn_v = fn_v->prev;
 
-  before = decl1_v;
-  after = decl2_v;
+  cgraph_function_version_info *insert_point_before = NULL;
+  cgraph_function_version_info *insert_point_after = fn_v;
 
-  while (before->next != NULL)
-    before = before->next;
+  /* Find the insertion point for the new version to maintain ordering.
+     The default node must always go at the beginning.  */
+  if (!is_function_default_version (decl))
+    while (insert_point_after
+	   && (targetm.compare_version_priority
+		 (decl, insert_point_after->this_node->decl) > 0
+	       || is_function_default_version
+		    (insert_point_after->this_node->decl)
+	       || lookup_attribute
+		    ("target_clones",
+		     DECL_ATTRIBUTES (insert_point_after->this_node->decl))))
+      {
+	insert_point_before = insert_point_after;
+	insert_point_after = insert_point_after->next;
+      }
 
-  while (after->prev != NULL)
-    after= after->prev;
+  decl_v->prev = insert_point_before;
+  decl_v->next= insert_point_after;
 
-  before->next = after;
-  after->prev = before;
+  if (insert_point_before)
+    insert_point_before->next = decl_v;
+  if (insert_point_after)
+    insert_point_after->prev = decl_v;
 }
 
 /* Initialize callgraph dump file.  */
@@ -1640,6 +1790,19 @@ cgraph_update_edges_for_call_stmt_node (cgraph_node *node,
 
       if (e)
 	{
+	  /* If call was devirtualized during cloning, mark edge
+	     as resolved.  */
+	  if (e->speculative)
+	    {
+	      if (new_stmt && is_gimple_call (new_stmt))
+		{
+		  tree decl = gimple_call_fndecl (new_stmt);
+		  if (decl)
+		    e = cgraph_edge::resolve_speculation (e, decl);
+		}
+	      else
+		e = cgraph_edge::resolve_speculation (e, NULL);
+	    }
 	  /* Keep calls marked as dead dead.  */
 	  if (new_stmt && is_gimple_call (new_stmt) && e->callee
 	      && fndecl_built_in_p (e->callee->decl, BUILT_IN_UNREACHABLE,
@@ -1879,7 +2042,7 @@ cgraph_node::remove (void)
   clone_info *info, saved_info;
   if (symtab->ipa_clones_dump_file && symtab->cloned_nodes.contains (this))
     fprintf (symtab->ipa_clones_dump_file,
-	     "Callgraph removal;%s;%d;%s;%d;%d\n", asm_name (), order,
+	     "Callgraph removal;%s;%d;%s;%d;%d\n", asm_name (), get_uid (),
 	     DECL_SOURCE_FILE (decl), DECL_SOURCE_LINE (decl),
 	     DECL_SOURCE_COLUMN (decl));
 
@@ -2984,13 +3147,22 @@ cgraph_edge::cannot_lead_to_return_p (void)
     return callee->cannot_return_p ();
 }
 
-/* Return true if the edge may be considered hot.  */
+/* Return true if the edge after scaling it profile by SCALE
+   may be considered hot.  */
 
 bool
-cgraph_edge::maybe_hot_p (void)
+cgraph_edge::maybe_hot_p (sreal scale)
 {
-  if (!maybe_hot_count_p (NULL, count.ipa ()))
+  /* Never consider calls in functions optimized for size hot.  */
+  if (opt_for_fn (caller->decl, optimize_size))
     return false;
+
+  /* If reliable IPA count is available, just use it.  */
+  profile_count c = count.ipa ();
+  if (c.reliable_p ())
+    return maybe_hot_count_p (NULL, c * scale);
+
+  /* See if we can determine hotness using caller frequency.  */
   if (caller->frequency == NODE_FREQUENCY_UNLIKELY_EXECUTED
       || (callee
 	  && callee->frequency == NODE_FREQUENCY_UNLIKELY_EXECUTED))
@@ -2999,23 +3171,47 @@ cgraph_edge::maybe_hot_p (void)
       && (callee
 	  && callee->frequency <= NODE_FREQUENCY_EXECUTED_ONCE))
     return false;
-  if (opt_for_fn (caller->decl, optimize_size))
-    return false;
+  /* ??? This may make sense for hot functions determined by
+     user attribute, but if function is hot by profile, it may
+     contains non-hot calls.  In most practical cases this case
+     is handled by the reliable ipa count above, but i.e. after
+     inlining function with no profile to function with profile
+     we get here.. */
   if (caller->frequency == NODE_FREQUENCY_HOT)
     return true;
+
+  /* Use IPA count and if it s not available appy local heuristics.  */
+  if (c.initialized_p ())
+    {
+      /* A special case; AFDO zero means that function may quite possibly
+	 be executed few times per execution.  If scale is large, we still
+	 want to consider the call hot.  */
+      if (c.quality () == AFDO)
+	c = c.force_nonzero ();
+      return maybe_hot_count_p (NULL, c * scale);
+    }
   if (!count.initialized_p ())
     return true;
   cgraph_node *where = caller->inlined_to ? caller->inlined_to : caller;
   if (!where->count.initialized_p ())
-    return false;
+    return true;
+  c = count * scale;
   if (caller->frequency == NODE_FREQUENCY_EXECUTED_ONCE)
     {
-      if (count * 2 < where->count * 3)
+      if (c * 2 < where->count * 3)
 	return false;
     }
-  else if (count * param_hot_bb_frequency_fraction < where->count)
+  else if (c * param_hot_bb_frequency_fraction < where->count)
     return false;
   return true;
+}
+
+/* Return true if the edge may be considered hot.  */
+
+bool
+cgraph_edge::maybe_hot_p ()
+{
+  return maybe_hot_p (1);
 }
 
 /* Worker for cgraph_can_remove_if_no_direct_calls_p.  */
@@ -3589,6 +3785,13 @@ cgraph_node::verify_node (void)
       if (!e->count.compatible_p (count))
 	{
 	  error ("edge count is not compatible with function count");
+	  e->count.debug ();
+	  count.debug ();
+	  error_found = true;
+	}
+      if (inlined_to && !e->count.compatible_p (inlined_to->count))
+	{
+	  error ("edge count is not compatible with inlined to function count");
 	  e->count.debug ();
 	  count.debug ();
 	  error_found = true;

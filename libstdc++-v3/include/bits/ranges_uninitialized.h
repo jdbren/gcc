@@ -263,26 +263,6 @@ namespace ranges
   inline constexpr __uninitialized_value_construct_n_fn
     uninitialized_value_construct_n;
 
-  namespace __detail
-  {
-    // This is only intended for finding smaller iterator differences below,
-    // not as a general purpose replacement for std::min.
-    struct __mindist_fn
-    {
-      template<typename _Dp1, typename _Dp2>
-	constexpr common_type_t<_Dp1, _Dp2>
-	operator()(_Dp1 __d1, _Dp2 __d2) const noexcept
-	{
-	  // Every C++20 iterator I satisfies weakly_incrementable<I> which
-	  // requires signed-integer-like<iter_difference_t<I>>.
-	  static_assert(std::__detail::__is_signed_integer_like<_Dp1>);
-	  static_assert(std::__detail::__is_signed_integer_like<_Dp2>);
-	  return std::min<common_type_t<_Dp1, _Dp2>>(__d1, __d2);
-	}
-    };
-    inline constexpr __mindist_fn __mindist{};
-  }
-
   template<typename _Iter, typename _Out>
     using uninitialized_copy_result = in_out_result<_Iter, _Out>;
 
@@ -305,10 +285,10 @@ namespace ranges
 		      && is_trivially_assignable_v<_OutType&,
 						 iter_reference_t<_Iter>>)
 	  {
-	    auto __d1 = __ilast - __ifirst;
-	    auto __d2 = __olast - __ofirst;
-	    return ranges::copy_n(std::move(__ifirst),
-				  __detail::__mindist(__d1, __d2), __ofirst);
+	    auto __d = __ilast - __ifirst;
+	    if (auto __d2 = __olast - __ofirst; __d2 < __d)
+	      __d = static_cast<iter_difference_t<_Iter>>(__d2);
+	    return ranges::copy_n(std::move(__ifirst), __d, __ofirst);
 	  }
 	else
 	  {
@@ -356,9 +336,9 @@ namespace ranges
 		      && is_trivially_assignable_v<_OutType&,
 						 iter_reference_t<_Iter>>)
 	  {
-	    auto __d = __olast - __ofirst;
-	    return ranges::copy_n(std::move(__ifirst),
-				  __detail::__mindist(__n, __d), __ofirst);
+	    if (auto __d = __olast - __ofirst; __d < __n)
+	      __n = static_cast<iter_difference_t<_Iter>>(__d);
+	    return ranges::copy_n(std::move(__ifirst), __n, __ofirst);
 	  }
 	else
 	  {
@@ -397,11 +377,12 @@ namespace ranges
 		      && is_trivially_assignable_v<_OutType&,
 						 iter_rvalue_reference_t<_Iter>>)
 	  {
-	    auto __d1 = __ilast - __ifirst;
-	    auto __d2 = __olast - __ofirst;
+	    auto __d = __ilast - __ifirst;
+	    if (auto __d2 = __olast - __ofirst; __d2 < __d)
+	      __d = static_cast<iter_difference_t<_Iter>>(__d2);
 	    auto [__in, __out]
 	      = ranges::copy_n(std::make_move_iterator(std::move(__ifirst)),
-			       __detail::__mindist(__d1, __d2), __ofirst);
+			       __d, __ofirst);
 	    return {std::move(__in).base(), __out};
 	  }
 	else
@@ -452,10 +433,11 @@ namespace ranges
 		      && is_trivially_assignable_v<_OutType&,
 						 iter_rvalue_reference_t<_Iter>>)
 	  {
-	    auto __d = __olast - __ofirst;
+	    if (auto __d = __olast - __ofirst; __d < __n)
+	      __n = static_cast<iter_difference_t<_Iter>>(__d);
 	    auto [__in, __out]
 	      = ranges::copy_n(std::make_move_iterator(std::move(__ifirst)),
-			       __detail::__mindist(__n, __d), __ofirst);
+			       __n, __ofirst);
 	    return {std::move(__in).base(), __out};
 	  }
 	else
@@ -574,13 +556,12 @@ namespace ranges
     __destroy_fn::operator()(_Iter __first, _Sent __last) const noexcept
     {
       if constexpr (is_trivially_destructible_v<iter_value_t<_Iter>>)
-	return ranges::next(std::move(__first), __last);
-      else
-	{
-	  for (; __first != __last; ++__first)
-	    ranges::destroy_at(std::__addressof(*__first));
-	  return __first;
-	}
+	if (!is_constant_evaluated())
+	  return ranges::next(std::move(__first), __last);
+
+      for (; __first != __last; ++__first)
+	ranges::destroy_at(std::__addressof(*__first));
+      return __first;
     }
 
   template<__detail::__nothrow_input_range _Range>
@@ -599,13 +580,12 @@ namespace ranges
       operator()(_Iter __first, iter_difference_t<_Iter> __n) const noexcept
       {
 	if constexpr (is_trivially_destructible_v<iter_value_t<_Iter>>)
-	  return ranges::next(std::move(__first), __n);
-	else
-	  {
-	    for (; __n > 0; ++__first, (void)--__n)
-	      ranges::destroy_at(std::__addressof(*__first));
-	    return __first;
-	  }
+	  if (!is_constant_evaluated())
+	    return ranges::next(std::move(__first), __n);
+
+	for (; __n > 0; ++__first, (void)--__n)
+	  ranges::destroy_at(std::__addressof(*__first));
+	return __first;
       }
   };
 

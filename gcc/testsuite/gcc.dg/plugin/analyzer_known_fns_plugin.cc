@@ -2,6 +2,7 @@
 /* { dg-options "-g" } */
 
 #define INCLUDE_MEMORY
+#define INCLUDE_STRING
 #define INCLUDE_VECTOR
 #include "gcc-plugin.h"
 #include "config.h"
@@ -22,14 +23,14 @@
 #include "target.h"
 #include "fold-const.h"
 #include "tree-pretty-print.h"
-#include "diagnostic-color.h"
-#include "diagnostic-metadata.h"
+#include "diagnostics/color.h"
+#include "diagnostics/metadata.h"
 #include "tristate.h"
 #include "bitmap.h"
 #include "selftest.h"
 #include "function.h"
 #include "json.h"
-#include "analyzer/analyzer.h"
+#include "analyzer/common.h"
 #include "analyzer/analyzer-logging.h"
 #include "ordered-hash-map.h"
 #include "options.h"
@@ -44,7 +45,6 @@
 #include "analyzer/region-model.h"
 #include "analyzer/call-details.h"
 #include "analyzer/call-info.h"
-#include "make-unique.h"
 
 int plugin_is_GPL_compatible;
 
@@ -168,7 +168,7 @@ public:
     if (cd.get_ctxt ())
       {
 	/* Bifurcate state, creating a "failure" out-edge.  */
-	cd.get_ctxt ()->bifurcate (make_unique<copy_failure> (cd));
+	cd.get_ctxt ()->bifurcate (std::make_unique<copy_failure> (cd));
 
 	/* The "unbifurcated" state is the "success" case.  */
 	copy_success success (cd,
@@ -189,11 +189,12 @@ known_fn_analyzer_init_cb (void *gcc_data, void */*user_data*/)
   LOG_SCOPE (iface->get_logger ());
   if (0)
     inform (input_location, "got here: known_fn_analyzer_init_cb");
-  iface->register_known_function ("returns_42",
-				  make_unique<known_function_returns_42> ());
+  iface->register_known_function
+    ("returns_42",
+     std::make_unique<known_function_returns_42> ());
   iface->register_known_function
     ("attempt_to_copy",
-     make_unique<known_function_attempt_to_copy> ());
+     std::make_unique<known_function_attempt_to_copy> ());
 }
 
 } // namespace ana

@@ -902,9 +902,7 @@ dump_omp_clause (pretty_printer *pp, tree clause, int spc, dump_flags_t flags)
       pp_string (pp, "affinity(");
       {
 	tree t = OMP_CLAUSE_DECL (clause);
-	if (TREE_CODE (t) == TREE_LIST
-	    && TREE_PURPOSE (t)
-	    && TREE_CODE (TREE_PURPOSE (t)) == TREE_VEC)
+	if (OMP_ITERATOR_DECL_P (t))
 	  {
 	    dump_omp_iterators (pp, TREE_PURPOSE (t), spc, flags);
 	    pp_colon (pp);
@@ -944,9 +942,7 @@ dump_omp_clause (pretty_printer *pp, tree clause, int spc, dump_flags_t flags)
 	}
       {
 	tree t = OMP_CLAUSE_DECL (clause);
-	if (TREE_CODE (t) == TREE_LIST
-	    && TREE_PURPOSE (t)
-	    && TREE_CODE (TREE_PURPOSE (t)) == TREE_VEC)
+	if (OMP_ITERATOR_DECL_P (t))
 	  {
 	    dump_omp_iterators (pp, TREE_PURPOSE (t), spc, flags);
 	    pp_colon (pp);
@@ -1122,6 +1118,15 @@ dump_omp_clause (pretty_printer *pp, tree clause, int spc, dump_flags_t flags)
 	case GOMP_MAP_ALWAYS_PRESENT_TOFROM:
 	  pp_string (pp, "always,present,tofrom");
 	  break;
+	case GOMP_MAP_UNSET:
+	  pp_string (pp, "unset");
+	  break;
+	case GOMP_MAP_PUSH_MAPPER_NAME:
+	  pp_string (pp, "push_mapper");
+	  break;
+	case GOMP_MAP_POP_MAPPER_NAME:
+	  pp_string (pp, "pop_mapper");
+	  break;
 	default:
 	  gcc_unreachable ();
 	}
@@ -1199,6 +1204,23 @@ dump_omp_clause (pretty_printer *pp, tree clause, int spc, dump_flags_t flags)
       dump_generic_node (pp, OMP_CLAUSE_DECL (clause),
 			 spc, flags, false);
       goto print_clause_size;
+
+    case OMP_CLAUSE__MAPPER_BINDING_:
+      pp_string (pp, "mapper_binding(");
+      if (OMP_CLAUSE__MAPPER_BINDING__ID (clause))
+	{
+	  dump_generic_node (pp, OMP_CLAUSE__MAPPER_BINDING__ID (clause), spc,
+			     flags, false);
+	  pp_comma (pp);
+	}
+      dump_generic_node (pp,
+			 TREE_TYPE (OMP_CLAUSE__MAPPER_BINDING__DECL (clause)),
+			 spc, flags, false);
+      pp_comma (pp);
+      dump_generic_node (pp, OMP_CLAUSE__MAPPER_BINDING__MAPPER (clause), spc,
+			 flags, false);
+      pp_right_paren (pp);
+      break;
 
     case OMP_CLAUSE_NUM_TEAMS:
       pp_string (pp, "num_teams(");
@@ -3201,6 +3223,8 @@ dump_generic_node (pretty_printer *pp, tree node, int spc, dump_flags_t flags,
 	pp_string (pp, " [return slot optimization]");
       if (CALL_EXPR_TAILCALL (node))
 	pp_string (pp, " [tail call]");
+      if (CALL_EXPR_MUST_TAIL_CALL (node))
+	pp_string (pp, " [must tail call]");
       break;
 
     case WITH_CLEANUP_EXPR:
@@ -4261,6 +4285,21 @@ dump_generic_node (pretty_printer *pp, tree node, int spc, dump_flags_t flags,
       pp_string (pp, ")>");
       break;
 
+    case OMP_DECLARE_MAPPER:
+      pp_string (pp, "#pragma omp declare mapper (");
+      if (OMP_DECLARE_MAPPER_ID (node))
+	{
+	  dump_generic_node (pp, OMP_DECLARE_MAPPER_ID (node), spc, flags,
+			     false);
+	  pp_colon (pp);
+	}
+      dump_generic_node (pp, TREE_TYPE (node), spc, flags, false);
+      pp_space (pp);
+      dump_generic_node (pp, OMP_DECLARE_MAPPER_DECL (node), spc, flags, false);
+      pp_right_paren (pp);
+      dump_omp_clauses (pp, OMP_DECLARE_MAPPER_CLAUSES (node), spc, flags);
+      break;
+
     case TRANSACTION_EXPR:
       if (TRANSACTION_EXPR_OUTER (node))
 	pp_string (pp, "__transaction_atomic [[outer]]");
@@ -4793,10 +4832,10 @@ op_symbol_code (enum tree_code code, dump_flags_t flags)
       return ">>";
 
     case LROTATE_EXPR:
-      return "r<<";
+      return (flags & TDF_GIMPLE) ? "__ROTATE_LEFT" : "r<<";
 
     case RROTATE_EXPR:
-      return "r>>";
+      return (flags & TDF_GIMPLE) ? "__ROTATE_RIGHT" : "r>>";
 
     case WIDEN_LSHIFT_EXPR:
       return "w<<";

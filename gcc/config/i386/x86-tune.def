@@ -31,7 +31,7 @@ see the files COPYING3 and COPYING.RUNTIME respectively.  If not, see
 	- Updating ix86_issue_rate and ix86_adjust_cost in i386.md
 	- possibly updating ia32_multipass_dfa_lookahead, ix86_sched_reorder
 	  and ix86_sched_init_global if those tricks are needed.
-    - Tunning the flags bellow. Those are split into sections and each
+    - tuning flags below; those are split into sections and each
       section is very roughly ordered by importance.  */
 
 /*****************************************************************************/
@@ -87,9 +87,7 @@ DEF_TUNE (X86_TUNE_SSE_PARTIAL_REG_CONVERTS_DEPENDENCY,
    several insns to break false dependency on the dest register for GLC
    micro-architecture.  */
 DEF_TUNE (X86_TUNE_DEST_FALSE_DEP_FOR_GLC,
-	  "dest_false_dep_for_glc", m_SAPPHIRERAPIDS | m_GRANITERAPIDS
-	  | m_GRANITERAPIDS_D | m_DIAMONDRAPIDS | m_CORE_HYBRID
-	  | m_CORE_ATOM)
+	  "dest_false_dep_for_glc", m_SAPPHIRERAPIDS | m_ALDERLAKE)
 
 /* X86_TUNE_SSE_SPLIT_REGS: Set for machines where the type and dependencies
    are resolved on SSE register parts instead of whole registers, so we may
@@ -574,6 +572,11 @@ DEF_TUNE (X86_TUNE_V2DF_REDUCTION_PREFER_HADDPD,
 DEF_TUNE (X86_TUNE_SSE_MOVCC_USE_BLENDV,
 	  "sse_movcc_use_blendv", ~m_CORE_ATOM)
 
+/* X86_TUNE_V4SI_REDUCTION_PREFER_SHUFD: Prefer pshuf to reduce V16QI,
+   V8HI, V8HI, V4SI, V4FI, V2DI modes when lshr are costlier. */
+DEF_TUNE (X86_TUNE_SSE_REDUCTION_PREFER_PSHUF,
+   "sse_reduction_prefer_pshuf", m_ZNVER4 | m_ZNVER5)
+
 /*****************************************************************************/
 /* AVX instruction selection tuning (some of SSE flags affects AVX, too)     */
 /*****************************************************************************/
@@ -634,6 +637,11 @@ DEF_TUNE (X86_TUNE_AVX512_STORE_BY_PIECES, "avx512_store_by_pieces",
 /* X86_TUNE_AVX512_TWO_EPILOGUES: Use two vector epilogues for 512-bit
    vectorized loops.  */
 DEF_TUNE (X86_TUNE_AVX512_TWO_EPILOGUES, "avx512_two_epilogues",
+	  m_ZNVER4 | m_ZNVER5)
+
+/* X86_TUNE_AVX512_MAKED_EPILOGUES: Use two masked vector epilogues
+   when fit.  */
+DEF_TUNE (X86_TUNE_AVX512_MASKED_EPILOGUES, "avx512_masked_epilogues",
 	  m_ZNVER4 | m_ZNVER5)
 
 /*****************************************************************************/

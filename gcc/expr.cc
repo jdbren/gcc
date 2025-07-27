@@ -471,8 +471,7 @@ convert_mode_scalar (rtx to, rtx from, int unsignedp)
 			    emit_move_insn (to, tof);
 			}
 		    }
-		  insns = get_insns ();
-		  end_sequence ();
+		  insns = end_sequence ();
 		  if (tof)
 		    {
 		      emit_insn (insns);
@@ -542,8 +541,7 @@ convert_mode_scalar (rtx to, rtx from, int unsignedp)
 		    emit_move_insn (to, tof);
 		}
 	      while (0);
-	      insns = get_insns ();
-	      end_sequence ();
+	      insns = end_sequence ();
 	      if (tof)
 		{
 		  emit_insn (insns);
@@ -562,8 +560,7 @@ convert_mode_scalar (rtx to, rtx from, int unsignedp)
       start_sequence ();
       value = emit_library_call_value (libcall, NULL_RTX, LCT_CONST, to_mode,
 				       from, from_mode);
-      insns = get_insns ();
-      end_sequence ();
+      insns = end_sequence ();
       emit_libcall_block (insns, to, value,
 			  tab == trunc_optab ? gen_rtx_FLOAT_TRUNCATE (to_mode,
 								       from)
@@ -736,8 +733,7 @@ convert_mode_scalar (rtx to, rtx from, int unsignedp)
 	    emit_move_insn (subword, fill_value);
 	}
 
-      insns = get_insns ();
-      end_sequence ();
+      insns = end_sequence ();
 
       emit_insn (insns);
       return;
@@ -4547,8 +4543,7 @@ emit_move_multi_word (machine_mode mode, rtx x, rtx y)
       last_insn = emit_move_insn (xpart, ypart);
     }
 
-  seq = get_insns ();
-  end_sequence ();
+  seq = end_sequence ();
 
   /* Show the output dies here.  This is necessary for SUBREGs
      of pseudos since we cannot track their lifetimes correctly;
@@ -4765,13 +4760,9 @@ emit_move_insn (rtx x, rtx y)
 rtx_insn *
 gen_move_insn (rtx x, rtx y)
 {
-  rtx_insn *seq;
-
   start_sequence ();
   emit_move_insn_1 (x, y);
-  seq = get_insns ();
-  end_sequence ();
-  return seq;
+  return end_sequence ();
 }
 
 /* If Y is representable exactly in a narrower mode, and the target can
@@ -7193,9 +7184,9 @@ categorize_ctor_elements_1 (const_tree ctor, HOST_WIDE_INT *p_nz_elts,
 
 	case VECTOR_CST:
 	  {
-	    /* We can only construct constant-length vectors using
-	       CONSTRUCTOR.  */
-	    unsigned int nunits = VECTOR_CST_NELTS (value).to_constant ();
+	    unsigned int nunits
+	      = constant_lower_bound
+	      (TYPE_VECTOR_SUBPARTS (TREE_TYPE (value)));
 	    for (unsigned int i = 0; i < nunits; ++i)
 	      {
 		tree v = VECTOR_CST_ELT (value, i);
@@ -7640,8 +7631,8 @@ store_constructor (tree exp, rtx target, int cleared, poly_int64 size,
 	tree domain;
 	tree elttype = TREE_TYPE (type);
 	bool const_bounds_p;
-	HOST_WIDE_INT minelt = 0;
-	HOST_WIDE_INT maxelt = 0;
+	unsigned HOST_WIDE_INT minelt = 0;
+	unsigned HOST_WIDE_INT maxelt = 0;
 
 	/* The storage order is specified for every aggregate type.  */
 	reverse = TYPE_REVERSE_STORAGE_ORDER (type);
@@ -7649,14 +7640,14 @@ store_constructor (tree exp, rtx target, int cleared, poly_int64 size,
 	domain = TYPE_DOMAIN (type);
 	const_bounds_p = (TYPE_MIN_VALUE (domain)
 			  && TYPE_MAX_VALUE (domain)
-			  && tree_fits_shwi_p (TYPE_MIN_VALUE (domain))
-			  && tree_fits_shwi_p (TYPE_MAX_VALUE (domain)));
+			  && tree_fits_uhwi_p (TYPE_MIN_VALUE (domain))
+			  && tree_fits_uhwi_p (TYPE_MAX_VALUE (domain)));
 
 	/* If we have constant bounds for the range of the type, get them.  */
 	if (const_bounds_p)
 	  {
-	    minelt = tree_to_shwi (TYPE_MIN_VALUE (domain));
-	    maxelt = tree_to_shwi (TYPE_MAX_VALUE (domain));
+	    minelt = tree_to_uhwi (TYPE_MIN_VALUE (domain));
+	    maxelt = tree_to_uhwi (TYPE_MAX_VALUE (domain));
 	  }
 
 	/* If the constructor has fewer elements than the array, clear
@@ -7669,7 +7660,7 @@ store_constructor (tree exp, rtx target, int cleared, poly_int64 size,
 	else
 	  {
 	    unsigned HOST_WIDE_INT idx;
-	    HOST_WIDE_INT count = 0, zero_count = 0;
+	    unsigned HOST_WIDE_INT count = 0, zero_count = 0;
 	    need_to_clear = ! const_bounds_p;
 
 	    /* This loop is a more accurate version of the loop in
@@ -7677,7 +7668,7 @@ store_constructor (tree exp, rtx target, int cleared, poly_int64 size,
 	       is also needed to check for missing elements.  */
 	    FOR_EACH_CONSTRUCTOR_ELT (CONSTRUCTOR_ELTS (exp), idx, index, value)
 	      {
-		HOST_WIDE_INT this_node_count;
+		unsigned HOST_WIDE_INT this_node_count;
 
 		if (need_to_clear)
 		  break;
@@ -7751,16 +7742,16 @@ store_constructor (tree exp, rtx target, int cleared, poly_int64 size,
 	      {
 		tree lo_index = TREE_OPERAND (index, 0);
 		tree hi_index = TREE_OPERAND (index, 1);
-		rtx index_r, pos_rtx;
-		HOST_WIDE_INT lo, hi, count;
-		tree position;
+		rtx index_r;
+		unsigned HOST_WIDE_INT lo, hi, count;
+		tree offset;
 
 		/* If the range is constant and "small", unroll the loop.  */
 		if (const_bounds_p
-		    && tree_fits_shwi_p (lo_index)
-		    && tree_fits_shwi_p (hi_index)
-		    && (lo = tree_to_shwi (lo_index),
-			hi = tree_to_shwi (hi_index),
+		    && tree_fits_uhwi_p (lo_index)
+		    && tree_fits_uhwi_p (hi_index)
+		    && (lo = tree_to_uhwi (lo_index),
+			hi = tree_to_uhwi (hi_index),
 			count = hi - lo + 1,
 			(!MEM_P (target)
 			 || count <= 2
@@ -7771,7 +7762,7 @@ store_constructor (tree exp, rtx target, int cleared, poly_int64 size,
 		    lo -= minelt;  hi -= minelt;
 		    for (; lo <= hi; lo++)
 		      {
-			bitpos = lo * tree_to_shwi (TYPE_SIZE (elttype));
+			bitpos = lo * tree_to_uhwi (TYPE_SIZE (elttype));
 
 			if (MEM_P (target)
 			    && !MEM_KEEP_ALIAS_SET_P (target)
@@ -7807,21 +7798,18 @@ store_constructor (tree exp, rtx target, int cleared, poly_int64 size,
 		    emit_label (loop_start);
 
 		    /* Assign value to element index.  */
-		    position =
-		      fold_convert (ssizetype,
-				    fold_build2 (MINUS_EXPR,
-						 TREE_TYPE (index),
-						 index,
-						 TYPE_MIN_VALUE (domain)));
+		    offset = fold_build2 (MINUS_EXPR,
+					  TREE_TYPE (index),
+					  index,
+					  TYPE_MIN_VALUE (domain));
 
-		    position =
-			size_binop (MULT_EXPR, position,
-				    fold_convert (ssizetype,
-						  TYPE_SIZE_UNIT (elttype)));
+		    offset = size_binop (MULT_EXPR,
+					 fold_convert (sizetype, offset),
+					 TYPE_SIZE_UNIT (elttype));
 
-		    pos_rtx = expand_normal (position);
-		    xtarget = offset_address (target, pos_rtx,
-					      highest_pow2_factor (position));
+		    xtarget = offset_address (target,
+					      expand_normal (offset),
+					      highest_pow2_factor (offset));
 		    xtarget = adjust_address (xtarget, mode, 0);
 		    if (TREE_CODE (value) == CONSTRUCTOR)
 		      store_constructor (value, xtarget, cleared,
@@ -7849,35 +7837,32 @@ store_constructor (tree exp, rtx target, int cleared, poly_int64 size,
 		    emit_label (loop_end);
 		  }
 	      }
-	    else if ((index != 0 && ! tree_fits_shwi_p (index))
-		     || ! tree_fits_uhwi_p (TYPE_SIZE (elttype)))
+	    else if ((index && !tree_fits_uhwi_p (index))
+		     || !tree_fits_uhwi_p (TYPE_SIZE (elttype)))
 	      {
-		tree position;
+		tree offset;
 
-		if (index == 0)
-		  index = ssize_int (1);
+		if (index)
+		  offset = fold_build2 (MINUS_EXPR,
+					TREE_TYPE (index),
+					index,
+					TYPE_MIN_VALUE (domain));
+		else
+		  offset = size_int (i);
 
-		if (minelt)
-		  index = fold_convert (ssizetype,
-					fold_build2 (MINUS_EXPR,
-						     TREE_TYPE (index),
-						     index,
-						     TYPE_MIN_VALUE (domain)));
-
-		position =
-		  size_binop (MULT_EXPR, index,
-			      fold_convert (ssizetype,
-					    TYPE_SIZE_UNIT (elttype)));
+		offset = size_binop (MULT_EXPR,
+				     fold_convert (sizetype, offset),
+				     TYPE_SIZE_UNIT (elttype));
 		xtarget = offset_address (target,
-					  expand_normal (position),
-					  highest_pow2_factor (position));
+					  expand_normal (offset),
+					  highest_pow2_factor (offset));
 		xtarget = adjust_address (xtarget, mode, 0);
 		store_expr (value, xtarget, 0, false, reverse);
 	      }
 	    else
 	      {
-		if (index != 0)
-		  bitpos = ((tree_to_shwi (index) - minelt)
+		if (index)
+		  bitpos = ((tree_to_uhwi (index) - minelt)
 			    * tree_to_uhwi (TYPE_SIZE (elttype)));
 		else
 		  bitpos = (i * tree_to_uhwi (TYPE_SIZE (elttype)));
@@ -7920,11 +7905,16 @@ store_constructor (tree exp, rtx target, int cleared, poly_int64 size,
 	gcc_assert (eltmode != BLKmode);
 
 	/* Try using vec_duplicate_optab for uniform vectors.  */
+	icode = optab_handler (vec_duplicate_optab, mode);
 	if (!TREE_SIDE_EFFECTS (exp)
 	    && VECTOR_MODE_P (mode)
-	    && eltmode == GET_MODE_INNER (mode)
-	    && ((icode = optab_handler (vec_duplicate_optab, mode))
-		!= CODE_FOR_nothing)
+	    && icode != CODE_FOR_nothing
+	    /* If the vec_duplicate target pattern does not specify an element
+	       mode check that eltmode is the normal inner mode of the
+	       requested vector mode.  But if the target allows eltmode
+	       explicitly go ahead and use it.  */
+	    && (eltmode == GET_MODE_INNER (mode)
+		|| insn_data[icode].operand[1].mode == eltmode)
 	    && (elt = uniform_vector_p (exp))
 	    && !VECTOR_TYPE_P (TREE_TYPE (elt)))
 	  {
@@ -9634,8 +9624,7 @@ expand_cond_expr_using_cmove (tree treeop0 ATTRIBUTE_UNUSED,
      and return.  */
   if (insn)
     {
-      rtx_insn *seq = get_insns ();
-      end_sequence ();
+      rtx_insn *seq = end_sequence ();
       emit_insn (seq);
       return convert_modes (orig_mode, mode, temp, 0);
     }
@@ -9692,8 +9681,8 @@ expand_expr_divmod (tree_code code, machine_mode mode, tree treeop0,
 		|| code == CEIL_MOD_EXPR || code == ROUND_MOD_EXPR);
   if (SCALAR_INT_MODE_P (mode)
       && optimize >= 2
-      && get_range_pos_neg (treeop0) == 1
-      && get_range_pos_neg (treeop1) == 1)
+      && get_range_pos_neg (treeop0, currently_expanding_gimple_stmt) == 1
+      && get_range_pos_neg (treeop1, currently_expanding_gimple_stmt) == 1)
     {
       /* If both arguments are known to be positive when interpreted
 	 as signed, we can expand it as both signed and unsigned
@@ -9702,12 +9691,10 @@ expand_expr_divmod (tree_code code, machine_mode mode, tree treeop0,
       do_pending_stack_adjust ();
       start_sequence ();
       rtx uns_ret = expand_divmod (mod_p, code, mode, op0, op1, target, 1);
-      rtx_insn *uns_insns = get_insns ();
-      end_sequence ();
+      rtx_insn *uns_insns = end_sequence ();
       start_sequence ();
       rtx sgn_ret = expand_divmod (mod_p, code, mode, op0, op1, target, 0);
-      rtx_insn *sgn_insns = get_insns ();
-      end_sequence ();
+      rtx_insn *sgn_insns = end_sequence ();
       unsigned uns_cost = seq_cost (uns_insns, speed_p);
       unsigned sgn_cost = seq_cost (sgn_insns, speed_p);
       bool was_tie = false;
@@ -9892,14 +9879,68 @@ expand_expr_real_2 (const_sepops ops, rtx target, machine_mode tmode,
 	op0 = gen_rtx_fmt_e (TYPE_UNSIGNED (TREE_TYPE (treeop0))
 			     ? ZERO_EXTEND : SIGN_EXTEND, mode, op0);
 
+      else if (SCALAR_INT_MODE_P (GET_MODE (op0))
+	       && optimize >= 2
+	       && SCALAR_INT_MODE_P (mode)
+	       && (GET_MODE_SIZE (as_a <scalar_int_mode> (mode))
+		   > GET_MODE_SIZE (as_a <scalar_int_mode> (GET_MODE (op0))))
+	       && get_range_pos_neg (treeop0,
+				     currently_expanding_gimple_stmt) == 1)
+	{
+	  /* If argument is known to be positive when interpreted
+	     as signed, we can expand it as both sign and zero
+	     extension.  Choose the cheaper sequence in that case.  */
+	  bool speed_p = optimize_insn_for_speed_p ();
+	  rtx uns_ret = NULL_RTX, sgn_ret = NULL_RTX;
+	  do_pending_stack_adjust ();
+	  start_sequence ();
+	  if (target == NULL_RTX)
+	    uns_ret = convert_to_mode (mode, op0, 1);
+	  else
+	    convert_move (target, op0, 1);
+	  rtx_insn *uns_insns = end_sequence ();
+	  start_sequence ();
+	  if (target == NULL_RTX)
+	    sgn_ret = convert_to_mode (mode, op0, 0);
+	  else
+	    convert_move (target, op0, 0);
+	  rtx_insn *sgn_insns = end_sequence ();
+	  unsigned uns_cost = seq_cost (uns_insns, speed_p);
+	  unsigned sgn_cost = seq_cost (sgn_insns, speed_p);
+	  bool was_tie = false;
+
+	  /* If costs are the same then use as tie breaker the other other
+	     factor.  */
+	  if (uns_cost == sgn_cost)
+	    {
+	      uns_cost = seq_cost (uns_insns, !speed_p);
+	      sgn_cost = seq_cost (sgn_insns, !speed_p);
+	      was_tie = true;
+	    }
+
+	  if (dump_file && (dump_flags & TDF_DETAILS))
+	    fprintf (dump_file, ";; positive extension:%s unsigned cost: %u; "
+				"signed cost: %u\n",
+		     was_tie ? " (needed tie breaker)" : "",
+		     uns_cost, sgn_cost);
+	  if (uns_cost < sgn_cost
+	      || (uns_cost == sgn_cost && TYPE_UNSIGNED (TREE_TYPE (treeop0))))
+	    {
+	      emit_insn (uns_insns);
+	      sgn_ret = uns_ret;
+	    }
+	  else
+	    emit_insn (sgn_insns);
+	  if (target == NULL_RTX)
+	    op0 = sgn_ret;
+	  else
+	    op0 = target;
+	}
       else if (target == 0)
-	op0 = convert_to_mode (mode, op0,
-			       TYPE_UNSIGNED (TREE_TYPE
-					      (treeop0)));
+	op0 = convert_to_mode (mode, op0, TYPE_UNSIGNED (TREE_TYPE (treeop0)));
       else
 	{
-	  convert_move (target, op0,
-			TYPE_UNSIGNED (TREE_TYPE (treeop0)));
+	  convert_move (target, op0, TYPE_UNSIGNED (TREE_TYPE (treeop0)));
 	  op0 = target;
 	}
 
@@ -10305,8 +10346,7 @@ expand_expr_real_2 (const_sepops ops, rtx target, machine_mode tmode,
 				      op0, op1, NULL_RTX, unsignedp);
 	      divmul_ret = expand_mult (mode, divmul_ret, op1, target,
 					unsignedp);
-	      rtx_insn *divmul_insns = get_insns ();
-	      end_sequence ();
+	      rtx_insn *divmul_insns = end_sequence ();
 	      start_sequence ();
 	      rtx modsub_ret
 		= expand_expr_divmod (TRUNC_MOD_EXPR, mode, treeop0, treeop1,
@@ -10315,8 +10355,7 @@ expand_expr_real_2 (const_sepops ops, rtx target, machine_mode tmode,
 						optab_default);
 	      modsub_ret = expand_binop (mode, this_optab, op0, modsub_ret,
 					 target, unsignedp, OPTAB_LIB_WIDEN);
-	      rtx_insn *modsub_insns = get_insns ();
-	      end_sequence ();
+	      rtx_insn *modsub_insns = end_sequence ();
 	      unsigned divmul_cost = seq_cost (divmul_insns, speed_p);
 	      unsigned modsub_cost = seq_cost (modsub_insns, speed_p);
 	      /* If costs are the same then use as tie breaker the other other
@@ -10558,8 +10597,7 @@ expand_expr_real_2 (const_sepops ops, rtx target, machine_mode tmode,
 	       and return.  */
 	    if (insn)
 	      {
-		rtx_insn *seq = get_insns ();
-		end_sequence ();
+		rtx_insn *seq = end_sequence ();
 		emit_insn (seq);
 		return target;
 	      }
@@ -10731,8 +10769,7 @@ expand_expr_real_2 (const_sepops ops, rtx target, machine_mode tmode,
 		    if (temp != dest_low)
 		      emit_move_insn (dest_low, temp);
 
-		    seq = get_insns ();
-		    end_sequence ();
+		    seq = end_sequence ();
 		    temp = target ;
 
 		    if (have_insn_for (ASHIFT, int_mode))
@@ -10744,8 +10781,7 @@ expand_expr_real_2 (const_sepops ops, rtx target, machine_mode tmode,
 							     target,
 							     unsignedp);
 
-			seq_old = get_insns ();
-			end_sequence ();
+			seq_old = end_sequence ();
 			if (seq_cost (seq, speed_p)
 			    >= seq_cost (seq_old, speed_p))
 			  {
@@ -11384,11 +11420,16 @@ expand_expr_real_1 (tree exp, rtx target, machine_mode tmode,
 	  /* ???  internal call expansion doesn't follow the usual API
 	     of returning the destination RTX and being passed a desired
 	     target.  */
+	  if (modifier == EXPAND_WRITE)
+	    return DECL_RTL (SSA_NAME_VAR (exp));
 	  rtx dest = gen_reg_rtx (TYPE_MODE (TREE_TYPE (exp)));
 	  tree tmplhs = make_tree (TREE_TYPE (exp), dest);
-	  gimple_call_set_lhs (g, tmplhs);
+	  tree var_or_id = SSA_NAME_VAR (exp);
+	  if (!var_or_id)
+	    var_or_id = SSA_NAME_IDENTIFIER (exp);
+	  SET_SSA_NAME_VAR_OR_IDENTIFIER (exp, tmplhs);
 	  expand_internal_call (as_a <gcall *> (g));
-	  gimple_call_set_lhs (g, exp);
+	  SET_SSA_NAME_VAR_OR_IDENTIFIER (exp, var_or_id);
 	  return dest;
 	}
 
@@ -13165,6 +13206,8 @@ constant_byte_string (tree arg, tree *ptr_offset, tree *mem_size, tree *decl,
 	     of the expected type and size.  */
 	  if (!initsize)
 	    initsize = integer_zero_node;
+	  else if (!tree_fits_uhwi_p (initsize))
+	    return NULL_TREE;
 
 	  unsigned HOST_WIDE_INT size = tree_to_uhwi (initsize);
 	  if (size > (unsigned HOST_WIDE_INT) INT_MAX)
@@ -13235,7 +13278,7 @@ maybe_optimize_pow2p_mod_cmp (enum tree_code code, tree *arg0, tree *arg1)
       || integer_zerop (*arg1)
       /* If c is known to be non-negative, modulo will be expanded as unsigned
 	 modulo.  */
-      || get_range_pos_neg (treeop0) == 1)
+      || get_range_pos_neg (treeop0, currently_expanding_gimple_stmt) == 1)
     return code;
 
   /* x % c == d where d < 0 && d <= -c should be always false.  */
@@ -13269,8 +13312,7 @@ maybe_optimize_pow2p_mod_cmp (enum tree_code code, tree *arg0, tree *arg1)
   start_sequence ();
   rtx mor = expand_expr_real_2 (&ops, NULL_RTX, TYPE_MODE (ops.type),
 				EXPAND_NORMAL);
-  rtx_insn *moinsns = get_insns ();
-  end_sequence ();
+  rtx_insn *moinsns = end_sequence ();
 
   unsigned mocost = seq_cost (moinsns, speed_p);
   mocost += rtx_cost (mor, mode, EQ, 0, speed_p);
@@ -13285,8 +13327,7 @@ maybe_optimize_pow2p_mod_cmp (enum tree_code code, tree *arg0, tree *arg1)
   start_sequence ();
   rtx mur = expand_expr_real_2 (&ops, NULL_RTX, TYPE_MODE (ops.type),
 				EXPAND_NORMAL);
-  rtx_insn *muinsns = get_insns ();
-  end_sequence ();
+  rtx_insn *muinsns = end_sequence ();
 
   unsigned mucost = seq_cost (muinsns, speed_p);
   mucost += rtx_cost (mur, mode, EQ, 0, speed_p);
@@ -13369,7 +13410,8 @@ maybe_optimize_mod_cmp (enum tree_code code, tree *arg0, tree *arg1)
   /* If both operands are known to have the sign bit clear, handle
      even the signed modulo case as unsigned.  treeop1 is always
      positive >= 2, checked above.  */
-  if (!TYPE_UNSIGNED (type) && get_range_pos_neg (treeop0) != 1)
+  if (!TYPE_UNSIGNED (type)
+      && get_range_pos_neg (treeop0, currently_expanding_gimple_stmt) != 1)
     sgn = SIGNED;
 
   if (!TYPE_UNSIGNED (type))
@@ -13472,8 +13514,7 @@ maybe_optimize_mod_cmp (enum tree_code code, tree *arg0, tree *arg1)
   start_sequence ();
   rtx mor = expand_expr_real_2 (&ops, NULL_RTX, TYPE_MODE (ops.type),
 				EXPAND_NORMAL);
-  rtx_insn *moinsns = get_insns ();
-  end_sequence ();
+  rtx_insn *moinsns = end_sequence ();
 
   unsigned mocost = seq_cost (moinsns, speed_p);
   mocost += rtx_cost (mor, mode, EQ, 0, speed_p);
@@ -13493,8 +13534,7 @@ maybe_optimize_mod_cmp (enum tree_code code, tree *arg0, tree *arg1)
 
   start_sequence ();
   rtx mur = expand_normal (t);
-  rtx_insn *muinsns = get_insns ();
-  end_sequence ();
+  rtx_insn *muinsns = end_sequence ();
 
   unsigned mucost = seq_cost (muinsns, speed_p);
   mucost += rtx_cost (mur, mode, LE, 0, speed_p);

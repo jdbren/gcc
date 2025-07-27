@@ -114,6 +114,7 @@
 #include "target.h"
 #include "rtl.h"
 #include "tree.h"
+#include "stmt.h"
 #include "predict.h"
 #include "df.h"
 #include "memmodel.h"
@@ -1199,8 +1200,7 @@ match_reload (signed char out, signed char *ins, signed char *outs,
      accurate.  */
   narrow_reload_pseudo_class (in_rtx, goal_class);
   lra_emit_move (copy_rtx (new_in_reg), in_rtx);
-  *before = get_insns ();
-  end_sequence ();
+  *before = end_sequence ();
   /* Add the new pseudo to consider values of subsequent input reload
      pseudos.  */
   lra_assert (curr_insn_input_reloads_num < LRA_MAX_INSN_RELOADS);
@@ -1235,8 +1235,7 @@ match_reload (signed char out, signed char *ins, signed char *outs,
 	out_rtx = gen_rtx_STRICT_LOW_PART (VOIDmode, out_rtx);
       lra_emit_move (out_rtx, copy_rtx (new_out_reg));
       emit_insn (*after);
-      *after = get_insns ();
-      end_sequence ();
+      *after = end_sequence ();
     }
   *curr_id->operand_loc[out] = new_out_reg;
   lra_update_dup (curr_id, out);
@@ -1444,8 +1443,7 @@ check_and_process_move (bool *change_p, bool *sec_mem_p ATTRIBUTE_UNUSED)
       emit_insn (GEN_FCN (sri.icode) (new_reg != NULL_RTX ? new_reg : dest,
 				      src, scratch_reg));
     }
-  before = get_insns ();
-  end_sequence ();
+  before = end_sequence ();
   lra_process_new_insns (curr_insn, before, NULL, "Inserting the move");
   if (new_reg != NULL_RTX)
     SET_SRC (curr_insn_set) = new_reg;
@@ -1612,8 +1610,7 @@ process_addr_reg (rtx *loc, bool check_only_p, rtx_insn **before, rtx_insn **aft
     {
       push_to_sequence (*before);
       lra_emit_move (new_reg, reg);
-      *before = get_insns ();
-      end_sequence ();
+      *before = end_sequence ();
     }
   *loc = new_reg;
   if (after != NULL)
@@ -1621,8 +1618,7 @@ process_addr_reg (rtx *loc, bool check_only_p, rtx_insn **before, rtx_insn **aft
       start_sequence ();
       lra_emit_move (before_p ? copy_rtx (reg) : reg, new_reg);
       emit_insn (*after);
-      *after = get_insns ();
-      end_sequence ();
+      *after = end_sequence ();
     }
   return true;
 }
@@ -1639,16 +1635,14 @@ insert_move_for_subreg (rtx_insn **before, rtx_insn **after, rtx origreg,
     {
       push_to_sequence (*before);
       lra_emit_move (newreg, origreg);
-      *before = get_insns ();
-      end_sequence ();
+      *before = end_sequence ();
     }
   if (after)
     {
       start_sequence ();
       lra_emit_move (origreg, newreg);
       emit_insn (*after);
-      *after = get_insns ();
-      end_sequence ();
+      *after = end_sequence ();
     }
 }
 
@@ -2175,6 +2169,7 @@ process_alt_operands (int only_alternative)
   bool costly_p;
   enum reg_class cl;
   const HARD_REG_SET *cl_filter;
+  HARD_REG_SET hard_reg_constraint;
 
   /* Calculate some data common for all alternatives to speed up the
      function.	*/
@@ -2423,14 +2418,15 @@ process_alt_operands (int only_alternative)
 			if (curr_static_id->operand[nop].type == OP_INOUT
 			    || curr_static_id->operand[m].type == OP_INOUT)
 			  break;
-			/* Operands don't match.  If the operands are
-			   different user defined explicit hard
+			/* Operands don't match.  For asm if the operands
+			   are different user defined explicit hard
 			   registers, then we cannot make them match
 			   when one is early clobber operand.  */
 			if ((REG_P (*curr_id->operand_loc[nop])
 			     || SUBREG_P (*curr_id->operand_loc[nop]))
 			    && (REG_P (*curr_id->operand_loc[m])
-				|| SUBREG_P (*curr_id->operand_loc[m])))
+				|| SUBREG_P (*curr_id->operand_loc[m]))
+			    && INSN_CODE (curr_insn) < 0)
 			  {
 			    rtx nop_reg = *curr_id->operand_loc[nop];
 			    if (SUBREG_P (nop_reg))
@@ -2550,6 +2546,17 @@ process_alt_operands (int only_alternative)
 		  cl = GENERAL_REGS;
 		  cl_filter = nullptr;
 		  goto reg;
+
+		case '{':
+		    {
+		      int regno = decode_hard_reg_constraint (p);
+		      gcc_assert (regno >= 0);
+		      cl = REGNO_REG_CLASS (regno);
+		      CLEAR_HARD_REG_SET (hard_reg_constraint);
+		      SET_HARD_REG_BIT (hard_reg_constraint, regno);
+		      cl_filter = &hard_reg_constraint;
+		      goto reg;
+		    }
 
 		default:
 		  cn = lookup_constraint (p);
@@ -3335,19 +3342,15 @@ process_alt_operands (int only_alternative)
 		  first_conflict_j = j;
 		last_conflict_j = j;
 		/* Both the earlyclobber operand and conflicting operand
-		   cannot both be user defined hard registers.  */
+		   cannot both be user defined hard registers for asm.
+		   Let curr_insn_transform diagnose it.  */
 		if (HARD_REGISTER_P (operand_reg[i])
 		    && REG_USERVAR_P (operand_reg[i])
 		    && operand_reg[j] != NULL_RTX
 		    && HARD_REGISTER_P (operand_reg[j])
-		    && REG_USERVAR_P (operand_reg[j]))
-		  {
-		    /* For asm, let curr_insn_transform diagnose it.  */
-		    if (INSN_CODE (curr_insn) < 0)
+		    && REG_USERVAR_P (operand_reg[j])
+		    && INSN_CODE (curr_insn) < 0)
 		      return false;
-		    fatal_insn ("unable to generate reloads for "
-				"impossible constraints:", curr_insn);
-		  }
 	      }
 	  if (last_conflict_j < 0)
 	    continue;
@@ -3937,6 +3940,16 @@ process_address_1 (int nop, bool check_only_p,
       enum reg_class cl;
       rtx set;
       rtx_insn *insns, *last_insn;
+
+      cl = base_reg_class (ad.mode, ad.as, ad.base_outer_code,
+			   get_index_code (&ad), curr_insn);
+
+      if (REG_P (*ad.base_term)
+	  && ira_class_subset_p[get_reg_class (REGNO (*ad.base_term))][cl])
+	/* It seems base reg is already in the base reg class and changing it
+	   does not make a progress.  So reload the whole inner address.  */
+	goto reload_inner_addr;
+
       /* Try to reload base into register only if the base is invalid
          for the address but with valid offset, case (4) above.  */
       start_sequence ();
@@ -3982,8 +3995,6 @@ process_address_1 (int nop, bool check_only_p,
 	    {
 	      *ad.base_term = XEXP (SET_SRC (set), 0);
 	      *ad.disp_term = XEXP (SET_SRC (set), 1);
-	      cl = base_reg_class (ad.mode, ad.as, ad.base_outer_code,
-				   get_index_code (&ad), curr_insn);
 	      regno = REGNO (*ad.base_term);
 	      if (regno >= FIRST_PSEUDO_REGISTER
 		  && cl != lra_get_allocno_class (regno))
@@ -4026,18 +4037,17 @@ process_address_1 (int nop, bool check_only_p,
     }
   else
     {
-      enum reg_class cl = base_reg_class (ad.mode, ad.as,
-					  SCRATCH, SCRATCH,
-					  curr_insn);
-      rtx addr = *ad.inner;
-
+      enum reg_class cl;
+      rtx addr;
+    reload_inner_addr:
+      cl = base_reg_class (ad.mode, ad.as, SCRATCH, SCRATCH, curr_insn);
+      addr = *ad.inner;
       new_reg = lra_create_new_reg (Pmode, NULL_RTX, cl, NULL, "addr");
       /* addr => new_base.  */
       lra_emit_move (new_reg, addr);
       *ad.inner = new_reg;
     }
-  *before = get_insns ();
-  end_sequence ();
+  *before = end_sequence ();
   return true;
 }
 
@@ -4052,14 +4062,21 @@ process_address (int nop, bool check_only_p,
 		 rtx_insn **before, rtx_insn **after)
 {
   bool res = false;
-
-  while (process_address_1 (nop, check_only_p, before, after))
+  /* Use enough iterations to process all address parts:  */
+  for (int i = 0; i < 10; i++)
     {
-      if (check_only_p)
-	return true;
-      res = true;
+      if (!process_address_1 (nop, check_only_p, before, after))
+	{
+	  return res;
+	}
+      else
+	{
+	  if (check_only_p)
+	    return true;
+	  res = true;
+	}
     }
-  return res;
+  fatal_insn ("unable to reload address in ", curr_insn);
 }
 
 /* Override the generic address_reload_context in order to
@@ -4446,8 +4463,7 @@ curr_insn_transform (bool check_only_p)
 	  push_to_sequence (before);
 	  before = emit_spill_move (true, new_reg, src);
 	  emit_insn (before);
-	  before = get_insns ();
-	  end_sequence ();
+	  before = end_sequence ();
 	  lra_process_new_insns (curr_insn, before, NULL, "Changing on");
 	  lra_set_insn_deleted (curr_insn);
 	}
@@ -4467,8 +4483,7 @@ curr_insn_transform (bool check_only_p)
 	  push_to_sequence (before);
 	  before = emit_spill_move (true, new_reg, src);
 	  emit_insn (before);
-	  before = get_insns ();
-	  end_sequence ();
+	  before = end_sequence ();
 	  lra_process_new_insns (curr_insn, before, NULL,
 				 "Inserting the sec. move");
 	}
@@ -4739,8 +4754,7 @@ curr_insn_transform (bool check_only_p)
 	      if (align_p)
 		emit_move_insn (new_reg, gen_rtx_AND (GET_MODE (new_reg), new_reg, XEXP (*loc, 1)));
 	    }
-	  before = get_insns ();
-	  end_sequence ();
+	  before = end_sequence ();
 	  *loc = new_reg;
 	  lra_update_dup (curr_id, i);
 	}
@@ -4813,8 +4827,7 @@ curr_insn_transform (bool check_only_p)
 	    {
 	      push_to_sequence (before);
 	      lra_emit_move (new_reg, old);
-	      before = get_insns ();
-	      end_sequence ();
+	      before = end_sequence ();
 	    }
 	  *loc = new_reg;
 	  if (type != OP_IN
@@ -4825,8 +4838,7 @@ curr_insn_transform (bool check_only_p)
 	      start_sequence ();
 	      lra_emit_move (type == OP_INOUT ? copy_rtx (old) : old, new_reg);
 	      emit_insn (after);
-	      after = get_insns ();
-	      end_sequence ();
+	      after = end_sequence ();
 	      *loc = new_reg;
 	    }
 	  for (j = 0; j < goal_alt_dont_inherit_ops_num; j++)
@@ -5968,8 +5980,7 @@ inherit_reload_reg (bool def_p, int original_regno,
     lra_emit_move (original_reg, new_reg);
   else
     lra_emit_move (new_reg, original_reg);
-  new_insns = get_insns ();
-  end_sequence ();
+  new_insns = end_sequence ();
   if (NEXT_INSN (new_insns) != NULL_RTX)
     {
       if (lra_dump_file != NULL)
@@ -6608,14 +6619,12 @@ process_invariant_for_inheritance (rtx dst_reg, rtx invariant_rtx)
 	  lra_reg_info[REGNO (new_reg)].restore_rtx = PATTERN (insn);
 	  start_sequence ();
 	  lra_emit_move (new_reg, dst_reg);
-	  new_insns = get_insns ();
-	  end_sequence ();
+	  new_insns = end_sequence ();
 	  lra_process_new_insns (curr_insn, NULL, new_insns,
 				 "Add invariant inheritance<-original");
 	  start_sequence ();
 	  lra_emit_move (SET_DEST (insn_set), new_reg);
-	  new_insns = get_insns ();
-	  end_sequence ();
+	  new_insns = end_sequence ();
 	  lra_process_new_insns (insn, NULL, new_insns,
 				 "Changing reload<-inheritance");
 	  lra_set_insn_deleted (insn);
@@ -7117,8 +7126,7 @@ inherit_in_ebb (rtx_insn *head, rtx_insn *tail)
 		    {
 		      start_sequence ();
 		      emit_move_insn (cheap, copy_rtx (dest));
-		      restore = get_insns ();
-		      end_sequence ();
+		      restore = end_sequence ();
 		      lra_process_new_insns (curr_insn, NULL, restore,
 					     "Inserting call parameter restore");
 		      /* We don't need to save/restore of the pseudo from
@@ -7498,8 +7506,7 @@ remove_inheritance_pseudos (bitmap remove_pseudos)
 		  /* We cannot just change the source.  It might be
 		     an insn different from the move.  */
 		  emit_insn (lra_reg_info[sregno].restore_rtx);
-		  rtx_insn *new_insns = get_insns ();
-		  end_sequence ();
+		  rtx_insn *new_insns = end_sequence ();
 		  lra_assert (single_set (new_insns) != NULL
 			      && SET_DEST (set) == SET_DEST (single_set (new_insns)));
 		  lra_process_new_insns (curr_insn, NULL, new_insns,

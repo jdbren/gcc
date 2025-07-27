@@ -18,26 +18,16 @@ You should have received a copy of the GNU General Public License
 along with GCC; see the file COPYING3.  If not see
 <http://www.gnu.org/licenses/>.  */
 
-#include "config.h"
-#define INCLUDE_VECTOR
-#include "system.h"
-#include "coretypes.h"
-#include "tree.h"
-#include "function.h"
-#include "basic-block.h"
-#include "gimple.h"
-#include "gimple-iterator.h"
-#include "diagnostic-core.h"
-#include "pretty-print.h"
-#include "analyzer/analyzer.h"
+#include "analyzer/common.h"
+
+#include "stmt.h"
+
 #include "analyzer/analyzer-logging.h"
-#include "options.h"
 #include "analyzer/call-string.h"
 #include "analyzer/program-point.h"
 #include "analyzer/store.h"
 #include "analyzer/region-model.h"
 #include "analyzer/region-model-reachability.h"
-#include "stmt.h"
 
 #if ENABLE_ANALYZER
 
@@ -129,7 +119,7 @@ deterministic_p (const gasm *asm_stmt)
 void
 region_model::on_asm_stmt (const gasm *stmt, region_model_context *ctxt)
 {
-  logger *logger = ctxt ? ctxt->get_logger () : NULL;
+  logger *logger = ctxt ? ctxt->get_logger () : nullptr;
   LOG_SCOPE (logger);
 
   const unsigned noutputs = gimple_asm_noutputs (stmt);
@@ -181,7 +171,8 @@ region_model::on_asm_stmt (const gasm *stmt, region_model_context *ctxt)
 	 no point in going further.  */
       constraint = constraints[i];
       if (!parse_output_constraint (&constraint, i, ninputs, noutputs,
-				    &allows_mem, &allows_reg, &is_inout))
+				    &allows_mem, &allows_reg, &is_inout,
+				    nullptr))
 	{
 	  if (logger)
 	    logger->log ("error parsing constraint for output %i: %qs",
@@ -214,8 +205,8 @@ region_model::on_asm_stmt (const gasm *stmt, region_model_context *ctxt)
       const char *constraint = constraints[i + noutputs];
       bool allows_reg, allows_mem;
       if (! parse_input_constraint (&constraint, i, ninputs, noutputs, 0,
-				    constraints.address (),
-				    &allows_mem, &allows_reg))
+				    constraints.address (), &allows_mem,
+				    &allows_reg, nullptr))
 	{
 	  if (logger)
 	    logger->log ("error parsing constraint for input %i: %qs",
@@ -226,7 +217,7 @@ region_model::on_asm_stmt (const gasm *stmt, region_model_context *ctxt)
 
       tree src_expr = input_tvec[i];
       const svalue *src_sval = get_rvalue (src_expr, ctxt);
-      check_for_poison (src_sval, src_expr, NULL, ctxt);
+      check_for_poison (src_sval, src_expr, nullptr, ctxt);
       input_svals.quick_push (src_sval);
       reachable_regs.handle_sval (src_sval);
 

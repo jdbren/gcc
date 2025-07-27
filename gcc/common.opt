@@ -53,12 +53,6 @@ bool in_lto_p = false
 Variable
 enum incremental_link flag_incremental_link = INCREMENTAL_LINK_NONE
 
-; 0 means straightforward implementation of complex divide acceptable.
-; 1 means wide ranges of inputs must work for complex divide.
-; 2 means C99-like requirements for complex multiply and divide.
-Variable
-int flag_complex_method = 1
-
 Variable
 int flag_default_complex_method = 1
 
@@ -551,6 +545,10 @@ Warray-bounds=
 Common Joined RejectNegative UInteger Var(warn_array_bounds) Warning IntegerRange(0, 2)
 Warn if an array is accessed out of bounds.
 
+Wauto-profile
+Common Var(warn_auto_profile) Warning
+Warn about problems with auto-profile data.
+
 Wuse-after-free
 Common Var(warn_use_after_free) Warning
 Warn for uses of pointers to deallocated storage.
@@ -614,11 +612,11 @@ Warn when an optimization pass is disabled.
 
 Werror
 Common Var(warnings_are_errors)
-Treat all warnings as errors.
+Turn all warnings into errors.
 
 Werror=
 Common Joined
-Treat specified warning as error.
+Turn the specified warning into an error.
 
 Wextra
 Common Var(extra_warnings) Warning
@@ -692,6 +690,14 @@ Does nothing. Preserved for backward compatibility.
 
 Wmissing-noreturn
 Common Warning Alias(Wsuggest-attribute=noreturn)
+
+Wmusttail-local-addr
+Common Var(warn_musttail_local_addr) Init(1) Warning
+Warn about passing a pointer/reference to a local or temporary variable to a musttail call argument.
+
+Wmaybe-musttail-local-addr
+Common Var(warn_maybe_musttail_local_addr) Warning EnabledBy(Wextra)
+Warn about pointer/reference to a local or temporary variable possibly escaping to a musttail call.
 
 Wodr
 Common Var(warn_odr_violations) Init(1) Warning
@@ -845,11 +851,17 @@ Common Var(warn_unused) Init(0) Warning
 Enable all -Wunused- warnings.
 
 Wunused-but-set-parameter
-Common Var(warn_unused_but_set_parameter) Warning EnabledBy(Wunused && Wextra)
+Common Alias(Wunused-but-set-parameter=,3,0) Warning
+
+Wunused-but-set-parameter=
+Common Var(warn_unused_but_set_parameter) RejectNegative Joined UInteger Warning IntegerRange(0, 3) EnabledBy(Wunused && Wextra)
 Warn when a function parameter is only set, otherwise unused.
 
 Wunused-but-set-variable
-Common Var(warn_unused_but_set_variable) Warning EnabledBy(Wunused)
+Common Alias(Wunused-but-set-variable=,3,0) Warning
+
+Wunused-but-set-variable=
+Common Var(warn_unused_but_set_variable) RejectNegative Joined UInteger Warning IntegerRange(0, 3) EnabledBy(Wunused)
 Warn when a variable is only set, otherwise unused.
 
 Wunused-function
@@ -1053,6 +1065,10 @@ Driver Undocumented
 ; 20: Fix mangling of lambdas in static data member initializers.
 ;     Default in G++ 15.
 ;
+; 21: Fix noexcept lambda capture pruning.
+;     Fix C++20 layout of base with all explicitly defaulted constructors.
+;     Default in G++ 16.
+;
 ; Additional positive integers will be assigned as new versions of
 ; the ABI become the default version of the ABI.
 fabi-version=
@@ -1181,6 +1197,10 @@ Common Joined RejectNegative Var(auto_profile_file)
 Use sample profile information for call graph node weights. The profile
 file is specified in the argument.
 
+fauto-profile-inlining
+Common Var(flag_auto_profile_inlining) Init(1) Optimization
+Perform inlining using auto-profile.
+
 ; -fcheck-bounds causes gcc to generate array bounds checks.
 ; For C, C++ and ObjC: defaults off.
 ; For Java: defaults to on.
@@ -1304,12 +1324,30 @@ fcse-skip-blocks
 Common Ignore
 Does nothing.  Preserved for backward compatibility.
 
+fcx-method=
+Common Joined RejectNegative Enum(complex_method) Var(flag_complex_method) Optimization SetByCombined
+
+Enum
+Name(complex_method) Type(int)
+
+; straightforward implementation of complex divide acceptable.
+EnumValue
+Enum(complex_method) String(limited-range) Value(0)
+
+; wide ranges of inputs must work for complex divide.
+EnumValue
+Enum(complex_method) String(fortran) Value(1)
+
+; C99-like requirements for complex multiply and divide.
+EnumValue
+Enum(complex_method) String(stdc) Value(2)
+
 fcx-limited-range
-Common Var(flag_cx_limited_range) Optimization SetByCombined
+Common Alias(fcx-method=,limited-range,stdc)
 Omit range reduction step when performing complex division.
 
 fcx-fortran-rules
-Common Var(flag_cx_fortran_rules) Optimization
+Common Alias(fcx-method=,fortran,stdc)
 Complex multiplication and division follow Fortran rules.
 
 fdata-sections
@@ -1409,7 +1447,7 @@ Driver Common Joined RejectNegative Var(flag_diagnostics_show_color) Enum(diagno
 
 ; Required for these enum values.
 SourceInclude
-diagnostic-color.h
+diagnostics/color.h
 
 Enum
 Name(diagnostic_color_rule) Type(int)
@@ -1433,7 +1471,7 @@ Driver Common Joined RejectNegative Var(flag_diagnostics_show_urls) Enum(diagnos
 
 ; Required for these enum values.
 SourceInclude
-diagnostic-url.h
+diagnostics/url.h
 
 Enum
 Name(diagnostic_url_rule) Type(int)
@@ -1457,7 +1495,7 @@ Common Joined RejectNegative UInteger
 
 fdiagnostics-format=
 Common Joined RejectNegative Enum(diagnostics_output_format)
--fdiagnostics-format=[text|sarif-stderr|sarif-file|json|json-stderr|json-file]	Select output format.
+-fdiagnostics-format=[text|sarif-stderr|sarif-file]	Select output format.
 
 fdiagnostics-add-output=
 Common Joined RejectNegative
@@ -1498,15 +1536,6 @@ Name(diagnostics_output_format) Type(int)
 
 EnumValue
 Enum(diagnostics_output_format) String(text) Value(DIAGNOSTICS_OUTPUT_FORMAT_TEXT)
-
-EnumValue
-Enum(diagnostics_output_format) String(json) Value(DIAGNOSTICS_OUTPUT_FORMAT_JSON_STDERR)
-
-EnumValue
-Enum(diagnostics_output_format) String(json-stderr) Value(DIAGNOSTICS_OUTPUT_FORMAT_JSON_STDERR)
-
-EnumValue
-Enum(diagnostics_output_format) String(json-file) Value(DIAGNOSTICS_OUTPUT_FORMAT_JSON_FILE)
 
 EnumValue
 Enum(diagnostics_output_format) String(sarif-stderr) Value(DIAGNOSTICS_OUTPUT_FORMAT_SARIF_STDERR)
@@ -2047,6 +2076,7 @@ Enum(ilsop_fn) String(memset) Value(ILSOP_MEMSET) Set(4)
 
 fcf-protection
 Common RejectNegative Alias(fcf-protection=,full)
+Equivalent to -fcf-protection=full.
 
 fcf-protection=
 Common Joined RejectNegative Enum(cf_protection_level) EnumSet Var(flag_cf_protection) Init(CF_NONE)
@@ -2106,6 +2136,10 @@ Perform interprocedural bitwise constant propagation.
 fipa-modref
 Common Var(flag_ipa_modref) Optimization
 Perform interprocedural modref analysis.
+
+fipa-reorder-for-locality
+Common Var(flag_ipa_reorder_for_locality) Init(0) Optimization
+Perform reordering and cloning of functions to maximize locality.
 
 fipa-profile
 Common Var(flag_ipa_profile) Init(0) Optimization
@@ -3797,7 +3831,7 @@ Common Alias(Wpedantic)
 
 pedantic-errors
 Common Var(flag_pedantic_errors)
-Like -pedantic but issue them as errors.
+Like -pedantic but issue errors instead of warnings.
 
 pg
 Driver

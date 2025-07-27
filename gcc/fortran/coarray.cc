@@ -357,7 +357,9 @@ split_expr_at_caf_ref (gfc_expr *expr, gfc_namespace *ns,
 
   gcc_assert (expr->expr_type == EXPR_VARIABLE);
   caf_ts = &expr->symtree->n.sym->ts;
-  if (!expr->symtree->n.sym->attr.codimension)
+  if (!(expr->symtree->n.sym->ts.type == BT_CLASS
+	  ? CLASS_DATA (expr->symtree->n.sym)->attr.codimension
+	  : expr->symtree->n.sym->attr.codimension))
     {
       /* The coarray is in some component.  Find it.  */
       caf_ref = expr->ref;
@@ -432,6 +434,9 @@ split_expr_at_caf_ref (gfc_expr *expr, gfc_namespace *ns,
   else if (base->ts.type == BT_CLASS)
     convert_coarray_class_to_derived_type (base, ns);
 
+  memset (&(*post_caf_ref_expr)->ts, 0, sizeof (gfc_typespec));
+  gfc_resolve_expr (*post_caf_ref_expr);
+  (*post_caf_ref_expr)->corank = 0;
   gfc_expression_rank (*post_caf_ref_expr);
   if (for_send)
     gfc_expression_rank (expr);
@@ -498,7 +503,7 @@ check_add_new_comp_handle_array (gfc_expr *e, gfc_symbol *type,
 				 gfc_symbol *add_data)
 {
   gfc_component *comp;
-  int cnt = -1;
+  static int cnt = -1;
   gfc_symtree *caller_image;
   gfc_code *pre_code = caf_accessor_prepend;
   bool static_array_or_scalar = true;
@@ -561,7 +566,7 @@ check_add_new_comp_handle_array (gfc_expr *e, gfc_symbol *type,
   else
     {
       comp->initializer = gfc_copy_expr (e);
-      if (e_attr.dimension)
+      if (e_attr.dimension && e->rank)
 	{
 	  comp->attr.dimension = 1;
 	  comp->as = get_arrayspec_from_expr (e);
@@ -692,7 +697,10 @@ check_add_new_component (gfc_symbol *type, gfc_expr *e, gfc_symbol *add_data)
 	  break;
 	case EXPR_FUNCTION:
 	  if (!e->symtree->n.sym->attr.pure
-	      && !e->symtree->n.sym->attr.elemental)
+	      && !e->symtree->n.sym->attr.elemental
+	      && !(e->value.function.isym
+		   && (e->value.function.isym->pure
+		       || e->value.function.isym->elemental)))
 	    /* Treat non-pure/non-elemental functions.  */
 	    check_add_new_comp_handle_array (e, type, add_data);
 	  else
@@ -738,7 +746,6 @@ create_caf_add_data_parameter_type (gfc_expr *expr, gfc_namespace *ns,
   add_data->as->lower[0]
     = gfc_get_constant_expr (BT_INTEGER, gfc_default_integer_kind,
 			     &expr->where);
-  mpz_init (add_data->as->lower[0]->value.integer);
   mpz_set_si (add_data->as->lower[0]->value.integer, 1);
 
   for (gfc_ref *ref = expr->ref; ref; ref = ref->next)
@@ -758,6 +765,7 @@ create_caf_add_data_parameter_type (gfc_expr *expr, gfc_namespace *ns,
   type->declared_at = expr->where;
   gfc_set_sym_referenced (type);
   gfc_commit_symbol (type);
+  free (name);
   return type;
 }
 
@@ -1130,8 +1138,8 @@ create_allocated_callback (gfc_expr *expr)
 
   // ADD_ARG (expr->symtree->name, base, BT_VOID, INTENT_IN);
   base = post_caf_ref_expr->symtree->n.sym;
+  base->attr.pointer = !base->attr.dimension;
   gfc_set_sym_referenced (base);
-  gfc_commit_symbol (base);
   *argptr = gfc_get_formal_arglist ();
   (*argptr)->sym = base;
   argptr = &(*argptr)->next;
@@ -1420,7 +1428,8 @@ coindexed_expr_callback (gfc_expr **e, int *walk_subtrees,
 	  {
 	  case GFC_ISYM_ALLOCATED:
 	    if ((*e)->value.function.actual->expr
-		&& gfc_is_coindexed ((*e)->value.function.actual->expr))
+		&& (gfc_is_coarray ((*e)->value.function.actual->expr)
+		    || gfc_is_coindexed ((*e)->value.function.actual->expr)))
 	      {
 		rewrite_caf_allocated (e);
 		*walk_subtrees = 0;

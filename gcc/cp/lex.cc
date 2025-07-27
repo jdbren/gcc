@@ -749,6 +749,9 @@ unqualified_name_lookup_error (tree name, location_t loc)
 
   if (IDENTIFIER_ANY_OP_P (name))
     error_at (loc, "%qD not defined", name);
+  else if (!flag_concepts && name == ridpointers[(int)RID_REQUIRES])
+    error_at (loc, "%<requires%> only available with %<-std=c++20%> or "
+	      "%<-fconcepts%>");
   else
     {
       if (!objc_diagnose_private_ivar (name))
@@ -1079,15 +1082,17 @@ copy_lang_type (tree node)
   if (! TYPE_LANG_SPECIFIC (node))
     return;
 
-  auto *lt = (struct lang_type *) ggc_internal_alloc (sizeof (struct lang_type));
+  size_t sz = (c_dialect_objc () ? sizeof (struct lang_type)
+	       : offsetof (struct lang_type, info));
+  auto *lt = (struct lang_type *) ggc_internal_alloc (sz);
 
-  memcpy (lt, TYPE_LANG_SPECIFIC (node), (sizeof (struct lang_type)));
+  memcpy (lt, TYPE_LANG_SPECIFIC (node), sz);
   TYPE_LANG_SPECIFIC (node) = lt;
 
   if (GATHER_STATISTICS)
     {
       tree_node_counts[(int)lang_type] += 1;
-      tree_node_sizes[(int)lang_type] += sizeof (struct lang_type);
+      tree_node_sizes[(int)lang_type] += sz;
     }
 }
 
@@ -1111,14 +1116,15 @@ maybe_add_lang_type_raw (tree t)
   if (!RECORD_OR_UNION_CODE_P (TREE_CODE (t)))
     return false;
 
-  auto *lt = (struct lang_type *) (ggc_internal_cleared_alloc
-				   (sizeof (struct lang_type)));
+  size_t sz = (c_dialect_objc () ? sizeof (struct lang_type)
+	       : offsetof (struct lang_type, info));
+  auto *lt = (struct lang_type *) (ggc_internal_cleared_alloc (sz));
   TYPE_LANG_SPECIFIC (t) = lt;
 
   if (GATHER_STATISTICS)
     {
       tree_node_counts[(int)lang_type] += 1;
-      tree_node_sizes[(int)lang_type] += sizeof (struct lang_type);
+      tree_node_sizes[(int)lang_type] += sz;
     }
 
   return true;
@@ -1132,8 +1138,8 @@ cxx_make_type (enum tree_code code MEM_STAT_DECL)
   if (maybe_add_lang_type_raw (t))
     {
       /* Set up some flags that give proper default behavior.  */
-      struct c_fileinfo *finfo =
-	get_fileinfo (LOCATION_FILE (input_location));
+      struct c_fileinfo *finfo
+	= get_fileinfo (LOCATION_FILE (input_location));
       SET_CLASSTYPE_INTERFACE_UNKNOWN_X (t, finfo->interface_unknown);
       CLASSTYPE_INTERFACE_ONLY (t) = finfo->interface_only;
     }

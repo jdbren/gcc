@@ -248,7 +248,12 @@ cb_def_pragma (cpp_reader *pfile, location_t loc)
     {
       const unsigned char *space, *name;
       const cpp_token *s;
-      location_t fe_loc = loc;
+
+      /* If we are processing a _Pragma, LOC is not a valid location, but libcpp
+	 will provide a good location via this function instead.  */
+      location_t fe_loc = cpp_get_diagnostic_override_loc (pfile);
+      if (fe_loc == UNKNOWN_LOCATION)
+	fe_loc = loc;
 
       space = name = (const unsigned char *) "";
 
@@ -1171,7 +1176,7 @@ interpret_integer (const cpp_token *token, unsigned int flags,
 	  && (flags & CPP_N_WIDTH) != CPP_N_LARGE)
 	emit_diagnostic
 	  ((c_dialect_cxx () ? cxx_dialect == cxx98 : !flag_isoc99)
-	   ? DK_PEDWARN : DK_WARNING,
+	   ? diagnostics::kind::pedwarn : diagnostics::kind::warning,
 	   input_location, OPT_Wlong_long,
 	   (flags & CPP_N_UNSIGNED)
 	   ? "integer constant is too large for %<unsigned long%> type"

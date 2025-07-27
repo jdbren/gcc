@@ -86,7 +86,7 @@ def prepend_to_changelog_files(repo, folder, git_commit, add_to_git):
 
 
 active_refs = ['master',
-               'releases/gcc-12', 'releases/gcc-13', 'releases/gcc-14']
+               'releases/gcc-13', 'releases/gcc-14', 'releases/gcc-15']
 
 parser = argparse.ArgumentParser(description='Update DATESTAMP and generate '
                                  'ChangeLog entries')

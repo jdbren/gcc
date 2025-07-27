@@ -1,3 +1,107 @@
+2025-07-25  David Malcolm  <dmalcolm@redhat.com>
+
+	* filter-clang-warnings.py: Update for move of
+	diagnostic-path-output.cc to diagnostics/paths-output.cc.
+
+2025-07-25  David Malcolm  <dmalcolm@redhat.com>
+
+	* gcc.doxy (INPUT): Add gcc/diagnostics subdir.
+
+2025-07-23  Sam James  <sam@gentoo.org>
+
+	PR other/105404
+	* gcc-changelog/git_commit.py (ignored_prefixes): Add zlib/.
+
+2025-07-16  David Malcolm  <dmalcolm@redhat.com>
+
+	* gcc.doxy (INPUT): Add directory "gcc/text-art".
+
+2025-07-11  Richard Biener  <rguenther@suse.de>
+
+	* gcc-changelog/git_update_version.py: Stop updating gcc-12
+	branch.
+
+2025-07-08  Pierre-Emmanuel Patry  <pierre-emmanuel.patry@embecosm.com>
+
+	* prepare-commit-msg: Force default git prefixes.
+
+2025-07-07  Martin Jambor  <mjambor@suse.cz>
+
+	* filter-clang-warnings.py (skip_warning): Also ignore
+	-Woverloaded-shift-op-parentheses, -Wunused-function,
+	-Wunneeded-internal-declaration, -Wvla-cxx-extension', and
+	-Wunused-command-line-argument everywhere and a warning about
+	m_logical_loc_mgr in diagnostic-path-output.cc.  Adjust gimple-match
+	and generic-match "filenames."  Ignore -Wnontrivial-memcall warnings
+	in wide-int.h, all warnings about unused stuff in files under
+	m2/gm2-compiler-boot, all -Wunused-private-field in rust FE, in
+	analyzer/ana-state-to-diagnostic-state.h and c-family/c-format.cc, all
+	Warnings in avr-mmcu.texi, install.texi and libgccjit.texi and all
+	-Wc23-extensions warnings in libiberty/sha1.c. Ignore
+	-Wunused-parameter in analyzer/sm.cc.  Reorder entries.
+
+2025-06-29  Filip Kastl  <fkastl@suse.cz>
+
+	* mklog.py: In 'main()', specify variable 'root' as global.
+
+2025-06-26  Alex Coplan  <alex.coplan@arm.com>
+
+	* mklog.py (main): New.
+
+2025-06-23  David Malcolm  <dmalcolm@redhat.com>
+
+	PR other/116792
+	PR testsuite/116163
+	PR sarif-replay/120792
+	* dg-lint/dg-lint: Add -fdiagnostics-add-output.
+	* dg-lint/libgdiagnostics.py: Add
+	diagnostic_manager_add_sink_from_spec.
+	(Manager.add_sink_from_spec): New.
+
+2025-06-23  Andrew Burgess  <aburgess@redhat.com>
+
+	* dg-extract-results.py: Handle GDB's unexpected core file count.
+	* dg-extract-results.sh: Likewise.
+
+2025-05-27  Jan Hubicka  <hubicka@ucw.cz>
+
+	* gen_autofdo_event.py: Add support for AMD Zen 3 and
+	later CPUs.
+
+2025-05-23  Andi Kleen  <ak@gcc.gnu.org>
+
+	* diffsummary.py: New file.
+
+2025-05-09  Torbjörn SVENSSON  <torbjorn.svensson@foss.st.com>
+
+	* check_GNU_style_lib.py: Remove literal prefix.
+
+2025-05-01  Gerald Pfeifer  <gerald@pfeifer.com>
+
+	* config-list.mk: Update FreeBSD targets to version 13.
+
+2025-04-26  Iain Buclaw  <ibuclaw@gdcproject.org>
+
+	* config-list.mk: Add m32c*-*-* to the list of obsoleted targets.
+
+2025-04-25  Jakub Jelinek  <jakub@redhat.com>
+
+	* gennews (files): Add files for GCC 15.
+
+2025-04-17  Jakub Jelinek  <jakub@redhat.com>
+
+	* gcc-changelog/git_update_version.py (active_refs): Add
+	releases/gcc-15.
+
+2025-04-11  Tomasz Kamiński  <tkaminsk@redhat.com>
+
+	PR libstdc++/109162
+	* unicode/README: Mentioned DerivedGeneralCategory.txt.
+	* unicode/gen_libstdcxx_unicode_data.py: Generation __escape_edges
+	table from DerivedGeneralCategory.txt. Update file name in comments.
+	* unicode/DerivedGeneralCategory.txt: Copy of file distributed by
+	Unicode Consortium.
+
 2025-03-27  David Malcolm  <dmalcolm@redhat.com>
 
 	PR testsuite/116163

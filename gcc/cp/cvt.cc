@@ -575,6 +575,19 @@ force_rvalue (tree expr, tsubst_flags_t complain)
   return expr;
 }
 
+/* Force EXPR to be an lvalue, if it isn't already.  */
+
+tree
+force_lvalue (tree expr, tsubst_flags_t complain)
+{
+  if (!lvalue_p (expr))
+    {
+      expr = cp_build_addr_expr (expr, complain);
+      expr = cp_build_indirect_ref (input_location, expr, RO_ARROW, complain);
+    }
+  return expr;
+}
+
 
 /* If EXPR and ORIG are INTEGER_CSTs, return a version of EXPR that has
    TREE_OVERFLOW set only if it is set in ORIG.  Otherwise, return EXPR
@@ -1173,13 +1186,6 @@ convert_to_void (tree expr, impl_conv_void implicit, tsubst_flags_t complain)
 
   expr = maybe_undo_parenthesized_ref (expr);
 
-  expr = mark_discarded_use (expr);
-  if (implicit == ICV_CAST)
-    /* An explicit cast to void avoids all -Wunused-but-set* warnings.  */
-    mark_exp_read (expr);
-
-  if (!TREE_TYPE (expr))
-    return expr;
   if (invalid_nonstatic_memfn_p (loc, expr, complain))
     return error_mark_node;
   if (TREE_CODE (expr) == PSEUDO_DTOR_EXPR)
@@ -1196,6 +1202,12 @@ convert_to_void (tree expr, impl_conv_void implicit, tsubst_flags_t complain)
 
   if (VOID_TYPE_P (TREE_TYPE (expr)))
     return expr;
+
+  expr = mark_discarded_use (expr);
+  if (implicit == ICV_CAST)
+    /* An explicit cast to void avoids all -Wunused-but-set* warnings.  */
+    mark_exp_read (expr);
+
   switch (TREE_CODE (expr))
     {
     case COND_EXPR:

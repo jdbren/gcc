@@ -105,6 +105,7 @@ enum rid
 
   /* C extensions */
   RID_ASM,       RID_TYPEOF,   RID_TYPEOF_UNQUAL, RID_ALIGNOF,  RID_ATTRIBUTE,
+  RID_COUNTOF,
   RID_C23_VA_START, RID_VA_ARG,
   RID_EXTENSION, RID_IMAGPART, RID_REALPART, RID_LABEL,    RID_CHOOSE_EXPR,
   RID_TYPES_COMPATIBLE_P,      RID_BUILTIN_COMPLEX,	   RID_BUILTIN_SHUFFLE,
@@ -890,6 +891,7 @@ extern tree c_common_truthvalue_conversion (location_t, tree);
 extern void c_apply_type_quals_to_decl (int, tree);
 extern tree c_sizeof_or_alignof_type (location_t, tree, bool, bool, int);
 extern tree c_alignof_expr (location_t, tree);
+extern tree c_countof_type (location_t, tree);
 /* Print an error message for invalid operands to arith operation CODE.
    NOP_EXPR is used as a special case (see truthvalue_conversion).  */
 extern void binary_op_error (rich_location *, enum tree_code, tree, tree);
@@ -977,7 +979,7 @@ extern tree build_va_arg (location_t, tree, tree);
 
 extern const unsigned int c_family_lang_mask;
 extern unsigned int c_common_option_lang_mask (void);
-extern void c_common_diagnostics_set_defaults (diagnostic_context *);
+extern void c_common_diagnostics_set_defaults (diagnostics::context *);
 extern bool c_common_complain_wrong_lang_p (const struct cl_option *);
 extern void c_common_init_options_struct (struct gcc_options *);
 extern void c_common_init_options (unsigned int, struct cl_decoded_option *);
@@ -1263,7 +1265,7 @@ extern void c_stddef_cpp_builtins (void);
 extern void fe_file_change (const line_map_ordinary *);
 extern void c_parse_error (const char *, enum cpp_ttype, tree, unsigned char,
 			   rich_location *richloc);
-extern diagnostic_option_id get_option_for_builtin_define (const char *macro_name);
+extern diagnostics::option_id get_option_for_builtin_define (const char *macro_name);
 
 /* In c-ppoutput.cc  */
 extern void init_pp_output (FILE *);
@@ -1301,10 +1303,12 @@ enum c_omp_region_type
   C_ORT_TARGET			= 1 << 3,
   C_ORT_EXIT_DATA		= 1 << 4,
   C_ORT_INTEROP			= 1 << 5,
+  C_ORT_DECLARE_MAPPER		= 1 << 6,
   C_ORT_OMP_DECLARE_SIMD	= C_ORT_OMP | C_ORT_DECLARE_SIMD,
   C_ORT_OMP_TARGET		= C_ORT_OMP | C_ORT_TARGET,
   C_ORT_OMP_EXIT_DATA		= C_ORT_OMP | C_ORT_EXIT_DATA,
   C_ORT_OMP_INTEROP		= C_ORT_OMP | C_ORT_INTEROP,
+  C_ORT_OMP_DECLARE_MAPPER	= C_ORT_OMP | C_ORT_DECLARE_MAPPER,
   C_ORT_ACC_TARGET		= C_ORT_ACC | C_ORT_TARGET
 };
 
@@ -1343,6 +1347,9 @@ extern enum omp_clause_defaultmap_kind c_omp_predetermined_mapping (tree);
 extern tree c_omp_check_context_selector (location_t, tree);
 extern void c_omp_mark_declare_variant (location_t, tree, tree);
 extern void c_omp_adjust_map_clauses (tree, bool);
+template<typename T> struct omp_mapper_list;
+extern void c_omp_find_nested_mappers (struct omp_mapper_list<tree> *, tree);
+extern tree c_omp_instantiate_mappers (tree);
 
 namespace omp_addr_tokenizer { struct omp_addr_token; }
 typedef omp_addr_tokenizer::omp_addr_token omp_addr_token;
@@ -1722,7 +1729,6 @@ extern tree braced_lists_to_strings (tree, tree);
 namespace selftest {
   /* Declarations for specific families of tests within c-family,
      by source file, in alphabetical order.  */
-  extern void c_diagnostic_cc_tests (void);
   extern void c_format_cc_tests (void);
   extern void c_indentation_cc_tests (void);
   extern void c_opt_problem_cc_tests (void);

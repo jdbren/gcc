@@ -2,6 +2,7 @@
 /* { dg-options "-g" } */
 
 #define INCLUDE_MEMORY
+#define INCLUDE_STRING
 #define INCLUDE_VECTOR
 #include "gcc-plugin.h"
 #include "config.h"
@@ -22,14 +23,14 @@
 #include "target.h"
 #include "fold-const.h"
 #include "tree-pretty-print.h"
-#include "diagnostic-color.h"
-#include "diagnostic-metadata.h"
+#include "diagnostics/color.h"
+#include "diagnostics/metadata.h"
 #include "tristate.h"
 #include "bitmap.h"
 #include "selftest.h"
 #include "function.h"
 #include "json.h"
-#include "analyzer/analyzer.h"
+#include "analyzer/common.h"
 #include "analyzer/analyzer-logging.h"
 #include "ordered-hash-map.h"
 #include "options.h"
@@ -44,7 +45,6 @@
 #include "analyzer/region-model.h"
 #include "analyzer/call-details.h"
 #include "analyzer/call-info.h"
-#include "make-unique.h"
 
 int plugin_is_GPL_compatible;
 
@@ -106,7 +106,7 @@ class copy_across_boundary_fn : public known_function
     if (ctxt)
       {
 	/* Bifurcate state, creating a "failure" out-edge.  */
-	ctxt->bifurcate (make_unique<copy_failure> (cd));
+	ctxt->bifurcate (std::make_unique<copy_failure> (cd));
 
 	/* The "unbifurcated" state is the "success" case.  */
 	copy_success success (cd,
@@ -238,11 +238,13 @@ kernel_analyzer_init_cb (void *gcc_data, void */*user_data*/)
     inform (input_location, "got here: kernel_analyzer_init_cb");
   iface->register_known_function
     ("copy_from_user",
-     make_unique<known_function_copy_from_user> ());
-  iface->register_known_function ("copy_to_user",
-				  make_unique<known_function_copy_to_user> ());
-  iface->register_known_function ("__check_object_size",
-				  make_unique<known_function___check_object_size> ());
+     std::make_unique<known_function_copy_from_user> ());
+  iface->register_known_function
+    ("copy_to_user",
+     std::make_unique<known_function_copy_to_user> ());
+  iface->register_known_function
+    ("__check_object_size",
+     std::make_unique<known_function___check_object_size> ());
 }
 
 } // namespace ana

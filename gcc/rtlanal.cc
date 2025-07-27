@@ -813,21 +813,6 @@ rtx_addr_varies_p (const_rtx x, bool for_alias)
   return false;
 }
 
-/* Return the CALL in X if there is one.  */
-
-rtx
-get_call_rtx_from (const rtx_insn *insn)
-{
-  rtx x = PATTERN (insn);
-  if (GET_CODE (x) == PARALLEL)
-    x = XVECEXP (x, 0, 0);
-  if (GET_CODE (x) == SET)
-    x = SET_SRC (x);
-  if (GET_CODE (x) == CALL && MEM_P (XEXP (x, 0)))
-    return x;
-  return NULL_RTX;
-}
-
 /* Get the declaration of the function called by INSN.  */
 
 tree
@@ -2235,7 +2220,7 @@ rtx_properties::try_to_add_src (const_rtx x, unsigned int flags)
 	{
 	  has_pre_post_modify = true;
 
-	  unsigned int addr_flags = (base_flags
+	  unsigned int addr_flags = (flags
 				     | rtx_obj_flags::IS_PRE_POST_MODIFY
 				     | rtx_obj_flags::IS_READ);
 	  try_to_add_dest (XEXP (x, 0), addr_flags);
@@ -4260,11 +4245,16 @@ subreg_offset_representable_p (unsigned int xregno, machine_mode xmode,
 
    can be simplified.  Return -1 if the subreg can't be simplified.
 
-   XREGNO is a hard register number.  */
+   XREGNO is a hard register number.  ALLOW_STACK_REGS is true if
+   we should allow subregs of stack_pointer_rtx, frame_pointer_rtx.
+   and arg_pointer_rtx (which are normally expected to be the unique
+   way of referring to their respective registers).  */
+
 
 int
 simplify_subreg_regno (unsigned int xregno, machine_mode xmode,
-		       poly_uint64 offset, machine_mode ymode)
+		       poly_uint64 offset, machine_mode ymode,
+		       bool allow_stack_regs)
 {
   struct subreg_info info;
   unsigned int yregno;
@@ -4275,20 +4265,23 @@ simplify_subreg_regno (unsigned int xregno, machine_mode xmode,
       && !REG_CAN_CHANGE_MODE_P (xregno, xmode, ymode))
     return -1;
 
-  /* We shouldn't simplify stack-related registers.  */
-  if ((!reload_completed || frame_pointer_needed)
-      && xregno == FRAME_POINTER_REGNUM)
-    return -1;
+  if (!allow_stack_regs)
+    {
+      /* We shouldn't simplify stack-related registers.  */
+      if ((!reload_completed || frame_pointer_needed)
+	  && xregno == FRAME_POINTER_REGNUM)
+	return -1;
 
-  if (FRAME_POINTER_REGNUM != ARG_POINTER_REGNUM
-      && xregno == ARG_POINTER_REGNUM)
-    return -1;
+      if (FRAME_POINTER_REGNUM != ARG_POINTER_REGNUM
+	  && xregno == ARG_POINTER_REGNUM)
+	return -1;
 
-  if (xregno == STACK_POINTER_REGNUM
-      /* We should convert hard stack register in LRA if it is
-	 possible.  */
-      && ! lra_in_progress)
-    return -1;
+      if (xregno == STACK_POINTER_REGNUM
+	  /* We should convert hard stack register in LRA if it is
+	     possible.  */
+	  && ! lra_in_progress)
+	return -1;
+    }
 
   /* Try to get the register offset.  */
   subreg_get_info (xregno, xmode, offset, ymode, &info);
@@ -5772,7 +5765,7 @@ pattern_cost (rtx pat, bool speed)
     return 0;
 
   cost = set_src_cost (SET_SRC (set), GET_MODE (SET_DEST (set)), speed);
-  return cost > 0 ? cost : COSTS_N_INSNS (1);
+  return MAX (COSTS_N_INSNS (1), cost);
 }
 
 /* Calculate the cost of a single instruction.  A return value of zero

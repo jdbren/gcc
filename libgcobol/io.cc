@@ -27,12 +27,16 @@
  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
+
+#include "config.h"
+
 #include "io.h"
-#include "stdio.h"
-#include "stdlib.h"
-#include <errno.h>
-#include <stdbool.h>
-#include <stdint.h>
+
+#include <cstdio>
+#include <cstdlib>
+#include <cerrno>
+#include <cstdbool>
+#include <cstdint>
 
 /*
  * The Cobol runtime support is responsible to set the file status

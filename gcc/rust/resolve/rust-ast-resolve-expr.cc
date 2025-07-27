@@ -129,8 +129,8 @@ ResolveExpr::visit (AST::IdentifierExpr &expr)
 	 resolve.  Emit a funny ICE.  We set the finalizer to our custom one,
 	 and use the lower-level emit_diagnostic () instead of the more common
 	 internal_error_no_backtrace () in order to pass our locus.  */
-      diagnostic_text_finalizer (global_dc) = funny_ice_text_finalizer;
-      emit_diagnostic (DK_ICE_NOBT, expr.get_locus (), -1,
+      diagnostics::text_finalizer (global_dc) = funny_ice_text_finalizer;
+      emit_diagnostic (diagnostics::kind::ice_nobt, expr.get_locus (), -1,
 		       "are you trying to break %s? how dare you?",
 		       expr.as_string ().c_str ());
     }
@@ -368,6 +368,17 @@ ResolveExpr::visit (AST::InlineAsm &expr)
 {
   translate_operand (expr, prefix, canonical_prefix);
 }
+
+void
+ResolveExpr::visit (AST::LlvmInlineAsm &expr)
+{
+  for (auto &output : expr.get_outputs ())
+    ResolveExpr::go (*output.expr, prefix, canonical_prefix);
+
+  for (auto &input : expr.get_inputs ())
+    ResolveExpr::go (*input.expr, prefix, canonical_prefix);
+}
+
 void
 ResolveExpr::visit (AST::UnsafeBlockExpr &expr)
 {
@@ -471,7 +482,7 @@ ResolveExpr::visit (AST::BreakExpr &expr)
 {
   if (expr.has_label ())
     {
-      auto label = expr.get_label ().get_lifetime ();
+      auto label = expr.get_label_unchecked ().get_lifetime ();
       if (label.get_lifetime_type () != AST::Lifetime::LifetimeType::NAMED)
 	{
 	  rust_error_at (label.get_locus (),
@@ -486,8 +497,8 @@ ResolveExpr::visit (AST::BreakExpr &expr)
 	    &resolved_node))
 	{
 	  rust_error_at (label.get_locus (), ErrorCode::E0426,
-			 "use of undeclared label %qs in %<break%>",
-			 label.get_lifetime_name ().c_str ());
+			 "use of undeclared label %qs",
+			 label.as_string ().c_str ());
 	  return;
 	}
       resolver->insert_resolved_label (label.get_node_id (), resolved_node);
@@ -594,7 +605,7 @@ ResolveExpr::visit (AST::ContinueExpr &expr)
 {
   if (expr.has_label ())
     {
-      auto label = expr.get_label ();
+      auto label = expr.get_label_unchecked ();
       if (label.get_lifetime_type () != AST::Lifetime::LifetimeType::NAMED)
 	{
 	  rust_error_at (label.get_locus (),
@@ -608,9 +619,9 @@ ResolveExpr::visit (AST::ContinueExpr &expr)
 				    label.get_lifetime_name ()),
 	    &resolved_node))
 	{
-	  rust_error_at (expr.get_label ().get_locus (), ErrorCode::E0426,
-			 "use of undeclared label %qs in %<continue%>",
-			 label.get_lifetime_name ().c_str ());
+	  rust_error_at (expr.get_label_unchecked ().get_locus (),
+			 ErrorCode::E0426, "use of undeclared label %qs",
+			 label.as_string ().c_str ());
 	  return;
 	}
       resolver->insert_resolved_label (label.get_node_id (), resolved_node);

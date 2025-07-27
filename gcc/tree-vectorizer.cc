@@ -724,7 +724,6 @@ vec_info::new_stmt_vec_info (gimple *stmt)
   STMT_VINFO_REDUC_IDX (res) = -1;
   STMT_VINFO_SLP_VECT_ONLY (res) = false;
   STMT_VINFO_SLP_VECT_ONLY_PATTERN (res) = false;
-  STMT_VINFO_VEC_STMTS (res) = vNULL;
   res->reduc_initial_values = vNULL;
   res->reduc_scalar_results = vNULL;
 
@@ -790,8 +789,6 @@ vec_info::free_stmt_vec_info (stmt_vec_info stmt_info)
 
   stmt_info->reduc_initial_values.release ();
   stmt_info->reduc_scalar_results.release ();
-  STMT_VINFO_SIMD_CLONE_INFO (stmt_info).release ();
-  STMT_VINFO_VEC_STMTS (stmt_info).release ();
   free (stmt_info);
 }
 
@@ -1026,10 +1023,19 @@ vect_transform_loops (hash_table<simduid_to_vf> *&simduid_to_vf_htab,
     {
       if (GET_MODE_SIZE (loop_vinfo->vector_mode).is_constant (&bytes))
 	dump_printf_loc (MSG_OPTIMIZED_LOCATIONS, vect_location,
-			 "loop vectorized using %wu byte vectors\n", bytes);
+			 "%sloop vectorized using %s%wu byte vectors and"
+			 " unroll factor %u\n",
+			 LOOP_VINFO_EPILOGUE_P (loop_vinfo)
+			 ? "epilogue " : "",
+			 LOOP_VINFO_USING_PARTIAL_VECTORS_P (loop_vinfo)
+			 ? "masked " : "", bytes,
+			 (unsigned int) LOOP_VINFO_VECT_FACTOR
+						 (loop_vinfo).to_constant ());
       else
 	dump_printf_loc (MSG_OPTIMIZED_LOCATIONS, vect_location,
-			 "loop vectorized using variable length vectors\n");
+			 "%sloop vectorized using variable length vectors\n",
+			 LOOP_VINFO_EPILOGUE_P (loop_vinfo)
+			 ? "epilogue " : "");
     }
 
   loop_p new_loop = vect_transform_loop (loop_vinfo,

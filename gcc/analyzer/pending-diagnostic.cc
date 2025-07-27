@@ -18,18 +18,18 @@ You should have received a copy of the GNU General Public License
 along with GCC; see the file COPYING3.  If not see
 <http://www.gnu.org/licenses/>.  */
 
-#include "config.h"
-#define INCLUDE_VECTOR
-#include "system.h"
-#include "coretypes.h"
-#include "tree.h"
-#include "intl.h"
-#include "diagnostic.h"
-#include "analyzer/analyzer.h"
-#include "diagnostic-event-id.h"
+#include "analyzer/common.h"
+
+#include "diagnostics/event-id.h"
+#include "cpplib.h"
+#include "digraph.h"
+#include "ordered-hash-map.h"
+#include "cfg.h"
+#include "gimple-iterator.h"
+#include "cgraph.h"
+
 #include "analyzer/analyzer-logging.h"
 #include "analyzer/sm.h"
-#include "diagnostic-event-id.h"
 #include "analyzer/sm.h"
 #include "analyzer/pending-diagnostic.h"
 #include "analyzer/diagnostic-manager.h"
@@ -37,20 +37,10 @@ along with GCC; see the file COPYING3.  If not see
 #include "analyzer/program-point.h"
 #include "analyzer/store.h"
 #include "analyzer/region-model.h"
-#include "cpplib.h"
-#include "digraph.h"
-#include "ordered-hash-map.h"
-#include "cfg.h"
-#include "basic-block.h"
-#include "gimple.h"
-#include "gimple-iterator.h"
-#include "cgraph.h"
 #include "analyzer/supergraph.h"
 #include "analyzer/program-state.h"
 #include "analyzer/exploded-graph.h"
-#include "diagnostic-path.h"
 #include "analyzer/checker-path.h"
-#include "make-unique.h"
 
 #if ENABLE_ANALYZER
 
@@ -102,7 +92,7 @@ diagnostic_emission_context::warn (const char *gmsgid, ...)
   auto_diagnostic_group d;
   va_list ap;
   va_start (ap, gmsgid);
-  const bool result = emit_diagnostic_valist_meta (DK_WARNING,
+  const bool result = emit_diagnostic_valist_meta (diagnostics::kind::warning,
 						   &m_rich_loc, &m_metadata,
 						   pd.get_controlling_option (),
 						   gmsgid, &ap);
@@ -120,7 +110,7 @@ diagnostic_emission_context::inform (const char *gmsgid, ...)
   auto_diagnostic_group d;
   va_list ap;
   va_start (ap, gmsgid);
-  emit_diagnostic_valist_meta (DK_NOTE,
+  emit_diagnostic_valist_meta (diagnostics::kind::note,
 			       &m_rich_loc, &m_metadata,
 			       pd.get_controlling_option (),
 			       gmsgid, &ap);
@@ -181,7 +171,7 @@ pending_diagnostic::fixup_location (location_t loc, bool) const
       const line_map_macro *macro_map = linemap_check_macro (map);
       if (fixup_location_in_macro_p (macro_map->macro))
 	loc = linemap_resolve_location (line_table, loc,
-					LRK_MACRO_EXPANSION_POINT, NULL);
+					LRK_MACRO_EXPANSION_POINT, nullptr);
     }
   return loc;
 }
@@ -195,7 +185,10 @@ pending_diagnostic::add_function_entry_event (const exploded_edge &eedge,
 {
   const exploded_node *dst_node = eedge.m_dest;
   const program_point &dst_point = dst_node->get_point ();
-  emission_path->add_event (make_unique<function_entry_event> (dst_point));
+  const program_state &dst_state = dst_node->get_state ();
+  emission_path->add_event
+    (std::make_unique<function_entry_event> (dst_point,
+					     dst_state));
 }
 
 /* Base implementation of pending_diagnostic::add_call_event.
@@ -210,12 +203,12 @@ pending_diagnostic::add_call_event (const exploded_edge &eedge,
   const int src_stack_depth = src_point.get_stack_depth ();
   const gimple *last_stmt = src_point.get_supernode ()->get_last_stmt ();
   emission_path->add_event
-    (make_unique<call_event> (eedge,
-			      event_loc_info (last_stmt
-					      ? last_stmt->location
-					      : UNKNOWN_LOCATION,
-					      src_point.get_fndecl (),
-					      src_stack_depth)));
+    (std::make_unique<call_event> (eedge,
+				   event_loc_info (last_stmt
+						   ? last_stmt->location
+						   : UNKNOWN_LOCATION,
+						   src_point.get_fndecl (),
+						   src_stack_depth)));
 }
 
 /* Base implementation of pending_diagnostic::add_region_creation_events.
@@ -228,12 +221,13 @@ pending_diagnostic::add_region_creation_events (const region *reg,
 						checker_path &emission_path)
 {
   emission_path.add_event
-    (make_unique<region_creation_event_memory_space> (reg->get_memory_space (),
-						      loc_info));
+    (std::make_unique<region_creation_event_memory_space>
+       (reg->get_memory_space (),
+	loc_info));
 
   if (capacity)
     emission_path.add_event
-      (make_unique<region_creation_event_capacity> (capacity, loc_info));
+      (std::make_unique<region_creation_event_capacity> (capacity, loc_info));
 }
 
 /* Base implementation of pending_diagnostic::add_final_event.
@@ -247,10 +241,11 @@ pending_diagnostic::add_final_event (const state_machine *sm,
 				     checker_path *emission_path)
 {
   emission_path->add_event
-    (make_unique<warning_event>
+    (std::make_unique<warning_event>
      (loc_info,
       enode,
-      sm, var, state));
+      sm, var, state,
+      get_final_state ()));
 }
 
 } // namespace ana

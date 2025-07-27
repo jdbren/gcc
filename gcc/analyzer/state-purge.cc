@@ -18,26 +18,21 @@ You should have received a copy of the GNU General Public License
 along with GCC; see the file COPYING3.  If not see
 <http://www.gnu.org/licenses/>.  */
 
-#include "config.h"
-#define INCLUDE_VECTOR
-#include "system.h"
-#include "coretypes.h"
-#include "tree.h"
+#include "analyzer/common.h"
+
 #include "timevar.h"
-#include "tree-ssa-alias.h"
-#include "function.h"
-#include "basic-block.h"
-#include "gimple.h"
-#include "stringpool.h"
+#include "gimple-pretty-print.h"
 #include "tree-vrp.h"
 #include "gimple-ssa.h"
+#include "stringpool.h"
 #include "tree-ssanames.h"
 #include "tree-phinodes.h"
 #include "options.h"
 #include "ssa-iterators.h"
-#include "diagnostic-core.h"
-#include "gimple-pretty-print.h"
-#include "analyzer/analyzer.h"
+#include "gimple-iterator.h"
+#include "gimple-walk.h"
+#include "cgraph.h"
+
 #include "analyzer/call-string.h"
 #include "analyzer/supergraph.h"
 #include "analyzer/program-point.h"
@@ -45,8 +40,6 @@ along with GCC; see the file COPYING3.  If not see
 #include "analyzer/state-purge.h"
 #include "analyzer/store.h"
 #include "analyzer/region-model.h"
-#include "gimple-walk.h"
-#include "cgraph.h"
 
 #if ENABLE_ANALYZER
 
@@ -666,7 +659,7 @@ state_purge_per_ssa_name::process_point (const function_point &point,
 	    if (snode->entry_p ())
 	      {
 		add_to_worklist
-		  (function_point::before_supernode (snode, NULL),
+		  (function_point::before_supernode (snode, nullptr),
 		   worklist, logger);
 	      }
 	  }
@@ -737,7 +730,7 @@ state_purge_per_decl::process_worklists (const state_purge_map &map,
       worklist.safe_push (iter);
 
     region_model model (mgr);
-    model.push_frame (get_function (), NULL, NULL);
+    model.push_frame (get_function (), nullptr, nullptr, nullptr);
 
     /* Process worklist by walking backwards until we reach a stmt
        that fully overwrites the decl.  */
@@ -848,8 +841,8 @@ fully_overwrites_p (const gimple *stmt, tree decl,
 	 We can't just check for equality; consider the case of
 	 "s.field = EXPR;" where the stmt writes to the only field
 	 of "s", and there's no padding.  */
-      const region *lhs_reg = model.get_lvalue (lhs, NULL);
-      const region *decl_reg = model.get_lvalue (decl, NULL);
+      const region *lhs_reg = model.get_lvalue (lhs, nullptr);
+      const region *decl_reg = model.get_lvalue (decl, nullptr);
       if (same_binding_p (lhs_reg, decl_reg,
 			  model.get_manager ()->get_store_manager ()))
 	return true;
@@ -1081,7 +1074,7 @@ state_purge_annotator::add_node_annotations (graphviz_out *gv,
 					     const supernode &n,
 					     bool within_table) const
 {
-  if (m_map == NULL)
+  if (m_map == nullptr)
     return false;
 
   if (within_table)
@@ -1098,7 +1091,7 @@ state_purge_annotator::add_node_annotations (graphviz_out *gv,
       Determine which points to dump.  */
    auto_vec<function_point> points;
    if (n.entry_p () || n.m_returning_call)
-     points.safe_push (function_point::before_supernode (&n, NULL));
+     points.safe_push (function_point::before_supernode (&n, nullptr));
    else
      for (auto inedge : n.m_preds)
        points.safe_push (function_point::before_supernode (&n, inedge));
@@ -1160,7 +1153,7 @@ state_purge_annotator::add_stmt_annotations (graphviz_out *gv,
   if (within_row)
     return;
 
-  if (m_map == NULL)
+  if (m_map == nullptr)
     return;
 
   if (stmt->code == GIMPLE_PHI)

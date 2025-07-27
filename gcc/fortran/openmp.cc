@@ -1588,7 +1588,7 @@ gfc_match_omp_clause_reduction (char pc, gfc_omp_clauses *c, bool openacc,
 	  {
 	    gfc_omp_namelist *p = gfc_get_omp_namelist (), **tl;
 	    p->sym = n->sym;
-	    p->where = p->where;
+	    p->where = n->where;
 	    p->u.map.op = OMP_MAP_ALWAYS_TOFROM;
 
 	    tl = &c->lists[OMP_LIST_MAP];
@@ -2138,10 +2138,8 @@ gfc_match_omp_prefer_type (char **type_str, int *type_str_len)
    the 'interop' directive and the 'append_args' directive of 'declare variant'.
      [prefer_type(...)][,][<target|targetsync>, ...])
 
-   If is_init_clause, there might be no modifiers but variables like 'target';
-   additionally, the modifier parsing ends with a ':'.
-   If not is_init_clause (i.e. append_args), there must be modifiers and the
-   parsing ends with ')'.  */
+   If is_init_clause, the modifier parsing ends with a ':'.
+   If not is_init_clause (i.e. append_args), the parsing ends with ')'.  */
 
 static match
 gfc_parser_omp_clause_init_modifiers (bool &target, bool &targetsync,
@@ -2153,9 +2151,10 @@ gfc_parser_omp_clause_init_modifiers (bool &target, bool &targetsync,
   *type_str = NULL;
   type_str_len = 0;
   match m;
-  locus old_loc = gfc_current_locus;
-  do {
-       if (gfc_match ("prefer_type ( ") == MATCH_YES)
+
+  do
+    {
+      if (gfc_match ("prefer_type ( ") == MATCH_YES)
 	{
 	  if (*type_str)
 	    {
@@ -2181,12 +2180,17 @@ gfc_parser_omp_clause_init_modifiers (bool &target, bool &targetsync,
 	    }
 	  return MATCH_ERROR;
 	}
-       if (gfc_match ("targetsync ") == MATCH_YES)
+
+      if (gfc_match ("prefer_type ") == MATCH_YES)
+	{
+	  gfc_error ("Expected %<(%> after %<prefer_type%> at %C");
+	  return MATCH_ERROR;
+	}
+
+      if (gfc_match ("targetsync ") == MATCH_YES)
 	{
 	  if (targetsync)
 	    {
-	      /* Avoid the word 'modifier' as it could be also be no clauses and
-		 twice a variable named 'targetsync', which is also invalid.  */
 	      gfc_error ("Duplicate %<targetsync%> at %C");
 	      return MATCH_ERROR;
 	    }
@@ -2202,13 +2206,6 @@ gfc_parser_omp_clause_init_modifiers (bool &target, bool &targetsync,
 	    }
 	  if (gfc_match (": ") == MATCH_YES)
 	    break;
-	  gfc_char_t c = gfc_peek_char ();
-	  if (!*type_str && (c == ')' || (gfc_current_form != FORM_FREE
-					  && (c == '_' || ISALPHA (c)))))
-	    {
-	      gfc_current_locus = old_loc;
-	      break;
-	    }
 	  gfc_error ("Expected %<,%> or %<:%> at %C");
 	  return MATCH_ERROR;
 	}
@@ -2231,25 +2228,21 @@ gfc_parser_omp_clause_init_modifiers (bool &target, bool &targetsync,
 	    }
 	  if (gfc_match (": ") == MATCH_YES)
 	    break;
-	  gfc_char_t c = gfc_peek_char ();
-	  if (!*type_str && (c == ')' || (gfc_current_form != FORM_FREE
-					  && (c == '_' || ISALPHA (c)))))
-	    {
-	      gfc_current_locus = old_loc;
-	      break;
-	    }
 	  gfc_error ("Expected %<,%> or %<:%> at %C");
 	  return MATCH_ERROR;
 	}
-      if (*type_str)
-	{
-	  gfc_error ("Expected %<target%> or %<targetsync%> at %C");
-	  return MATCH_ERROR;
-	}
-      gfc_current_locus = old_loc;
-      break;
+      gfc_error ("Expected %<prefer_type%>, %<target%>, or %<targetsync%> "
+		 "at %C");
+      return MATCH_ERROR;
     }
   while (true);
+
+  if (!target && !targetsync)
+    {
+      gfc_error ("Missing required %<target%> and/or %<targetsync%> "
+		 "modifier at %C");
+      return MATCH_ERROR;
+    }
   return MATCH_YES;
 }
 
@@ -2266,17 +2259,17 @@ gfc_match_omp_init (gfc_omp_namelist **list)
 					    type_str_len, true) == MATCH_ERROR)
     return MATCH_ERROR;
 
- gfc_omp_namelist **head = NULL;
- if (gfc_match_omp_variable_list ("", list, false, NULL, &head) != MATCH_YES)
-   return MATCH_ERROR;
- for (gfc_omp_namelist *n = *head; n; n = n->next)
-   {
-     n->u.init.target = target;
-     n->u.init.targetsync = targetsync;
-     n->u.init.len = type_str_len;
-     n->u2.init_interop = type_str;
-   }
- return MATCH_YES;
+  gfc_omp_namelist **head = NULL;
+  if (gfc_match_omp_variable_list ("", list, false, NULL, &head) != MATCH_YES)
+    return MATCH_ERROR;
+  for (gfc_omp_namelist *n = *head; n; n = n->next)
+    {
+      n->u.init.target = target;
+      n->u.init.targetsync = targetsync;
+      n->u.init.len = type_str_len;
+      n->u2.init_interop = type_str;
+    }
+  return MATCH_YES;
 }
 
 
@@ -4481,7 +4474,7 @@ error:
    | OMP_CLAUSE_COPYOUT | OMP_CLAUSE_DELETE | OMP_CLAUSE_FINALIZE	      \
    | OMP_CLAUSE_DETACH)
 #define OACC_WAIT_CLAUSES \
-  omp_mask (OMP_CLAUSE_ASYNC)
+  omp_mask (OMP_CLAUSE_ASYNC) | OMP_CLAUSE_IF
 #define OACC_ROUTINE_CLAUSES \
   (omp_mask (OMP_CLAUSE_GANG) | OMP_CLAUSE_WORKER | OMP_CLAUSE_VECTOR	      \
    | OMP_CLAUSE_SEQ							      \
@@ -8902,15 +8895,21 @@ resolve_omp_clauses (gfc_code *code, gfc_omp_clauses *omp_clauses,
 	if (list == OMP_LIST_MAP
 	    && n->sym->attr.flavor == FL_PARAMETER)
 	  {
+	    /* OpenACC since 3.4 permits for Fortran named constants, but
+	       permits removing then as optimization is not needed and such
+	       ignore them. Likewise below for FIRSTPRIVATE.  */
 	    if (openacc)
-	      gfc_error ("Object %qs is not a variable at %L; parameters"
-			 " cannot be and need not be copied", n->sym->name,
-			 &n->where);
+	      gfc_warning (OPT_Wsurprising, "Clause for object %qs at %L is "
+			   "ignored as parameters need not be copied",
+			   n->sym->name, &n->where);
 	    else
 	      gfc_error ("Object %qs is not a variable at %L; parameters"
 			 " cannot be and need not be mapped", n->sym->name,
 			 &n->where);
 	  }
+	else if (openacc && n->sym->attr.flavor == FL_PARAMETER)
+	  gfc_warning (OPT_Wsurprising, "Clause for object %qs at %L is ignored"
+		       " as it is a parameter", n->sym->name, &n->where);
 	else if (list != OMP_LIST_USES_ALLOCATORS)
 	  gfc_error ("Object %qs is not a variable at %L", n->sym->name,
 		     &n->where);
@@ -9688,22 +9687,6 @@ resolve_omp_clauses (gfc_code *code, gfc_omp_clauses *omp_clauses,
 			 && n->sym->as->type == AS_ASSUMED_SIZE)
 		  gfc_error ("Assumed size array %qs in %s clause at %L",
 			     n->sym->name, name, &n->where);
-		if (!openacc
-		    && list == OMP_LIST_MAP
-		    && n->sym->ts.type == BT_DERIVED
-		    && n->sym->ts.u.derived->attr.alloc_comp)
-		  gfc_error ("List item %qs with allocatable components is not "
-			     "permitted in map clause at %L", n->sym->name,
-			     &n->where);
-		if (!openacc
-		    && (list == OMP_LIST_MAP
-			|| list == OMP_LIST_FROM
-			|| list == OMP_LIST_TO)
-		    && ((n->expr && n->expr->ts.type == BT_CLASS)
-			|| (!n->expr && n->sym->ts.type == BT_CLASS)))
-		  gfc_warning (OPT_Wopenmp,
-			       "Mapping polymorphic list item at %L is "
-			       "unspecified behavior", &n->where);
 		if (list == OMP_LIST_MAP && !openacc)
 		  switch (code->op)
 		    {
@@ -10015,9 +9998,11 @@ resolve_omp_clauses (gfc_code *code, gfc_omp_clauses *omp_clauses,
 			     n->sym->name, name, &n->where);
 
 		if (!openacc
-		    && list == OMP_LIST_FIRSTPRIVATE
-		    && ((n->expr && n->expr->ts.type == BT_CLASS)
-			|| (!n->expr && n->sym->ts.type == BT_CLASS)))
+		    && (list == OMP_LIST_PRIVATE
+			|| list == OMP_LIST_FIRSTPRIVATE)
+		    && ((n->sym->ts.type == BT_DERIVED
+			 && n->sym->ts.u.derived->attr.alloc_comp)
+			|| n->sym->ts.type == BT_CLASS))
 		  switch (code->op)
 		    {
 		    case EXEC_OMP_TARGET:
@@ -10032,9 +10017,19 @@ resolve_omp_clauses (gfc_code *code, gfc_omp_clauses *omp_clauses,
 		    case EXEC_OMP_TARGET_TEAMS_DISTRIBUTE_PARALLEL_DO_SIMD:
 		    case EXEC_OMP_TARGET_TEAMS_DISTRIBUTE_SIMD:
 		    case EXEC_OMP_TARGET_TEAMS_LOOP:
-		      gfc_warning (OPT_Wopenmp,
-				   "FIRSTPRIVATE with polymorphic list item at "
-				   "%L is unspecified behavior", &n->where);
+		      if (n->sym->ts.type == BT_DERIVED
+			  && n->sym->ts.u.derived->attr.alloc_comp)
+			gfc_error ("Sorry, list item %qs at %L with allocatable"
+				   " components is not yet supported in %s "
+				   "clause", n->sym->name, &n->where,
+				   list == OMP_LIST_PRIVATE ? "PRIVATE"
+							    : "FIRSTPRIVATE");
+		      else
+			gfc_error ("Polymorphic list item %qs at %L in %s "
+				   "clause has unspecified behavior and "
+				   "unsupported", n->sym->name, &n->where,
+				   list == OMP_LIST_PRIVATE ? "PRIVATE"
+							    : "FIRSTPRIVATE");
 		      break;
 		    default:
 		      break;
@@ -12767,9 +12762,21 @@ gfc_resolve_oacc_declare (gfc_namespace *ns)
 		&& (n->sym->attr.flavor != FL_PROCEDURE
 		    || n->sym->result != n->sym))
 	      {
-		gfc_error ("Object %qs is not a variable at %L",
-			   n->sym->name, &oc->loc);
-		continue;
+		if (n->sym->attr.flavor != FL_PARAMETER)
+		  {
+		    gfc_error ("Object %qs is not a variable at %L",
+			       n->sym->name, &oc->loc);
+		    continue;
+		  }
+		/* Note that OpenACC 3.4 permits name constants, but the
+		   implementation is permitted to ignore the clause;
+		   as semantically, device_resident kind of makes sense
+		   (and the wording with it is a bit odd), the warning
+		   is suppressed.  */
+		if (list != OMP_LIST_DEVICE_RESIDENT)
+		  gfc_warning (OPT_Wsurprising, "Object %qs at %L is ignored as"
+			       " parameters need not be copied", n->sym->name,
+			       &oc->loc);
 	      }
 
 	    if (n->expr && n->expr->ref->type == REF_ARRAY)

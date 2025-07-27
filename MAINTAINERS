@@ -57,7 +57,7 @@ docs, and the testsuite related to that.
 aarch64 ldp/stp         Alex Coplan             <alex.coplan@arm.com>
 aarch64 port            Richard Earnshaw        <richard.earnshaw@arm.com>
 aarch64 port            Richard Sandiford       <richard.sandiford@arm.com>
-aarch64 port            Marcus Shawcroft        <marcus.shawcroft@arm.com>
+aarch64 port            Tamar Christina         <tamar.christina@arm.com>
 aarch64 port            Kyrylo Tkachov          <ktkachov@nvidia.com>
 alpha port              Richard Henderson       <rth@gcc.gnu.org>
 amdgcn port             Julian Brown            <julian@codesourcery.com>
@@ -275,11 +275,14 @@ check in changes outside of the parts of the compiler they maintain.
 
                         Reviewers
 
+aarch64 port            Alex Coplan             <alex.coplan@arm.com>
+aarch64 port            Andrew Pinski           <pinskia@gmail.com>
 arm port (MVE)          Christophe Lyon         <christophe.lyon@arm.com>
 callgraph               Martin Jambor           <mjambor@suse.cz>
 C front end             Marek Polacek           <polacek@redhat.com>
 CTF, BTF                Indu Bhagat             <indu.bhagat@oracle.com>
 CTF, BTF, bpf port      David Faust             <david.faust@oracle.com>
+c++                     Patrick Palka           <ppalka@gcc.gnu.org>
 dataflow                Paolo Bonzini           <bonzini@gnu.org>
 dataflow                Seongbae Park           <seongbae.park@gmail.com>
 dataflow                Kenneth Zadeck          <zadeck@naturalbridge.com>
@@ -309,7 +312,7 @@ loop optimizer          Zdenek Dvorak           <ook@ucw.cz>
 LTO                     Richard Biener          <rguenther@suse.de>
 LTO plugin              Cary Coutant            <ccoutant@gmail.com>
 Plugin                  Le-Chun Wu              <lcwu@google.com>
-register allocation     Peter Bergner           <bergner@linux.ibm.com>
+register allocation     Peter Bergner           <bergner@tenstorrent.com>
 register allocation     Kenneth Zadeck          <zadeck@naturalbridge.com>
 register allocation     Seongbae Park           <seongbae.park@gmail.com>
 riscv port              Robin Dapp              <rdapp.gcc@gmail.com>
@@ -330,6 +333,7 @@ from other maintainers or reviewers.
 Name                            BZ account      Email
 
 Soumya AR                       soumyaa         <soumyaa@nvidia.com>
+Spencer Abson                   sabson          <spencer.abson@arm.com>
 Mark G. Adams                   mgadams         <mark.g.adams@sympatico.ca>
 Ajit Kumar Agarwal              aagarwa         <aagarwa1@linux.ibm.com>
 Pedro Alves                     palves          <palves@redhat.com>
@@ -358,7 +362,7 @@ Serge Belyshev                  -               <belyshev@depni.sinp.msu.ru>
 Jon Beniston                    jbeniston       <jon@beniston.com>
 Andrew Bennett                  -               <andrew.bennett@imgtec.com>
 Andrew Benson                   abensonca       <abensonca@gmail.com>
-Peter Bergner                   bergner         <bergner@linux.ibm.com>
+Peter Bergner                   bergner         <bergner@tenstorrent.com>
 Daniel Berlin                   dberlin         <dberlin@dberlin.org>
 Pat Bernardi                    -               <bernardi@adacore.com>
 Jan Beulich                     -               <jbeulich@suse.com>
@@ -396,12 +400,13 @@ Tobias Burnus                   burnus          <tburnus@baylibre.com>
 Adam Butcher                    abutcher        <adam@jessamine.co.uk>
 Andrew Cagney                   cagney          <cagney@gnu.org>
 Paolo Carlini                   paolo           <paolo.carlini@oracle.com>
-Andrew Carlotti                 acarlotti       <andrew.carlotti@arm.com>
+Alice Carlotti                  acarlotti       <alice.carlotti@arm.com>
 Daniel Carrera                  dcarrera        <dcarrera@gmail.com>
 Stephane Carrez                 ciceron         <stcarrez@nerim.fr>
 Gabriel Charette                gchare          <gchare@google.com>
 Arnaud Charlet                  charlet         <charlet@adacore.com>
 Chandra Chavva                  -               <cchavva@redhat.com>
+Dhruv Chawla                    dhruvc          <dhruvc@nvidia.com>
 Dehao Chen                      dehao           <dehao@google.com>
 Fabien Chêne                    fabien          <fabien@gcc.gnu.org>
 Bin Cheng                       amker           <bin.cheng@linux.alibaba.com>
@@ -717,6 +722,7 @@ Maxim Ostapenko                 chefmax         <m.ostapenko@samsung.com>
 Jeevitha Palanisamy             jeevitha        <jeevitha@linux.ibm.com>
 Patrick Palka                   ppalka          <ppalka@gcc.gnu.org>
 Seongbae Park                   spark           <seongbae.park@gmail.com>
+Kishan Parmar                   kishan          <kishan@linux.ibm.com>
 Srinath Parvathaneni            sripar01        <srinath.parvathaneni@arm.com>
 Devang Patel                    dpatel          <dpatel@apple.com>
 Andris Pavenis                  andris          <andris.pavenis@iki.fi>
@@ -792,7 +798,6 @@ Senthil Kumar Selvaraj          saaadhu         <saaadhu@gcc.gnu.org>
 Kostya Serebryany               kcc             <kcc@google.com>
 Thiemo Seufer                   -               <ths@networkno.de>
 Bill Seurer                     seurer          <seurer@linux.vnet.ibm.com>
-Marcus Shawcroft                mshawcroft      <marcus.shawcroft@arm.com>
 Nathaniel Shead                 nshead          <nathanieloshead@gmail.com>
 Tim Shen                        timshen         <timshen@google.com>
 Joel Sherrill                   joel            <joel@oarcorp.com>
@@ -862,6 +867,7 @@ Ville Voutilainen               ville           <ville.voutilainen@gmail.com>
 Tom de Vries                    vries           <tdevries@suse.de>
 Nenad Vukicevic                 nenadv          <nenad@intrepid.com>
 Dmitry Vyukov                   dvyukov         <dvyukov@google.com>
+Waffl3x                         waffl3x         <waffl3x@baylibre.com>
 Jonathan Wakely                 redi            <jwakely@redhat.com>
 Krister Walfridsson             kristerw        <krister.walfridsson@gmail.com>
 Feng Wang                       -               <wangfeng@eswincomputing.com>
@@ -896,7 +902,7 @@ Canqun Yang                     canqun          <canqun@nudt.edu.cn>
 Fei Yang                        fyang           <felix.yang@huawei.com>
 Jeffrey Yasskin                 jyasskin        <jyasskin@google.com>
 Joey Ye                         jye2            <joey.ye@arm.com>
-Kwok Cheung Yeung               -               <kcyeung@baylibre.com>
+Kwok Cheung Yeung               kcy             <kcyeung@baylibre.com>
 Jonathan Yong                   jyong           <10walls@gmail.com>
 Greta Yorsh                     gretay          <greta.yorsh@arm.com>
 Kirill Yukhin                   kyukhin         <kirill.yukhin@gmail.com>
@@ -932,6 +938,8 @@ information.
 
 
 Soumya AR                                       <soumyaa@nvidia.com>
+Peter Bergner                                   <bergner@tenstorrent.com>
+Dhruv Chawla                                    <dhruvc@nvidia.com>
 Juergen Christ                                  <jchrist@linux.ibm.com>
 Giuseppe D'Angelo                               <giuseppe.dangelo@kdab.com>
 Robin Dapp                                      <rdapp.gcc@gmail.com>

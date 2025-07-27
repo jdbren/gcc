@@ -25,10 +25,10 @@ namespace ana {
 
 class constraint_manager;
 
-enum bound_kind
+enum class bound_kind
 {
-  BK_LOWER,
-  BK_UPPER
+  lower,
+  upper
 };
 
 /* One of the end-points of a range.  */
@@ -226,8 +226,8 @@ private:
     {
       return k->get_hash ();
     }
-    static inline bool is_empty (key_type k) { return k == NULL; }
-    static inline void mark_empty (key_type &k) { k = NULL; }
+    static inline bool is_empty (key_type k) { return k == nullptr; }
+    static inline void mark_empty (key_type &k) { k = nullptr; }
     static inline bool is_deleted (key_type k)
     {
       return k == reinterpret_cast<key_type> (1);

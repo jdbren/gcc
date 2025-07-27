@@ -538,7 +538,7 @@ emit_insn_at_entry (rtx insn)
    The insn chain range is inclusive
    (i.e. both BEGIN and END will be updated. */
 
-static void
+void
 update_bb_for_insn_chain (rtx_insn *begin, rtx_insn *end, basic_block bb)
 {
   rtx_insn *insn;
@@ -1982,8 +1982,7 @@ insert_insn_on_edge (rtx pattern, edge e)
 
   emit_insn (pattern);
 
-  e->insns.r = get_insns ();
-  end_sequence ();
+  e->insns.r = end_sequence ();
 }
 
 /* Like insert_insn_on_edge, but if there are already queued instructions
@@ -2001,8 +2000,7 @@ prepend_insn_to_edge (rtx pattern, edge e)
   emit_insn (pattern);
   emit_insn (e->insns.r);
 
-  e->insns.r = get_insns ();
-  end_sequence ();
+  e->insns.r = end_sequence ();
 }
 
 /* Update the CFG for the instructions queued on edge E.  */
@@ -3213,6 +3211,16 @@ purge_dead_edges (basic_block bb)
 	      && ! may_trap_p (XEXP (eqnote, 0))))
 	remove_note (insn, note);
     }
+  /* A tail call cannot trap either.  The tailc/musttail pass could have
+     allowed a tail call if it could throw internally, but perform no
+     actual statements and then caused the exception to be thrown externally
+     in the hope that it is cleaned up later.  If it is not, just
+     remove REG_EH_REGION note.  While the call maybe can throw, the
+     current function's frame will not be there anymore when it does.  */
+   if (CALL_P (insn)
+       && SIBLING_CALL_P (insn)
+       && (note = find_reg_note (insn, REG_EH_REGION, NULL)))
+     remove_note (insn, note);
 
   /* Cleanup abnormal edges caused by exceptions or non-local gotos.  */
   for (ei = ei_start (bb->succs); (e = ei_safe_edge (ei)); )
@@ -5268,8 +5276,7 @@ rtl_lv_add_condition_to_bb (basic_block first_head ,
   jump = get_last_insn ();
   JUMP_LABEL (jump) = label;
   LABEL_NUSES (label)++;
-  seq = get_insns ();
-  end_sequence ();
+  seq = end_sequence ();
 
   /* Add the new cond, in the new head.  */
   emit_insn_after (seq, BB_END (cond_bb));

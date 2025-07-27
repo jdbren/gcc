@@ -54,7 +54,6 @@ along with GCC; see the file COPYING3.  If not see
 #include "dbgcnt.h"
 #include "tree-ssa-propagate.h"
 #include "tree-ssa-dce.h"
-#include "calls.h"
 #include "tree-ssa-loop-niter.h"
 
 /* Return the singleton PHI in the SEQ of PHIs for edges E0 and E1. */
@@ -403,12 +402,15 @@ factor_out_conditional_operation (edge e0, edge e1, basic_block merge,
       if (dominated_by_p (CDI_DOMINATORS, gimple_bb (phi), gimple_bb (arg0_def_stmt)))
 	return false;
 
-      /* Only handle if arg1 is a INTEGER_CST and one that fits
-	 into the new type or if it is the same precision.  */
+      /* If arg1 is an INTEGER_CST, fold it to new type if it fits, or else
+	 if the bits will not be modified during the conversion, except for
+	 boolean types whose precision is not 1 (see int_fits_type_p).  */
       if (!INTEGRAL_TYPE_P (TREE_TYPE (new_arg0))
 	  || !(int_fits_type_p (arg1, TREE_TYPE (new_arg0))
 	       || (TYPE_PRECISION (TREE_TYPE (new_arg0))
-		   == TYPE_PRECISION (TREE_TYPE (arg1)))))
+		   == TYPE_PRECISION (TREE_TYPE (arg1))
+		   && (TREE_CODE (TREE_TYPE (new_arg0)) != BOOLEAN_TYPE
+		       || TYPE_PRECISION (TREE_TYPE (new_arg0)) == 1))))
 	return false;
 
       /* For the INTEGER_CST case, we are just moving the
@@ -547,8 +549,7 @@ phiopt_early_allow (gimple_seq &seq, gimple_match_op &op)
   tree_code code = (tree_code)op.code;
 
   /* For non-empty sequence, only allow one statement
-     except for MIN/MAX, allow max 2 statements,
-     each with MIN/MAX.  */
+     a MIN/MAX and an original MIN/MAX.  */
   if (!gimple_seq_empty_p (seq))
     {
       if (code == MIN_EXPR || code == MAX_EXPR)
@@ -563,18 +564,7 @@ phiopt_early_allow (gimple_seq &seq, gimple_match_op &op)
 	  code = gimple_assign_rhs_code (stmt);
 	  return code == MIN_EXPR || code == MAX_EXPR;
 	}
-      /* Check to make sure op was already a SSA_NAME.  */
-      if (code != SSA_NAME)
-	return false;
-      if (!gimple_seq_singleton_p (seq))
-	return false;
-      gimple *stmt = gimple_seq_first_stmt (seq);
-      /* Only allow assignments.  */
-      if (!is_gimple_assign (stmt))
-	return false;
-      if (gimple_assign_lhs (stmt) != op.ops[0])
-	return false;
-      code = gimple_assign_rhs_code (stmt);
+      return false;
     }
 
   switch (code)
@@ -848,33 +838,13 @@ move_stmt (gimple *stmt, gimple_stmt_iterator *gsi, auto_bitmap &inserted_exprs)
   // Mark the name to be renamed if there is one.
   bitmap_set_bit (inserted_exprs, SSA_NAME_VERSION (name));
   gimple_stmt_iterator gsi1 = gsi_for_stmt (stmt);
-  gsi_move_before (&gsi1, gsi);
+  gsi_move_before (&gsi1, gsi, GSI_NEW_STMT);
   reset_flow_sensitive_info (name);
 
   /* Rewrite some code which might be undefined when
      unconditionalized. */
-  if (gimple_assign_single_p (stmt))
-    {
-      tree rhs = gimple_assign_rhs1 (stmt);
-      /* VCE from integral types to another integral types but with
-	 different precisions need to be changed into casts
-	 to be well defined when unconditional. */
-      if (gimple_assign_rhs_code (stmt) == VIEW_CONVERT_EXPR
-	  && INTEGRAL_TYPE_P (TREE_TYPE (name))
-	  && INTEGRAL_TYPE_P (TREE_TYPE (TREE_OPERAND (rhs, 0))))
-	{
-	  if (dump_file && (dump_flags & TDF_DETAILS))
-	    {
-	      fprintf (dump_file, "rewriting stmt with maybe undefined VCE ");
-	      print_gimple_stmt (dump_file, stmt, 0, TDF_SLIM);
-	    }
-	  tree new_rhs = TREE_OPERAND (rhs, 0);
-	  gcc_assert (is_gimple_val (new_rhs));
-	  gimple_assign_set_rhs_code (stmt, NOP_EXPR);
-	  gimple_assign_set_rhs1 (stmt, new_rhs);
-	  update_stmt (stmt);
-	}
-    }
+  if (gimple_needing_rewrite_undefined (stmt))
+    rewrite_to_defined_unconditional (gsi);
 }
 
 /* RAII style class to temporarily remove flow sensitive
@@ -1031,16 +1001,9 @@ match_simplify_replacement (basic_block cond_bb, basic_block middle_bb,
   if (seq)
     {
       // Mark the lhs of the new statements maybe for dce
-      gimple_stmt_iterator gsi1 = gsi_start (seq);
-      for (; !gsi_end_p (gsi1); gsi_next (&gsi1))
-	{
-	  gimple *stmt = gsi_stmt (gsi1);
-	  tree name = gimple_get_lhs (stmt);
-	  if (name && TREE_CODE (name) == SSA_NAME)
-	    bitmap_set_bit (exprs_maybe_dce, SSA_NAME_VERSION (name));
-	}
-    gsi_insert_seq_before (&gsi, seq, GSI_CONTINUE_LINKING);
-  }
+      mark_lhs_in_seq_for_dce (exprs_maybe_dce, seq);
+      gsi_insert_seq_before (&gsi, seq, GSI_CONTINUE_LINKING);
+    }
 
   /* If there was a statement to move, move it to right before
      the original conditional.  */
@@ -3556,8 +3519,15 @@ cond_store_replacement (basic_block middle_bb, basic_block join_bb,
       /* If LHS is an access to a local variable without address-taken
 	 (or when we allow data races) and known not to trap, we could
 	 always safely move down the store.  */
+      tree base;
       if (ref_can_have_store_data_races (lhs)
-	  || tree_could_trap_p (lhs))
+	  || tree_could_trap_p (lhs)
+	  /* tree_could_trap_p is a predicate for rvalues, so check
+	     for readonly memory explicitly.  */
+	  || ((base = get_base_address (lhs))
+	      && ((DECL_P (base)
+		   && TREE_READONLY (base))
+		  || TREE_CODE (base) == STRING_CST)))
 	return false;
     }
 
@@ -3635,7 +3605,8 @@ cond_store_replacement (basic_block middle_bb, basic_block join_bb,
 static bool
 cond_if_else_store_replacement_1 (basic_block then_bb, basic_block else_bb,
 				  basic_block join_bb, gimple *then_assign,
-				  gimple *else_assign)
+				  gimple *else_assign,
+				  gphi *vphi)
 {
   tree lhs_base, lhs, then_rhs, else_rhs, name;
   location_t then_locus, else_locus;
@@ -3702,6 +3673,14 @@ cond_if_else_store_replacement_1 (basic_block then_bb, basic_block else_bb,
   add_phi_arg (newphi, else_rhs, EDGE_SUCC (else_bb, 0), else_locus);
 
   new_stmt = gimple_build_assign (lhs, gimple_phi_result (newphi));
+  /* Update the vdef for the new store statement. */
+  tree newvphilhs = make_ssa_name (gimple_vop (cfun));
+  tree vdef = gimple_phi_result (vphi);
+  gimple_set_vuse (new_stmt, newvphilhs);
+  gimple_set_vdef (new_stmt, vdef);
+  gimple_phi_set_result (vphi, newvphilhs);
+  SSA_NAME_DEF_STMT (vdef) = new_stmt;
+  update_stmt (vphi);
   if (dump_file && (dump_flags & TDF_DETAILS))
     {
       fprintf(dump_file, "to use phi:\n");
@@ -3729,10 +3708,11 @@ cond_if_else_store_replacement_1 (basic_block then_bb, basic_block else_bb,
 }
 
 /* Return the single store in BB with VDEF or NULL if there are
-   other stores in the BB or loads following the store.  */
+   other stores in the BB or loads following the store. VPHI is
+   where the only use of the vdef should be.  */
 
 static gimple *
-single_trailing_store_in_bb (basic_block bb, tree vdef)
+single_trailing_store_in_bb (basic_block bb, tree vdef, gphi *vphi)
 {
   if (SSA_NAME_IS_DEFAULT_DEF (vdef))
     return NULL;
@@ -3747,15 +3727,60 @@ single_trailing_store_in_bb (basic_block bb, tree vdef)
       && gimple_code (SSA_NAME_DEF_STMT (gimple_vuse (store))) != GIMPLE_PHI)
     return NULL;
 
-  /* Verify there is no load or store after the store.  */
+  /* Verify there is no load or store after the store, the vdef of the store
+     should only be used by the vphi joining the 2 bbs.  */
   use_operand_p use_p;
-  imm_use_iterator imm_iter;
-  FOR_EACH_IMM_USE_FAST (use_p, imm_iter, gimple_vdef (store))
-    if (USE_STMT (use_p) != store
-	&& gimple_bb (USE_STMT (use_p)) == bb)
-      return NULL;
+  gimple *use_stmt;
+  if (!single_imm_use (gimple_vdef (store), &use_p, &use_stmt))
+    return NULL;
+  if (use_stmt != vphi)
+    return NULL;
 
   return store;
+}
+
+/* Limited Conditional store replacement.  We already know
+   that the recognized pattern looks like so:
+
+   split:
+     if (cond) goto THEN_BB; else goto ELSE_BB (edge E1)
+   THEN_BB:
+     ...
+     ONLY_STORE = Y;
+     ...
+     goto JOIN_BB;
+   ELSE_BB:
+     ...
+     ONLY_STORE = Z;
+     ...
+     fallthrough (edge E0)
+   JOIN_BB:
+     some more
+
+   Handles only the case with single store in THEN_BB and ELSE_BB.  That is
+   cheap enough due to in phiopt and not worry about heurstics.  Moving the store
+   out might provide an opportunity for a phiopt to happen.  */
+
+static bool
+cond_if_else_store_replacement_limited (basic_block then_bb, basic_block else_bb,
+					basic_block join_bb)
+{
+  gphi *vphi = get_virtual_phi (join_bb);
+  if (!vphi)
+    return false;
+
+  tree then_vdef = PHI_ARG_DEF_FROM_EDGE (vphi, single_succ_edge (then_bb));
+  gimple *then_assign = single_trailing_store_in_bb (then_bb, then_vdef, vphi);
+  if (!then_assign)
+    return false;
+
+  tree else_vdef = PHI_ARG_DEF_FROM_EDGE (vphi, single_succ_edge (else_bb));
+  gimple *else_assign = single_trailing_store_in_bb (else_bb, else_vdef, vphi);
+  if (!else_assign)
+    return false;
+
+  return cond_if_else_store_replacement_1 (then_bb, else_bb, join_bb,
+					   then_assign, else_assign, vphi);
 }
 
 /* Conditional store replacement.  We already know
@@ -3794,25 +3819,20 @@ cond_if_else_store_replacement (basic_block then_bb, basic_block else_bb,
   /* Handle the case with single store in THEN_BB and ELSE_BB.  That is
      cheap enough to always handle as it allows us to elide dependence
      checking.  */
-  gphi *vphi = NULL;
-  for (gphi_iterator si = gsi_start_phis (join_bb); !gsi_end_p (si);
-       gsi_next (&si))
-    if (virtual_operand_p (gimple_phi_result (si.phi ())))
-      {
-	vphi = si.phi ();
-	break;
-      }
+  gphi *vphi = get_virtual_phi (join_bb);
   if (!vphi)
     return false;
   tree then_vdef = PHI_ARG_DEF_FROM_EDGE (vphi, single_succ_edge (then_bb));
-  tree else_vdef = PHI_ARG_DEF_FROM_EDGE (vphi, single_succ_edge (else_bb));
-  gimple *then_assign = single_trailing_store_in_bb (then_bb, then_vdef);
+  gimple *then_assign = single_trailing_store_in_bb (then_bb, then_vdef, vphi);
   if (then_assign)
     {
-      gimple *else_assign = single_trailing_store_in_bb (else_bb, else_vdef);
+      tree else_vdef = PHI_ARG_DEF_FROM_EDGE (vphi, single_succ_edge (else_bb));
+      gimple *else_assign = single_trailing_store_in_bb (else_bb, else_vdef,
+							 vphi);
       if (else_assign)
 	return cond_if_else_store_replacement_1 (then_bb, else_bb, join_bb,
-						 then_assign, else_assign);
+						 then_assign, else_assign,
+						 vphi);
     }
 
   /* If either vectorization or if-conversion is disabled then do
@@ -3951,7 +3971,7 @@ cond_if_else_store_replacement (basic_block then_bb, basic_block else_bb,
       then_store = store_pair.first;
       else_store = store_pair.second;
       res = cond_if_else_store_replacement_1 (then_bb, else_bb, join_bb,
-                                              then_store, else_store);
+					      then_store, else_store, vphi);
       ok = ok || res;
     }
 
@@ -4486,6 +4506,11 @@ pass_phiopt::execute (function *)
 	      && !predictable_edge_p (EDGE_SUCC (bb, 0))
 	      && !predictable_edge_p (EDGE_SUCC (bb, 1)))
 	    hoist_adjacent_loads (bb, bb1, bb2, bb3);
+
+	  /* Try to see if there are only one store in each side of the if
+	     and try to remove that.  */
+	  if (EDGE_COUNT (bb3->preds) == 2)
+	    cond_if_else_store_replacement_limited (bb1, bb2, bb3);
 	}
 
       gimple_stmt_iterator gsi;

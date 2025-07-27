@@ -18,42 +18,28 @@ You should have received a copy of the GNU General Public License
 along with GCC; see the file COPYING3.  If not see
 <http://www.gnu.org/licenses/>.  */
 
-#include "config.h"
-#define INCLUDE_VECTOR
-#include "system.h"
-#include "coretypes.h"
-#include "tree.h"
-#include "gimple-pretty-print.h"
+#include "analyzer/common.h"
+
+#include "diagnostics/event-id.h"
 #include "gcc-rich-location.h"
-#include "ordered-hash-map.h"
-#include "options.h"
-#include "cgraph.h"
-#include "function.h"
-#include "cfg.h"
-#include "basic-block.h"
-#include "gimple.h"
-#include "gimple-iterator.h"
-#include "digraph.h"
-#include "analyzer/analyzer.h"
+#include "gimple-pretty-print.h"
+#include "sbitmap.h"
+#include "selftest.h"
+#include "shortest-paths.h"
+
 #include "analyzer/analyzer-logging.h"
 #include "analyzer/call-string.h"
 #include "analyzer/supergraph.h"
 #include "analyzer/program-point.h"
-#include "sbitmap.h"
-#include "bitmap.h"
-#include "selftest.h"
 #include "analyzer/store.h"
 #include "analyzer/region-model.h"
 #include "analyzer/sm.h"
 #include "analyzer/program-state.h"
-#include "diagnostic-event-id.h"
 #include "analyzer/pending-diagnostic.h"
 #include "analyzer/diagnostic-manager.h"
-#include "shortest-paths.h"
 #include "analyzer/exploded-graph.h"
 #include "analyzer/analysis-plan.h"
 #include "analyzer/inlining-iterator.h"
-#include "make-unique.h"
 
 #if ENABLE_ANALYZER
 
@@ -185,7 +171,7 @@ function_point::get_function () const
   if (m_supernode)
     return m_supernode->m_fun;
   else
-    return NULL;
+    return nullptr;
 }
 
 /* Get the gimple stmt for this function_point, if any.  */
@@ -198,7 +184,7 @@ function_point::get_stmt () const
   else if (m_kind == PK_AFTER_SUPERNODE)
     return m_supernode->get_last_stmt ();
   else
-    return NULL;
+    return nullptr;
 }
 
 /* Get a location for this function_point, if any.  */
@@ -233,32 +219,33 @@ function_point::final_stmt_p () const
 function_point
 function_point::from_function_entry (const supergraph &sg, const function &fun)
 {
-  return before_supernode (sg.get_node_for_function_entry (fun), NULL);
+  return before_supernode (sg.get_node_for_function_entry (fun), nullptr);
 }
 
 /* Create a function_point representing entering supernode SUPERNODE,
-   having reached it via FROM_EDGE (which could be NULL).  */
+   having reached it via FROM_EDGE (which could be nullptr).  */
 
 function_point
 function_point::before_supernode (const supernode *supernode,
 				  const superedge *from_edge)
 {
   if (from_edge && from_edge->get_kind () != SUPEREDGE_CFG_EDGE)
-    from_edge = NULL;
+    from_edge = nullptr;
   return function_point (supernode, from_edge, 0, PK_BEFORE_SUPERNODE);
 }
 
-/* A subclass of diagnostic_context for use by
+/* A subclass of diagnostics::context for use by
    program_point::print_source_line.  */
 
-class debug_diagnostic_context : public diagnostic_context
+class debug_diagnostic_context : public diagnostics::context
 {
 public:
   debug_diagnostic_context ()
   {
     diagnostic_initialize (this, 0);
-    m_source_printing.show_line_numbers_p = true;
-    m_source_printing.enabled = true;
+    auto &source_printing_opts = get_source_printing_options ();
+    source_printing_opts.show_line_numbers_p = true;
+    source_printing_opts.enabled = true;
   }
   ~debug_diagnostic_context ()
   {
@@ -277,9 +264,9 @@ function_point::print_source_line (pretty_printer *pp) const
   // TODO: monospace font
   debug_diagnostic_context tmp_dc;
   gcc_rich_location richloc (stmt->location);
-  diagnostic_source_print_policy source_policy (tmp_dc);
+  diagnostics::source_print_policy source_policy (tmp_dc);
   gcc_assert (pp);
-  source_policy.print (*pp, richloc, DK_ERROR, nullptr);
+  source_policy.print (*pp, richloc, diagnostics::kind::error, nullptr);
   pp_string (pp, pp_formatted_text (tmp_dc.get_reference_printer ()));
 }
 
@@ -316,7 +303,7 @@ program_point::dump () const
 std::unique_ptr<json::object>
 program_point::to_json () const
 {
-  auto point_obj = ::make_unique<json::object> ();
+  auto point_obj = std::make_unique<json::object> ();
 
   point_obj->set_string ("kind", point_kind_to_string (get_kind ()));
 
@@ -687,7 +674,7 @@ function_point::get_next () const
 program_point
 program_point::origin (const region_model_manager &mgr)
 {
-  return program_point (function_point (NULL, NULL,
+  return program_point (function_point (nullptr, nullptr,
 					0, PK_ORIGIN),
 			mgr.get_empty_call_string ());
 }
@@ -780,11 +767,11 @@ namespace selftest {
 static void
 test_function_point_equality ()
 {
-  const supernode *snode = NULL;
+  const supernode *snode = nullptr;
 
-  function_point a = function_point (snode, NULL, 0,
+  function_point a = function_point (snode, nullptr, 0,
 				     PK_BEFORE_SUPERNODE);
-  function_point b = function_point::before_supernode (snode, NULL);
+  function_point b = function_point::before_supernode (snode, nullptr);
   ASSERT_EQ (a, b);
 }
 
@@ -793,12 +780,12 @@ test_function_point_equality ()
 static void
 test_function_point_ordering ()
 {
-  const supernode *snode = NULL;
+  const supernode *snode = nullptr;
 
   /* Populate an array with various points within the same
      snode, in order.  */
   auto_vec<function_point> points;
-  points.safe_push (function_point::before_supernode (snode, NULL));
+  points.safe_push (function_point::before_supernode (snode, nullptr));
   points.safe_push (function_point::before_stmt (snode, 0));
   points.safe_push (function_point::before_stmt (snode, 1));
   points.safe_push (function_point::after_supernode (snode));
@@ -830,14 +817,14 @@ test_program_point_equality ()
 {
   region_model_manager mgr;
 
-  const supernode *snode = NULL;
+  const supernode *snode = nullptr;
 
   const call_string &cs = mgr.get_empty_call_string ();
 
-  program_point a = program_point::before_supernode (snode, NULL,
+  program_point a = program_point::before_supernode (snode, nullptr,
 						     cs);
 
-  program_point b = program_point::before_supernode (snode, NULL,
+  program_point b = program_point::before_supernode (snode, nullptr,
 						     cs);
 
   ASSERT_EQ (a, b);

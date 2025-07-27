@@ -178,8 +178,8 @@ get_live_range (hash_map<tree, pair> *live_ranges, tree arg)
        STMT 5 (be vectorized)      -- point 2
        ...
 */
-static void
-compute_local_program_points (
+void
+costs::compute_local_program_points (
   vec_info *vinfo,
   hash_map<basic_block, vec<stmt_point>> &program_points_per_bb)
 {
@@ -205,9 +205,7 @@ compute_local_program_points (
 	      if (!is_gimple_assign_or_call (gsi_stmt (si)))
 		continue;
 	      stmt_vec_info stmt_info = vinfo->lookup_stmt (gsi_stmt (si));
-	      enum stmt_vec_info_type type
-		= STMT_VINFO_TYPE (vect_stmt_to_vectorize (stmt_info));
-	      if (type != undef_vec_info_type)
+	      if (STMT_VINFO_RELEVANT_P (stmt_info))
 		{
 		  stmt_point info = {point, gsi_stmt (si), stmt_info};
 		  program_points.safe_push (info);
@@ -276,14 +274,14 @@ loop_invariant_op_p (class loop *loop,
 
 /* Return true if the variable should be counted into liveness.  */
 static bool
-variable_vectorized_p (class loop *loop, stmt_vec_info stmt_info, tree var,
-		       bool lhs_p)
+variable_vectorized_p (class loop *loop, stmt_vec_info stmt_info,
+		       slp_tree node ATTRIBUTE_UNUSED, tree var, bool lhs_p)
 {
   if (!var)
     return false;
   gimple *stmt = STMT_VINFO_STMT (stmt_info);
-  enum stmt_vec_info_type type
-    = STMT_VINFO_TYPE (vect_stmt_to_vectorize (stmt_info));
+  stmt_info = vect_stmt_to_vectorize (stmt_info);
+  enum stmt_vec_info_type type = STMT_VINFO_TYPE (stmt_info);
   if (is_gimple_call (stmt) && gimple_call_internal_p (stmt))
     {
       if (gimple_call_internal_fn (stmt) == IFN_MASK_STORE
@@ -359,8 +357,8 @@ variable_vectorized_p (class loop *loop, stmt_vec_info stmt_info, tree var,
 
    The live range of SSA 1 is [1, 3] in bb 2.
    The live range of SSA 2 is [0, 4] in bb 3.  */
-static machine_mode
-compute_local_live_ranges (
+machine_mode
+costs::compute_local_live_ranges (
   loop_vec_info loop_vinfo,
   const hash_map<basic_block, vec<stmt_point>> &program_points_per_bb,
   hash_map<basic_block, hash_map<tree, pair>> &live_ranges_per_bb)
@@ -390,8 +388,11 @@ compute_local_live_ranges (
 	      unsigned int point = program_point.point;
 	      gimple *stmt = program_point.stmt;
 	      tree lhs = gimple_get_lhs (stmt);
-	      if (variable_vectorized_p (loop, program_point.stmt_info, lhs,
-					 true))
+	      slp_tree *node = vinfo_slp_map.get (program_point.stmt_info);
+	      if (!node)
+		continue;
+	      if (variable_vectorized_p (loop, program_point.stmt_info,
+					 *node, lhs, true))
 		{
 		  biggest_mode = get_biggest_mode (biggest_mode,
 						   TYPE_MODE (TREE_TYPE (lhs)));
@@ -408,8 +409,8 @@ compute_local_live_ranges (
 	      for (i = 0; i < gimple_num_args (stmt); i++)
 		{
 		  tree var = gimple_arg (stmt, i);
-		  if (variable_vectorized_p (loop, program_point.stmt_info, var,
-					     false))
+		  if (variable_vectorized_p (loop, program_point.stmt_info,
+					     *node, var, false))
 		    {
 		      biggest_mode
 			= get_biggest_mode (biggest_mode,
@@ -599,11 +600,11 @@ get_store_value (gimple *stmt)
 }
 
 /* Return true if additional vector vars needed.  */
-static bool
-need_additional_vector_vars_p (stmt_vec_info stmt_info)
+bool
+costs::need_additional_vector_vars_p (stmt_vec_info stmt_info,
+				      slp_tree node ATTRIBUTE_UNUSED)
 {
-  enum stmt_vec_info_type type
-    = STMT_VINFO_TYPE (vect_stmt_to_vectorize (stmt_info));
+  enum stmt_vec_info_type type = STMT_VINFO_TYPE (stmt_info);
   if (type == load_vec_info_type || type == store_vec_info_type)
     {
       if (STMT_VINFO_GATHER_SCATTER_P (stmt_info)
@@ -626,7 +627,7 @@ compute_estimated_lmul (loop_vec_info loop_vinfo, machine_mode mode)
   int regno_alignment = riscv_get_v_regno_alignment (loop_vinfo->vector_mode);
   if (riscv_v_ext_vls_mode_p (loop_vinfo->vector_mode))
     return regno_alignment;
-  else if (known_eq (LOOP_VINFO_SLP_UNROLLING_FACTOR (loop_vinfo), 1U))
+  else
     {
       int estimated_vf = vect_vf_for_cost (loop_vinfo);
       int estimated_lmul = estimated_vf * GET_MODE_BITSIZE (mode).to_constant ()
@@ -635,25 +636,6 @@ compute_estimated_lmul (loop_vec_info loop_vinfo, machine_mode mode)
 	return regno_alignment;
       else
 	return estimated_lmul;
-    }
-  else
-    {
-      /* Estimate the VLA SLP LMUL.  */
-      if (regno_alignment > RVV_M1)
-	return regno_alignment;
-      else if (mode != QImode
-	       || LOOP_VINFO_SLP_UNROLLING_FACTOR (loop_vinfo).is_constant ())
-	{
-	  int ratio;
-	  if (can_div_trunc_p (BYTES_PER_RISCV_VECTOR,
-			       GET_MODE_SIZE (loop_vinfo->vector_mode), &ratio))
-	    {
-	      if (ratio == 1)
-		return RVV_M4;
-	      else if (ratio == 2)
-		return RVV_M2;
-	    }
-	}
     }
   return 0;
 }
@@ -678,8 +660,8 @@ compute_estimated_lmul (loop_vec_info loop_vinfo, machine_mode mode)
 
    Then, after this function, we update SSA 1 live range in bb 2
    into [2, 4] since SSA 1 is live out into bb 3.  */
-static void
-update_local_live_ranges (
+void
+costs::update_local_live_ranges (
   vec_info *vinfo,
   hash_map<basic_block, vec<stmt_point>> &program_points_per_bb,
   hash_map<basic_block, hash_map<tree, pair>> &live_ranges_per_bb,
@@ -706,8 +688,13 @@ update_local_live_ranges (
 	{
 	  gphi *phi = psi.phi ();
 	  stmt_vec_info stmt_info = vinfo->lookup_stmt (phi);
-	  if (STMT_VINFO_TYPE (vect_stmt_to_vectorize (stmt_info))
-	      == undef_vec_info_type)
+	  stmt_info = vect_stmt_to_vectorize (stmt_info);
+	  slp_tree *node = vinfo_slp_map.get (stmt_info);
+
+	  if (!node)
+	    continue;
+
+	  if (STMT_VINFO_TYPE (stmt_info) == undef_vec_info_type)
 	    continue;
 
 	  for (j = 0; j < gimple_phi_num_args (phi); j++)
@@ -782,9 +769,12 @@ update_local_live_ranges (
 	  if (!is_gimple_assign_or_call (gsi_stmt (si)))
 	    continue;
 	  stmt_vec_info stmt_info = vinfo->lookup_stmt (gsi_stmt (si));
-	  enum stmt_vec_info_type type
-	    = STMT_VINFO_TYPE (vect_stmt_to_vectorize (stmt_info));
-	  if (need_additional_vector_vars_p (stmt_info))
+	  stmt_info = vect_stmt_to_vectorize (stmt_info);
+	  slp_tree *node = vinfo_slp_map.get (stmt_info);
+	  if (!node)
+	    continue;
+	  enum stmt_vec_info_type type = STMT_VINFO_TYPE (stmt_info);
+	  if (need_additional_vector_vars_p (stmt_info, *node))
 	    {
 	      /* For non-adjacent load/store STMT, we will potentially
 		 convert it into:
@@ -837,8 +827,8 @@ update_local_live_ranges (
 }
 
 /* Compute the maximum live V_REGS.  */
-static bool
-has_unexpected_spills_p (loop_vec_info loop_vinfo)
+bool
+costs::has_unexpected_spills_p (loop_vec_info loop_vinfo)
 {
   /* Compute local program points.
      It's a fast and effective computation.  */
@@ -920,7 +910,11 @@ costs::analyze_loop_vinfo (loop_vec_info loop_vinfo)
   /* Detect whether we're vectorizing for VLA and should apply the unrolling
      heuristic described above m_unrolled_vls_niters.  */
   record_potential_vls_unrolling (loop_vinfo);
+}
 
+void
+costs::record_lmul_spills (loop_vec_info loop_vinfo)
+{
   /* Detect whether the LOOP has unexpected spills.  */
   record_potential_unexpected_spills (loop_vinfo);
 }
@@ -1120,8 +1114,8 @@ costs::adjust_stmt_cost (enum vect_cost_for_stmt kind, loop_vec_info loop,
   switch (kind)
     {
     case scalar_to_vec:
-      stmt_cost += (FLOAT_TYPE_P (vectype) ? costs->regmove->FR2VR
-		    : costs->regmove->GR2VR);
+      stmt_cost
+	+= (FLOAT_TYPE_P (vectype) ? get_fr2vr_cost () : get_gr2vr_cost ());
       break;
     case vec_to_scalar:
       stmt_cost += (FLOAT_TYPE_P (vectype) ? costs->regmove->VR2FR
@@ -1260,8 +1254,12 @@ costs::add_stmt_cost (int count, vect_cost_for_stmt kind,
   int stmt_cost
     = targetm.vectorize.builtin_vectorization_cost (kind, vectype, misalign);
 
+  if (stmt_info && node)
+    vinfo_slp_map.put (stmt_info, node);
+
   /* Do one-time initialization based on the vinfo.  */
   loop_vec_info loop_vinfo = dyn_cast<loop_vec_info> (m_vinfo);
+
   if (!m_analyzed_vinfo)
     {
       if (loop_vinfo)
@@ -1347,6 +1345,8 @@ costs::finish_cost (const vector_costs *scalar_costs)
 {
   if (loop_vec_info loop_vinfo = dyn_cast<loop_vec_info> (m_vinfo))
     {
+      record_lmul_spills (loop_vinfo);
+
       adjust_vect_cost_per_loop (loop_vinfo);
     }
   vector_costs::finish_cost (scalar_costs);

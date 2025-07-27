@@ -517,19 +517,24 @@ namespace __gnu_test
       constexpr SimpleAllocator() noexcept { }
 
       template <class T>
+	constexpr
         SimpleAllocator(const SimpleAllocator<T>&) { }
 
+      _GLIBCXX20_CONSTEXPR
       Tp *allocate(std::size_t n)
       { return std::allocator<Tp>().allocate(n); }
 
+      _GLIBCXX20_CONSTEXPR
       void deallocate(Tp *p, std::size_t n)
       { std::allocator<Tp>().deallocate(p, n); }
     };
 
   template <class T, class U>
+    constexpr
     bool operator==(const SimpleAllocator<T>&, const SimpleAllocator<U>&)
     { return true; }
   template <class T, class U>
+    constexpr
     bool operator!=(const SimpleAllocator<T>&, const SimpleAllocator<U>&)
     { return false; }
 
@@ -541,15 +546,16 @@ namespace __gnu_test
       default_init_allocator() = default;
 
       template<typename U>
+	constexpr
         default_init_allocator(const default_init_allocator<U>& a)
 	  : state(a.state)
         { }
 
-      T*
+      constexpr T*
       allocate(std::size_t n)
       { return std::allocator<T>().allocate(n); }
 
-      void
+      constexpr void
       deallocate(T* p, std::size_t n)
       { std::allocator<T>().deallocate(p, n); }
 
@@ -557,15 +563,17 @@ namespace __gnu_test
     };
 
   template<typename T, typename U>
-    bool operator==(const default_init_allocator<T>& t,
-		    const default_init_allocator<U>& u)
+    constexpr bool
+    operator==(const default_init_allocator<T>& t,
+	       const default_init_allocator<U>& u)
     { return t.state == u.state; }
 
   template<typename T, typename U>
-    bool operator!=(const default_init_allocator<T>& t,
-		    const default_init_allocator<U>& u)
+    constexpr bool
+    operator!=(const default_init_allocator<T>& t,
+	       const default_init_allocator<U>& u)
     { return !(t == u); }
-#endif
+#endif // C++11
 
   template<typename Tp>
     struct ExplicitConsAlloc : std::allocator<Tp>

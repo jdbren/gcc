@@ -493,7 +493,7 @@ public:
   static inline void checking_verify_symtab_nodes (void);
 
   /* Get unique identifier of the node.  */
-  inline int get_uid ()
+  inline int get_uid () const
   {
     return m_uid;
   }
@@ -965,15 +965,19 @@ struct GTY((tag ("SYMTAB_FUNCTION"))) cgraph_node : public symtab_node
      If the new node is being inlined into another one, NEW_INLINED_TO should be
      the outline function the new one is (even indirectly) inlined to.
      All hooks will see this in node's inlined_to, when invoked.
-     Can be NULL if the node is not inlined.  SUFFIX is string that is appended
-     to the original name.  */
+     Should be NULL if the node is not inlined.
+
+     SUFFIX is string that is appended to the original name, it should only be
+     NULL if NEW_INLINED_TO is not NULL or if the clone being created is
+     temporary and a record about it should not be added into the ipa-clones
+     dump file.  */
   cgraph_node *create_clone (tree decl, profile_count count,
 			     bool update_original,
 			     vec<cgraph_edge *> redirect_callers,
 			     bool call_duplication_hook,
 			     cgraph_node *new_inlined_to,
 			     ipa_param_adjustments *param_adjustments,
-			     const char *suffix = NULL);
+			     const char *suffix);
 
   /* Create callgraph node clone with new declaration.  The actual body will be
      copied later at compilation stage.  The name of the new clone will be
@@ -1020,11 +1024,12 @@ struct GTY((tag ("SYMTAB_FUNCTION"))) cgraph_node : public symtab_node
      TREE_MAP is a mapping of tree nodes we want to replace with
      new ones (according to results of prior analysis).
 
-     If non-NULL ARGS_TO_SKIP determine function parameters to remove
-     from new version.
-     If SKIP_RETURN is true, the new version will return void.
+     If non-NULL PARAM_ADJUSTMENTS determine how function formal parameters
+     should be modified in the new version and if it should return void.
      If non-NULL BLOCK_TO_COPY determine what basic blocks to copy.
      If non_NULL NEW_ENTRY determine new entry BB of the clone.
+     SUFFIX is a string that will be used to create a new name for the new
+     function.
 
      If TARGET_ATTRIBUTES is non-null, when creating a new declaration,
      add the attributes to DECL_ATTRIBUTES.  And call valid_attribute_p
@@ -1039,7 +1044,7 @@ struct GTY((tag ("SYMTAB_FUNCTION"))) cgraph_node : public symtab_node
     (vec<cgraph_edge *> redirect_callers,
      vec<ipa_replace_map *, va_gc> *tree_map,
      ipa_param_adjustments *param_adjustments,
-     bitmap bbs_to_copy, basic_block new_entry_block, const char *clone_name,
+     bitmap bbs_to_copy, basic_block new_entry_block, const char *suffix,
      tree target_attributes = NULL_TREE, bool version_decl = true);
 
   /* Insert a new cgraph_function_version_info node into cgraph_fnver_htab
@@ -1251,6 +1256,21 @@ struct GTY((tag ("SYMTAB_FUNCTION"))) cgraph_node : public symtab_node
      it is not used in any other non-standard way.  */
   bool only_called_directly_p (void);
 
+  /* Turn profile to global0.  Walk into inlined functions.  */
+  void make_profile_local ();
+
+  /* Turn profile to global0.  Walk into inlined functions.  */
+  void make_profile_global0 (profile_quality quality);
+
+  /* Scale profile by NUM/DEN.  Walk into inlined funtion.  */
+  void apply_scale (profile_count num, profile_count den);
+
+  /* Scale profile to given IPA_COUNT.
+     IPA_COUNT should pass ipa_p () with a single exception.
+     It can be also GUESSED_LOCAL in case we want to
+     drop any IPA info about the profile.  */
+  void scale_profile_to (profile_count ipa_count);
+
   /* Return true when function is only called directly or it has alias.
      i.e. it is not externally visible, address was not taken and
      it is not used in any other non-standard way.  */
@@ -1319,9 +1339,9 @@ struct GTY((tag ("SYMTAB_FUNCTION"))) cgraph_node : public symtab_node
     return m_summary_id;
   }
 
-  /* Record that DECL1 and DECL2 are semantically identical function
-     versions.  */
-  static void record_function_versions (tree decl1, tree decl2);
+  /* Adds DECL to the FN_V structure of semantically identical functions.  */
+  static void add_function_version (cgraph_function_version_info *fn_v,
+				    tree decl);
 
   /* Remove the cgraph_function_version_info and cgraph_node for DECL.  This
      DECL is a duplicate declaration.  */
@@ -1872,8 +1892,13 @@ public:
   /* Return true when the edge represents a direct recursion.  */
   bool recursive_p (void);
 
-  /* Return true if the edge may be considered hot.  */
-  bool maybe_hot_p (void);
+  /* Return true if the edge may be considered hot after scalling its count.  */
+  bool maybe_hot_p ();
+
+  /* Return true if the edge may be considered hot after scalling its count
+     (i.e. assume that optimization would reduce runtime for callee,
+      possibly significantly).  */
+  bool maybe_hot_p (sreal scale);
 
   /* Get unique identifier of the edge.  */
   inline int get_uid ()
@@ -2627,6 +2652,7 @@ void tree_function_versioning (tree, tree, vec<ipa_replace_map *, va_gc> *,
 void dump_callgraph_transformation (const cgraph_node *original,
 				    const cgraph_node *clone,
 				    const char *suffix);
+void set_new_clone_decl_and_node_flags (cgraph_node *new_node);
 /* In cgraphbuild.cc  */
 int compute_call_stmt_bb_frequency (tree, basic_block bb);
 void record_references_in_initializer (tree, bool);

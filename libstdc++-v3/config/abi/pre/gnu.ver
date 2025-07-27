@@ -1767,7 +1767,8 @@ GLIBCXX_3.4.21 {
     _ZNSt7__cxx1112basic_stringI[cw]St11char_traitsI[cw]ESaI[cw]EE10_S_compareE[jmy][jmy];
     _ZNSt7__cxx1112basic_stringI[cw]St11char_traitsI[cw]ESaI[cw]EE11_M_capacityE[jmy];
     _ZNSt7__cxx1112basic_stringI[cw]St11char_traitsI[cw]ESaI[cw]EE12_Alloc_hiderC[12]EP[cw]RKS3_;
-    _ZNSt7__cxx1112basic_stringI[cw]St11char_traitsI[cw]ESaI[cw]EE12_M*;
+    _ZNSt7__cxx1112basic_stringI[cw]St11char_traitsI[cw]ESaI[cw]EE12_M_constructE[jmy][cw];
+    _ZNSt7__cxx1112basic_stringI[cw]St11char_traitsI[cw]ESaI[cw]EE12_M_constructI[NP]*;
     _ZNSt7__cxx1112basic_stringI[cw]St11char_traitsI[cw]ESaI[cw]EE13*;
     _ZNSt7__cxx1112basic_stringI[cw]St11char_traitsI[cw]ESaI[cw]EE14_M_replace_aux*;
     _ZNSt7__cxx1112basic_stringI[cw]St11char_traitsI[cw]ESaI[cw]EE1[68-9]*;
@@ -2540,10 +2541,35 @@ GLIBCXX_3.4.34 {
     _ZNSt8__format25__locale_encoding_to_utf8ERKSt6localeSt17basic_string_viewIcSt11char_traitsIcEEPv;
     # __sso_string constructor and destructor
     _ZNSt12__sso_string[CD][12]Ev;
-    # void std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >::_M_construct<bool>(char const*, unsigned long)
+    # void std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >::_M_construct<bool>(char const*, size_t)
     # and wide char version
-    _ZNSt7__cxx1112basic_stringI[cw]St11char_traitsI[cw]ESaI[cw]EE12_M_constructILb[01]EEEvPK[cw]m;
+    _ZNSt7__cxx1112basic_stringI[cw]St11char_traitsI[cw]ESaI[cw]EE12_M_constructILb[01]EEEvPK[cw][jmy];
+
 } GLIBCXX_3.4.33;
+
+# GCC 16.1.0
+GLIBCXX_3.4.35 {
+
+    _ZNSt8__detail11__wait_implEPKvRNS_16__wait_args_baseE;
+    _ZNSt8__detail13__notify_implEPKvbRKNS_16__wait_args_baseE;
+    _ZNSt8__detail17__wait_until_implEPKvRNS_16__wait_args_baseERKNSt6chrono8durationI[lx]St5ratioIL[lx]1EL[lx]1000000000EEEE;
+    _ZNSt8__detail11__wait_args22_M_load_proxy_wait_valEPKv;
+
+    # __gnu_debug::_Safe_iterator_base and _Safe_sequence_base const
+    _ZN11__gnu_debug19_Safe_iterator_base9_M_attachEPKNS_19_Safe_sequence_baseEb;
+    _ZN11__gnu_debug19_Safe_iterator_base16_M_attach_singleEPKNS_19_Safe_sequence_baseEb;
+    _ZNK11__gnu_debug19_Safe_sequence_base13_M_detach_allEv;
+    _ZNK11__gnu_debug19_Safe_sequence_base18_M_detach_singularEv;
+    _ZNK11__gnu_debug19_Safe_sequence_base12_M_get_mutexEv;
+    _ZNK11__gnu_debug19_Safe_sequence_base22_M_revalidate_singularEv;
+    _ZNK11__gnu_debug19_Safe_sequence_base7_M_swapERKS0_;
+
+    # __gnu_debug::_Safe_local_iterator_base and _Safe_unordered_container_base const
+    _ZN11__gnu_debug25_Safe_local_iterator_base9_M_attachEPKNS_30_Safe_unordered_container_baseEb;
+    _ZN11__gnu_debug25_Safe_local_iterator_base16_M_attach_singleEPKNS_30_Safe_unordered_container_baseEb;
+    _ZNK11__gnu_debug30_Safe_unordered_container_base13_M_detach_allEv;
+    _ZNK11__gnu_debug30_Safe_unordered_container_base7_M_swapERKS0_;
+} GLIBCXX_3.4.34;
 
 # Symbols in the support library (libsupc++) have their own tag.
 CXXABI_1.3 {
@@ -2884,6 +2910,15 @@ CXXABI_1.3.16 {
     _ZTIPDF16b;
     _ZTIPKDF16b;
 
+} CXXABI_1.3.15;
+#endif
+
+CXXABI_1.3.17 {
+    # std::exception_ptr::_M_exception_ptr_cast
+    _ZNKSt15__exception_ptr13exception_ptr21_M_exception_ptr_castERKSt9type_info;
+#ifdef __riscv
+} CXXABI_1.3.16;
+#else
 } CXXABI_1.3.15;
 #endif
 

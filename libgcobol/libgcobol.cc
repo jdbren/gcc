@@ -27,27 +27,35 @@
  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-#include <ctype.h>
-#include <err.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <math.h>
-#include <fenv.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <time.h>
-#include <unistd.h>
-#include <vector>
 #include <algorithm>
-#include <unordered_map>
+#include <cctype>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <ctime>
 #include <set>
+#include <stack>
 #include <string>
+#include <unordered_map>
+#include <vector>
+
+#include <dirent.h>
+#include <dlfcn.h>
+#include <err.h>
+#include <fcntl.h>
+#include <fenv.h>
+#include <math.h> // required for fpclassify(3), not in cmath
 #include <setjmp.h>
 #include <signal.h>
-#include <dlfcn.h>
-#include <dirent.h>
-#include <sys/resource.h>
+#include <syslog.h>
+#include <unistd.h>
+#include <stdarg.h>
+#if __has_include(<errno.h>)
+# include <errno.h> // for program_invocation_short_name
+#endif
+
+#include "config.h"
+#include "libgcobol-fp.h"
 
 #include "ec.h"
 #include "common-defs.h"
@@ -57,14 +65,50 @@
 #include "gfileio.h"
 #include "charmaps.h"
 #include "valconv.h"
-
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/types.h>
-
+#include <sys/time.h>
 #include <execinfo.h>
-
 #include "exceptl.h"
+
+/* BSD extension.  */
+#if !defined(LOG_PERROR)
+#define LOG_PERROR 0
+#endif
+
+#if !defined (HAVE_STRFROMF32)
+# if __FLT_MANT_DIG__ == 24 && __FLT_MAX_EXP__ == 128
+static int
+strfromf32 (char *s, size_t n, const char *f, float v)
+{
+  return snprintf (s, n, f, (double) v);
+}
+# else
+#  error "It looks like float on this platform is not IEEE754"
+# endif
+#endif
+
+#if !defined (HAVE_STRFROMF64)
+# if __DBL_MANT_DIG__ == 53 && __DBL_MAX_EXP__ == 1024
+static int
+strfromf64 (char *s, size_t n, const char *f, double v)
+{
+  return snprintf (s, n, f, v);
+}
+# else
+#  error "It looks like double on this platform is not IEEE754"
+# endif
+#endif
+
+// Enable Declarative tracing via "match_declarative" environment variable.
+#if defined(MATCH_DECLARATIVE) || true
+# undef  MATCH_DECLARATIVE
+# define MATCH_DECLARATIVE getenv("match_declarative")
+#else
+# define MATCH_DECLARATIVE (nullptr)
+#endif
 
 // This couldn't be defined in symbols.h because it conflicts with a LEVEL66
 // in parse.h
@@ -80,8 +124,6 @@
 
 // These global values are established as the COBOL program executes
 int         __gg__exception_code              = 0    ;
-int         __gg__exception_handled           = 0    ;
-int         __gg__exception_file_number       = 0    ;
 int         __gg__exception_file_status       = 0    ;
 const char *__gg__exception_file_name         = NULL ;
 const char *__gg__exception_program_id        = NULL ;
@@ -92,9 +134,13 @@ int         __gg__exception_line_number       = 0    ;
 const char *__gg__exception_statement         = NULL ;
 int         __gg__default_compute_error       = 0    ;
 int         __gg__rdigits                     = 0    ;
-int         __gg__odo_violation               = 0    ;
 int         __gg__nop                         = 0    ;
 int         __gg__main_called                 = 0    ;
+
+// During SORT operations, we don't want the end-of-file condition, which
+// happens as a matter of course, from setting the EOF exception condition.
+// Setting this variable to 'true' suppresses the error condition.
+static bool sv_suppress_eof_ec = false;
 
 // What follows are arrays that are used by features like INSPECT, STRING,
 // UNSTRING, and, particularly, arithmetic_operation.  These features are
@@ -144,18 +190,23 @@ size_t       *  __gg__treeplet_4s              = NULL  ;
 // used to keep track of local variables.
 size_t      __gg__unique_prog_id              = 0    ;
 
-// These values are the persistent stashed versions of the global values
-static int         stashed_exception_code;
-static int         stashed_exception_handled;
-static int         stashed_exception_file_number;
-static int         stashed_exception_file_status;
-static const char *stashed_exception_file_name;
-static const char *stashed_exception_program_id;
-static const char *stashed_exception_section;
-static const char *stashed_exception_paragraph;
-static const char *stashed_exception_source_file;
-static int         stashed_exception_line_number;
-static const char *stashed_exception_statement;
+// Whenever an exception status is set, a snapshot of the current statement
+// location information are established in the "last_exception..." variables.
+// This is in accordance with the ISO requirements of "14.6.13.1.1 General" that
+// describe how a "last exception status" is maintained.
+// other "location" information
+static int         last_exception_code;
+static const char *last_exception_program_id;
+static const char *last_exception_section;
+static const char *last_exception_paragraph;
+static const char *last_exception_source_file;
+static int         last_exception_line_number;
+static const char *last_exception_statement;
+// These variables are similar, and are established when an exception is
+// raised for a file I-O operation.
+static cblc_file_prior_op_t last_exception_file_operation;
+static file_status_t        last_exception_file_status;
+static const char          *last_exception_file_name;
 
 static int sv_from_raise_statement = 0;
 
@@ -178,46 +229,220 @@ void       *__gg__entry_location = NULL;
 // nested PERFORM PROC statements.
 void       *__gg__exit_address = NULL;
 
+/*
+ * ec_status_t represents the runtime exception condition status for
+ * any statement.  There are 4 states:
+ *   1.  initial, all zeros
+ *   2.  updated, copy global EC state for by Declarative and/or default
+ *   3.  matched, Declarative found, isection nonzero
+ *   4.  handled, where handled == type
+ *
+ * If the statement includes some kind of ON ERROR
+ * clause that covers it, the generated code does not raise an EC.
+ *
+ * The status is updated by __gg_match_exception if it runs, else
+ * __gg__check_fatal_exception.
+ *
+ * If a Declarative is matched, its section number is passed to handled_by(),
+ * which does two things:
+ *  1. sets isection to record the declarative
+ *  2. for a nonfatal EC, sets handled, indication no further action is needed
+ *
+ * A Declarative may use RESUME, which clears ec_status, which is a "handled" state.
+ *
+ * Default processing ensures return to initial state.
+ */
+class ec_status_t {
+ public:
+  struct file_status_t {
+    size_t ifile;
+    cblc_file_prior_op_t operation;
+    cbl_file_mode_t mode;
+    cblc_field_t *user_status;
+    const char * filename;
+    file_status_t()
+                    : ifile(0)
+                    ,  operation(file_op_none)
+                    ,  mode(file_mode_none_e)
+                    ,  user_status(nullptr)
+                    ,  filename(nullptr)
+                      {}
+    explicit file_status_t( const cblc_file_t *file )
+                    : ifile(file->symbol_table_index)
+                    , operation(file->prior_op)
+                    , mode(cbl_file_mode_t(file->mode_char))
+                    , user_status(file->user_status)
+                    , filename(file->filename)
+                      {}
+    const char * op_str() const {
+      switch( operation ) {
+      case file_op_none: return "none";
+      case file_op_open: return "open";
+      case file_op_close: return "close";
+      case file_op_start: return "start";
+      case file_op_read: return "read";
+      case file_op_write: return "write";
+      case file_op_rewrite: return "rewrite";
+      case file_op_delete: return "delete";
+      }
+      return "???";
+    }
+  };
+ private:
+  char msg[132];
+  ec_type_t type, handled;
+  size_t isection;
+  cbl_enabled_exceptions_t enabled;
+  cbl_declaratives_t declaratives;
+  struct file_status_t file;
+ public:
+  int lineno;
+  const char *source_file;
+  cbl_name_t statement; // e.g., "ADD"
+
+  ec_status_t()
+    : type(ec_none_e)
+    , handled(ec_none_e)
+    , isection(0)
+    , lineno(0)
+    , source_file(NULL)
+  {
+    msg[0] = statement[0] = '\0';
+  }
+
+  bool is_fatal() const;
+  ec_status_t& update();
+
+  bool is_enabled() const { return enabled.match(type); }
+  bool is_enabled( ec_type_t ec) const { return enabled.match(ec); }
+  ec_status_t& handled_by( size_t declarative_section ) {
+    isection = declarative_section;
+    // A fatal exception remains unhandled unless RESUME clears it.
+    if( ! is_fatal() ) {
+      handled = type;
+    }
+    return *this;
+  }
+  ec_status_t& clear() {
+    handled = type = ec_none_e;
+    isection = 0;
+    lineno = 0;
+    msg[0] = statement[0] = '\0';
+    return *this;
+  }
+  bool unset() const { return isection == 0 && lineno == 0; }
+
+  void reset_environment() const;
+  ec_status_t& copy_environment();
+
+  // Return the EC's type if it is *not* handled.
+  ec_type_t unhandled() const {
+    bool was_handled = ec_cmp(type, handled);
+    return was_handled? ec_none_e : type;
+  }
+
+  bool done() const { return unhandled() == ec_none_e; }
+
+  const file_status_t& file_status() const { return file; }
+
+  const char * exception_location() {
+    snprintf(msg, sizeof(msg), "%s:%d: '%s'", source_file, lineno, statement);
+    return msg;
+  }
+};
+
+/*
+ * Capture the global EC status at the beginning of Declarative matching. While
+ * executing the Declarative, push the current status on a stack. When the
+ * Declarative returns, restore EC status from the stack.
+ *
+ * If the Declarative includes a RESUME statement, it clears the on-stack
+ * status, thus avoiding any default handling.
+ */
 static ec_status_t ec_status;
+static std::stack<ec_status_t> ec_stack;
+
+static cbl_enabled_exceptions_t enabled_ECs;
+static cbl_declaratives_t declaratives;
 
 static const ec_descr_t *
 local_ec_type_descr( ec_type_t type ) {
   auto p = std::find( __gg__exception_table, __gg__exception_table_end, type );
   if( p == __gg__exception_table_end )
     {
+      warnx("%s:%d: no such EC value %08x", __func__, __LINE__, type);
     __gg__abort("Fell off the end of the __gg__exception_table");
     }
   return p;
 }
 
+cblc_file_t * __gg__file_stashed();
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-function"
+// Keep this debugging function around for when it is needed
 static const char *
 local_ec_type_str( ec_type_t type ) {
   if( type == ec_none_e ) return "EC-NONE";
   auto p = local_ec_type_descr(type);
   return p->name;
 }
+#pragma GCC diagnostic pop
 
-ec_status_t& ec_status_t::update() {
-  handled =   ec_type_t(__gg__exception_handled);
-  type    =   ec_type_t(__gg__exception_code);
-  __gg__exception_code = ec_none_e;
-  source_file = __gg__exception_source_file;
-  lineno = __gg__exception_line_number;
+bool
+ec_status_t::is_fatal() const {
+  auto descr = local_ec_type_descr(type);
+  return descr->disposition == ec_category_fatal_e;
+}
+
+ec_status_t&
+ec_status_t::update() {
+  handled =   ec_none_e;
+  type =      ec_type_t(__gg__exception_code);
+  source_file =         __gg__exception_source_file;
+  lineno =              __gg__exception_line_number;
   if( __gg__exception_statement ) {
     snprintf(statement, sizeof(statement), "%s", __gg__exception_statement);
   }
+  cblc_file_t *stashed = __gg__file_stashed();
+  this->file = stashed? file_status_t(stashed) : file_status_t();
 
-  if( type != ec_none_e && getenv("match_declarative") ) {
-    warnx( "ec_status_t::update:%d: EC %s by %s handled %02X " , __LINE__,
+  if( type != ec_none_e && MATCH_DECLARATIVE ) {
+    warnx( "ec_status_t::update:%d: EC %s by %s (handled %s) " , __LINE__,
            local_ec_type_str(type),
            __gg__exception_statement? statement : "<none>",
-           handled ); // might be file-status, not ec_type_t
+           local_ec_type_str(handled) );
   }
+
+  this->enabled = ::enabled_ECs;
+  this->declaratives = ::declaratives;
 
   return *this;
 }
 
+ec_status_t&
+ec_status_t::copy_environment() {
+  this->enabled = ::enabled_ECs;
+  this->declaratives = ::declaratives;
+  return *this;
+}
+
+void
+ec_status_t::reset_environment() const {
+  ::enabled_ECs = enabled;
+  ::declaratives = declaratives;
+}
+
+
+// This is the default truncation mode
 static cbl_truncation_mode truncation_mode = trunc_std_e;
+
+extern "C"
+void
+__gg__set_truncation_mode(cbl_truncation_mode trunc_mode)
+  {
+  truncation_mode = trunc_mode;
+  }
 
 struct program_state
   {
@@ -324,7 +549,6 @@ void *malloc(size_t a)
   void *retval = malloc(a);
   fprintf(stderr, " --malloc(%p)-- ", retval);
   return retval;
-  return retval;
   }
 #endif
 
@@ -333,6 +557,12 @@ __gg__abort(const char *msg)
   {
   fprintf(stderr, "%s: %s\n", program_name, msg);
   abort();
+  }
+
+void
+__gg__mabort()
+  {
+  __gg__abort("Memory allocation error\n");
   }
 
 extern "C"
@@ -365,7 +595,7 @@ __gg__resize_int_p( size_t *size,
   if( new_size > *size )
     {
     *size = new_size;
-    *block = (int *)realloc(*block, new_size * sizeof(int));
+    *block = static_cast<int *>(realloc(*block, new_size * sizeof(int)));
     }
   }
 
@@ -380,36 +610,36 @@ __gg__resize_treeplet(int     ngroup,
       if( new_size > treeplet_1_size )
         {
         treeplet_1_size = new_size;
-        __gg__treeplet_1f = (cblc_field_t **)realloc(__gg__treeplet_1f, new_size * sizeof(cblc_field_t *));
-        __gg__treeplet_1o = (size_t *)realloc(__gg__treeplet_1o, new_size * sizeof(size_t));
-        __gg__treeplet_1s = (size_t *)realloc(__gg__treeplet_1s, new_size * sizeof(size_t));
+        __gg__treeplet_1f = static_cast<cblc_field_t **>(realloc(__gg__treeplet_1f, new_size * sizeof(cblc_field_t *)));
+        __gg__treeplet_1o = static_cast<size_t *>(realloc(__gg__treeplet_1o, new_size * sizeof(size_t)));
+        __gg__treeplet_1s = static_cast<size_t *>(realloc(__gg__treeplet_1s, new_size * sizeof(size_t)));
         }
     break;
     case 2:
       if( new_size > treeplet_2_size )
         {
         treeplet_2_size = new_size;
-        __gg__treeplet_2f = (cblc_field_t **)realloc(__gg__treeplet_2f, new_size * sizeof(cblc_field_t *));
-        __gg__treeplet_2o = (size_t *)realloc(__gg__treeplet_2o, new_size * sizeof(size_t));
-        __gg__treeplet_2s = (size_t *)realloc(__gg__treeplet_2s, new_size * sizeof(size_t));
+        __gg__treeplet_2f = static_cast<cblc_field_t **>(realloc(__gg__treeplet_2f, new_size * sizeof(cblc_field_t *)));
+        __gg__treeplet_2o = static_cast<size_t *>(realloc(__gg__treeplet_2o, new_size * sizeof(size_t)));
+        __gg__treeplet_2s = static_cast<size_t *>(realloc(__gg__treeplet_2s, new_size * sizeof(size_t)));
         }
     break;
     case 3:
       if( new_size > treeplet_3_size )
         {
         treeplet_3_size = new_size;
-        __gg__treeplet_3f = (cblc_field_t **)realloc(__gg__treeplet_3f, new_size * sizeof(cblc_field_t *));
-        __gg__treeplet_3o = (size_t *)realloc(__gg__treeplet_3o, new_size * sizeof(size_t));
-        __gg__treeplet_3s = (size_t *)realloc(__gg__treeplet_3s, new_size * sizeof(size_t));
+        __gg__treeplet_3f = static_cast<cblc_field_t **>(realloc(__gg__treeplet_3f, new_size * sizeof(cblc_field_t *)));
+        __gg__treeplet_3o = static_cast<size_t *>(realloc(__gg__treeplet_3o, new_size * sizeof(size_t)));
+        __gg__treeplet_3s = static_cast<size_t *>(realloc(__gg__treeplet_3s, new_size * sizeof(size_t)));
         }
     break;
     case 4:
       if( new_size > treeplet_4_size )
         {
         treeplet_4_size = new_size;
-        __gg__treeplet_4f = (cblc_field_t **)realloc(__gg__treeplet_4f, new_size * sizeof(cblc_field_t *));
-        __gg__treeplet_4o = (size_t *)realloc(__gg__treeplet_4o, new_size * sizeof(size_t));
-        __gg__treeplet_4s = (size_t *)realloc(__gg__treeplet_4s, new_size * sizeof(size_t));
+        __gg__treeplet_4f = static_cast<cblc_field_t **>(realloc(__gg__treeplet_4f, new_size * sizeof(cblc_field_t *)));
+        __gg__treeplet_4o = static_cast<size_t *>(realloc(__gg__treeplet_4o, new_size * sizeof(size_t)));
+        __gg__treeplet_4s = static_cast<size_t *>(realloc(__gg__treeplet_4s, new_size * sizeof(size_t)));
         }
     break;
     }
@@ -527,7 +757,7 @@ __gg__init_program_state()
   }
 
 static int
-var_is_refmod( cblc_field_t *var )
+var_is_refmod( const cblc_field_t *var )
   {
   return (var->attr & refmod_e) != 0;
   }
@@ -696,9 +926,9 @@ __gg__binary_to_string_internal(char *result, int digits, __int128 value)
   }
 
 static bool
-value_is_too_big(   cblc_field_t *var,
-                    __int128 value,
-                    int source_rdigits)
+value_is_too_big(const cblc_field_t *var,
+                 __int128            value,
+                 int                 source_rdigits)
   {
   // This routine is in support of arithmetic ON SIZE ERROR.  It returns
   // TRUE if var hasn't enough bytes to hold the decimal representation
@@ -835,12 +1065,13 @@ is_sign_bit_on(char ch)
 
 extern "C"
 void
-__gg__string_to_alpha_edited_ascii( char *dest,
-                                    char *source,
-                                    int slength,
-                                    char *picture)
+__gg__string_to_alpha_edited_ascii( char       *dest,
+                                    const char *source,
+                                    int         slength,
+                                    const char *picture)
   {
-  char *dupe = (char *)malloc(slength);
+  char *dupe = static_cast<char *>(malloc(slength));
+  massert(dupe);
   memcpy(dupe, source, slength);
   ascii_to_internal_str(dupe, slength);
   __gg__string_to_alpha_edited(dest, dupe, slength, picture);
@@ -855,10 +1086,12 @@ int128_to_int128_rounded( cbl_round_t rounded,
                           int        *compute_error)
   {
   // value is signed, and is scaled to the target
-  _Float128 fpart = _Float128(remainder) / _Float128(factor);
+  GCOB_FP128 fpart = ((GCOB_FP128)remainder) / ((GCOB_FP128)factor);
   __int128 retval = value;
 
-  if(rounded == nearest_even_e && fpart != -0.5Q && fpart != 0.5Q )
+  if(rounded == nearest_even_e
+     && fpart != GCOB_FP128_LITERAL (-0.5)
+     && fpart != GCOB_FP128_LITERAL (0.5))
     {
     // "bankers rounding" has been requested.
     //
@@ -879,14 +1112,14 @@ int128_to_int128_rounded( cbl_round_t rounded,
       // 0.5 through 0.9 becomes 1
       if( value < 0 )
         {
-        if( fpart <= -0.5Q )
+        if( fpart <= GCOB_FP128_LITERAL(-0.5) )
           {
           retval -= 1;
           }
         }
       else
         {
-        if( fpart >= 0.5Q )
+        if( fpart >= GCOB_FP128_LITERAL(0.5) )
           {
           retval += 1;
           }
@@ -920,14 +1153,14 @@ int128_to_int128_rounded( cbl_round_t rounded,
       // 0.6 through 0.9 becomes 1
       if( value < 0 )
         {
-        if( fpart < -0.5Q )
+        if( fpart < GCOB_FP128_LITERAL(-0.5) )
           {
           retval -= 1;
           }
         }
       else
         {
-        if( fpart > 0.5Q )
+        if( fpart > GCOB_FP128_LITERAL(0.5) )
           {
           retval += 1;
           }
@@ -1009,15 +1242,17 @@ int128_to_int128_rounded( cbl_round_t rounded,
 
 static __int128
 f128_to_i128_rounded( cbl_round_t rounded,
-                    _Float128   value,
+                    GCOB_FP128   value,
                     int        *compute_error)
   {
   // value is signed, and is scaled to the target
-  _Float128 ipart;
-  _Float128 fpart = modff128(value, &ipart);
+  GCOB_FP128 ipart;
+  GCOB_FP128 fpart = FP128_FUNC(modf)(value, &ipart);
   __int128 retval = (__int128)ipart;
 
-  if(rounded == nearest_even_e &&  fpart != -0.5Q && fpart != 0.5Q )
+  if(rounded == nearest_even_e
+     && fpart != GCOB_FP128_LITERAL (-0.5)
+     && fpart != GCOB_FP128_LITERAL (0.5))
     {
     // "bankers rounding" has been requested.
     //
@@ -1038,14 +1273,14 @@ f128_to_i128_rounded( cbl_round_t rounded,
       // 0.5 through 0.9 becomes 1
       if( value < 0 )
         {
-        if( fpart <= -0.5Q )
+        if( fpart <= GCOB_FP128_LITERAL (-0.5) )
           {
           retval -= 1;
           }
         }
       else
         {
-        if( fpart >= 0.5Q )
+        if( fpart >= GCOB_FP128_LITERAL (0.5) )
           {
           retval += 1;
           }
@@ -1079,14 +1314,14 @@ f128_to_i128_rounded( cbl_round_t rounded,
       // 0.6 through 0.9 becomes 1
       if( value < 0 )
         {
-        if( fpart < -0.5Q )
+        if( fpart < GCOB_FP128_LITERAL (-0.5) )
           {
           retval -= 1;
           }
         }
       else
         {
-        if( fpart > 0.5Q )
+        if( fpart > GCOB_FP128_LITERAL (0.5) )
           {
           retval += 1;
           }
@@ -1191,7 +1426,7 @@ int128_to_field(cblc_field_t   *var,
           {
           float tvalue = (float)value;
           tvalue /= (float)__gg__power_of_ten(source_rdigits);
-          *(float *)location = tvalue;
+          *PTRCAST(float, location) = tvalue;
           break;
           }
 
@@ -1199,7 +1434,7 @@ int128_to_field(cblc_field_t   *var,
           {
           double tvalue = (double)value;
           tvalue /= (double)__gg__power_of_ten(source_rdigits);
-          *(double *)location = tvalue;
+          *PTRCAST(double, location) = tvalue;
           break;
           }
 
@@ -1250,8 +1485,8 @@ int128_to_field(cblc_field_t   *var,
             {
             value = -value;
             }
-          _Float128 tvalue = (_Float128 )value;
-          tvalue /= (_Float128 )__gg__power_of_ten(source_rdigits);
+          GCOB_FP128 tvalue = (GCOB_FP128 )value;
+          tvalue /= (GCOB_FP128 )__gg__power_of_ten(source_rdigits);
           // *(_Float128  *)location = tvalue;
           // memcpy because *(_Float128  *) requires a 16-byte boundary.
           memcpy(location, &tvalue, 16);
@@ -1263,8 +1498,6 @@ int128_to_field(cblc_field_t   *var,
 
     default:
       {
-      bool size_error = false;
-
       int target_rdigits = var->rdigits;
       if( var->attr & intermediate_e && var->type == FldNumericBin5)
         {
@@ -1354,6 +1587,7 @@ int128_to_field(cblc_field_t   *var,
       else
         {
         // Value is now scaled to the target's target_rdigits
+        bool size_error = false;
 
         int is_negative = value < 0 ;
 
@@ -1383,8 +1617,9 @@ int128_to_field(cblc_field_t   *var,
 
             // Note that sending a signed value to an alphanumeric strips off
             // any plus or minus signs.
-            size_error = __gg__binary_to_string_internal( (char *)location,
-                         length, value);
+            size_error = __gg__binary_to_string_internal(
+                          PTRCAST(char, location),
+                          length, value);
             break;
 
           case FldNumericDisplay:
@@ -1400,7 +1635,7 @@ int128_to_field(cblc_field_t   *var,
                   {
                   // The sign character goes into the first location
                   size_error =
-                    __gg__binary_to_string_internal((char *)(location+1),
+                    __gg__binary_to_string_internal(PTRCAST(char, location+1),
                                                     length-1, value);
                   location[0] = sign_ch;
                   }
@@ -1408,8 +1643,8 @@ int128_to_field(cblc_field_t   *var,
                   {
                   // The sign character goes into the last location
                   size_error =
-                    __gg__binary_to_string_internal(  (char *)location,
-                                                      length-1, value);
+                    __gg__binary_to_string_internal(PTRCAST(char, location),
+                                                    length-1, value);
                   location[length-1] = sign_ch;
                   }
                 }
@@ -1418,7 +1653,7 @@ int128_to_field(cblc_field_t   *var,
                 // The sign information is not separate, so we put it into
                 // the number
                 size_error =
-                  __gg__binary_to_string_internal(( char *)location,
+                  __gg__binary_to_string_internal(PTRCAST(char, location),
                                                   length, value);
 
                 if( size_error && is_negative )
@@ -1454,7 +1689,8 @@ int128_to_field(cblc_field_t   *var,
             else
               {
               // It's a simple positive number
-              size_error = __gg__binary_to_string_internal( (char *)location,
+              size_error = __gg__binary_to_string_internal( PTRCAST(char,
+                                                                    location),
                            length, value);
               }
 
@@ -1477,12 +1713,12 @@ int128_to_field(cblc_field_t   *var,
 
               // Convert that string according to the PICTURE clause
               size_error |= __gg__string_to_numeric_edited(
-                                (char *)location,
+                                 PTRCAST(char, location),
                                 ach,
                                 target_rdigits,
                                 is_negative,
                                 var->picture);
-              ascii_to_internal_str((char *)location, var->capacity);
+              ascii_to_internal_str( PTRCAST(char, location), var->capacity);
               }
 
             break;
@@ -1518,7 +1754,7 @@ int128_to_field(cblc_field_t   *var,
 
             // Convert that string according to the PICTURE clause
             __gg__string_to_alpha_edited(
-              (char *)location,
+              PTRCAST(char, location),
               ach,
               strlen(ach),
               var->picture);
@@ -1634,11 +1870,11 @@ int128_to_field(cblc_field_t   *var,
   }
 
 static __int128
-edited_to_binary( const char *ps_,
+edited_to_binary( char *ps_,
                   int length,
                   int *rdigits)
   {
-  const unsigned char *ps = (const unsigned char *)ps_;
+  const unsigned char *ps = const_cast<const unsigned char *>(PTRCAST(unsigned char, ps_));
   // This routine is used for converting NumericEdited strings to
   // binary.
 
@@ -1664,8 +1900,6 @@ edited_to_binary( const char *ps_,
 
   __int128 result = 0;
 
-  unsigned char ch;
-
   // We need to check the last two characters.  If CR or DB, then the result
   // is negative:
   if( length >= 2)
@@ -1686,7 +1920,7 @@ edited_to_binary( const char *ps_,
 
   while( index < length )
     {
-    ch = ps[index++] & 0xFF;
+    unsigned char ch = ps[index++] & 0xFF;
     if( ch == ascii_to_internal(__gg__decimal_point) )
       {
       delta_r = 1;
@@ -1708,11 +1942,7 @@ edited_to_binary( const char *ps_,
       }
     }
 
-  if( result == 0 )
-    {
-    hyphen = 0;
-    }
-  else if( hyphen )
+  if( hyphen )
     {
     result = -result;
     }
@@ -1742,7 +1972,7 @@ big_endian_to_binary_signed(
     }
 
   // move the bytes of psource into retval, flipping them end-to-end
-  unsigned char *dest = (unsigned char *)&retval;
+  unsigned char *dest = PTRCAST(unsigned char, &retval);
   while(capacity > 0)
     {
     *dest++ = psource[--capacity];
@@ -1806,7 +2036,7 @@ big_endian_to_binary_unsigned(
   __int128 retval = 0 ;
 
   // move the bytes of psource into retval, flipping them end-to-end
-  unsigned char *dest = (unsigned char *)&retval;
+  unsigned char *dest = PTRCAST(unsigned char, &retval);
   while(capacity > 0)
     {
     *dest++ = psource[--capacity];
@@ -1816,10 +2046,10 @@ big_endian_to_binary_unsigned(
 
 static
 __int128
-get_binary_value_local(  int           *rdigits,
-                         cblc_field_t  *resolved_var,
-                         unsigned char *resolved_location,
-                         size_t         resolved_length)
+get_binary_value_local(  int                 *rdigits,
+                         const cblc_field_t  *resolved_var,
+                         unsigned char       *resolved_location,
+                         size_t               resolved_length)
   {
   __int128 retval = 0;
 
@@ -1840,7 +2070,8 @@ get_binary_value_local(  int           *rdigits,
     case FldGroup :
     case FldAlphanumeric :
       // Read the data area as a dirty string:
-      retval = __gg__dirty_to_binary_internal( (const char *)resolved_location,
+      retval = __gg__dirty_to_binary_internal( PTRCAST(const char,
+                                                       resolved_location),
                resolved_length,
                rdigits );
       break;
@@ -1867,8 +2098,8 @@ get_binary_value_local(  int           *rdigits,
         // Turn all the bits on
         memset( &retval, 0xFF, sizeof(retval) );
 
-        // Make it positive
-        ((unsigned char *)&retval)[sizeof(retval)-1] = 0x3F;
+        // Make it positive by turning off the highest order bit:
+        (PTRCAST(unsigned char, &retval))[sizeof(retval)-1] = 0x3F;
         *rdigits = resolved_var->rdigits;
         }
       else
@@ -1905,7 +2136,8 @@ get_binary_value_local(  int           *rdigits,
         // We know where the decimal point is because of rdigits.  Because
         // we know that it a clean string of ASCII digits, we can use the
         // dirty converter:
-        retval = __gg__dirty_to_binary_internal((const char *)resolved_location,
+        retval = __gg__dirty_to_binary_internal(PTRCAST(const char,
+                                                        resolved_location),
                  resolved_length,
                  rdigits );
         *rdigits = resolved_var->rdigits;
@@ -1921,7 +2153,7 @@ get_binary_value_local(  int           *rdigits,
       break;
 
     case FldNumericEdited :
-      retval = edited_to_binary(  (const char *)resolved_location,
+      retval = edited_to_binary(  PTRCAST(char, resolved_location),
                                   resolved_length,
                                   rdigits);
       break;
@@ -1930,13 +2162,13 @@ get_binary_value_local(  int           *rdigits,
       if( resolved_var->attr & signable_e)
         {
         retval = big_endian_to_binary_signed(
-                        (const unsigned char *)resolved_location,
+                        PTRCAST(const unsigned char, resolved_location),
                         resolved_length);
         }
       else
         {
         retval = big_endian_to_binary_unsigned(
-                        (const unsigned char *)resolved_location,
+                        PTRCAST(const unsigned char, resolved_location),
                         resolved_length);
         }
       *rdigits = resolved_var->rdigits;
@@ -1964,13 +2196,13 @@ get_binary_value_local(  int           *rdigits,
       if( resolved_var->attr & signable_e)
         {
         retval = little_endian_to_binary_signed(
-                      (const unsigned char *)resolved_location,
+                      PTRCAST(const unsigned char, resolved_location),
                       resolved_length);
         }
       else
         {
         retval = little_endian_to_binary_unsigned(
-                      (const unsigned char *)resolved_location,
+                      PTRCAST(const unsigned char, resolved_location),
                       resolved_length);
         }
       *rdigits = resolved_var->rdigits;
@@ -2058,8 +2290,8 @@ get_binary_value_local(  int           *rdigits,
 static time_t
 cobol_time()
   {
-  struct timespec tp;
-  __gg__clock_gettime(CLOCK_REALTIME, &tp);
+  struct cbl_timespec tp;
+  __gg__clock_gettime(&tp);
   return tp.tv_sec;
   }
 
@@ -2070,7 +2302,7 @@ __gg__get_date_yymmdd()
   char ach[32];
 
   time_t t = cobol_time();
-  struct tm *local = localtime(&t);
+  const struct tm *local = localtime(&t);
 
   sprintf(ach,
           "%2.2d%2.2d%2.2d",
@@ -2089,7 +2321,7 @@ __gg__get_date_yyyymmdd()
   char ach[32];
 
   time_t t = cobol_time();
-  struct tm *local = localtime(&t);
+  const struct tm *local = localtime(&t);
 
   sprintf(ach,
           "%4.4d%2.2d%2.2d",
@@ -2108,7 +2340,7 @@ __gg__get_date_yyddd()
   char ach[32];
 
   time_t t = cobol_time();
-  struct tm *local = localtime(&t);
+  const struct tm *local = localtime(&t);
 
   sprintf(ach,
           "%2.2d%3.3d",
@@ -2126,7 +2358,7 @@ __gg__get_yyyyddd()
   char ach[32];
 
   time_t t = cobol_time();
-  struct tm *local = localtime(&t);
+  const struct tm *local = localtime(&t);
 
   sprintf(ach,
           "%4.4d%3.3d",
@@ -2144,7 +2376,7 @@ __gg__get_date_dow()
   char ach[32];
 
   time_t t = cobol_time();
-  struct tm *local = localtime(&t);
+  const struct tm *local = localtime(&t);
 
   sprintf(ach,
           "%1.1d",
@@ -2171,12 +2403,51 @@ int_from_digits(const char * &p, int ndigits)
   return retval;
   }
 
+// For testing purposes, this undef causes the use of gettimeofday().
+// #undef HAVE_CLOCK_GETTIME
+
+static uint64_t
+get_time_nanoseconds_local()
+{
+  // This code was unabashedly stolen from gcc/timevar.cc.
+  // It returns the Unix epoch with nine decimal places.
+
+  /*  Note:  I am perplexed.  I have been examining the gcc Makefiles and
+      configure.ac files, and I am unable to locate where HAVE_GETTIMEOFDAY
+      is established.  There have been issues compiling on MacOS, where
+      apparently clock_gettime() is not available.  But I don't see exactly
+      how gettimeofday() gets used, instead.  But without the ability to
+      compile on a MacOS system, I am fumbling along as best I can.
+
+      I decided to simply replace clock_gettime() with getttimeofday() when
+      clock_gettime() isn't available, even though gcc/timevar.cc handles
+      the situation differently.
+
+           -- Bob Dubner, 2025-06-11*/
+
+  uint64_t retval = 0;
+
+#ifdef HAVE_CLOCK_GETTIME
+  struct timespec ts;
+  clock_gettime (CLOCK_REALTIME, &ts);
+  retval = ts.tv_sec * 1000000000 + ts.tv_nsec;
+  return retval;
+//#endif
+//#ifdef HAVE_GETTIMEOFDAY
+#else
+  struct timeval tv;
+  gettimeofday (&tv, NULL);
+  retval = tv.tv_sec * 1000000000 + tv.tv_usec * 1000;
+  return retval;
+#endif
+  return retval;
+}
 
 extern "C"
 void
-__gg__clock_gettime(clockid_t clk_id, struct timespec *tp)
+__gg__clock_gettime(struct cbl_timespec *tp)
   {
-  const char *p = getenv("COB_CURRENT_DATE");
+  const char *p = getenv("GCOBOL_CURRENT_DATE");
 
   if( p )
     {
@@ -2204,7 +2475,9 @@ __gg__clock_gettime(clockid_t clk_id, struct timespec *tp)
     }
   else
     {
-    clock_gettime(clk_id, tp);
+    uint64_t ns = get_time_nanoseconds_local();
+    tp->tv_sec  = ns/1000000000;
+    tp->tv_nsec = ns%1000000000;
     }
   }
 
@@ -2214,8 +2487,8 @@ __gg__get_date_hhmmssff()
   {
   char ach[32];
 
-  struct timespec tv;
-  __gg__clock_gettime(CLOCK_REALTIME, &tv);
+  struct cbl_timespec tv;
+  __gg__clock_gettime(&tv);
 
   struct tm tm;
   localtime_r(&tv.tv_sec, &tm);
@@ -2244,20 +2517,19 @@ int
 __gg__setop_compare(
   const char *candidate,
   int capacity,
-  const char *domain)
+  char *domain)
   {
   // This routine is called to compare the characters of 'candidate'
   // against the list of character pairs in 'domain'
 
   int retval = 0;
-  int ch;
   int l;
   int h;
-  const char *d;
+  char *d;
 
   for(int i=0; i<capacity; i++)
     {
-    ch = (*candidate++ & 0xFF);
+    int ch = (*candidate++ & 0xFF);
     d = domain;
     while(*d)
       {
@@ -2269,7 +2541,7 @@ __gg__setop_compare(
       // See the comments in genapi.cc::get_class_condition_string
       // to see how this string was encoded.
 
-      l = (int)strtoll(d, (char **)&d, 16);
+      l = (int)strtoll(d, reinterpret_cast<char **>(&d), 16);
       if( l < 0 )
         {
         l = -l;
@@ -2278,7 +2550,7 @@ __gg__setop_compare(
       if( *d == '/' )
         {
         d += 1;
-        h = (int)strtoll(d, (char **)&d, 16);
+        h = (int)strtoll(d, reinterpret_cast<char **>(&d), 16);
         if( h < 0 )
           {
           h = -h;
@@ -2547,7 +2819,7 @@ __gg__dirty_to_binary_internal( const char *dirty,
   }
 
 extern "C"
-_Float128
+GCOB_FP128
 __gg__dirty_to_float( const char *dirty,
                       int length)
   {
@@ -2563,7 +2835,7 @@ __gg__dirty_to_float( const char *dirty,
 
   // It also can handle 12345E-2 notation.
 
-  _Float128 retval = 0;
+  GCOB_FP128 retval = 0;
 
   int rdigits = 0;
   int hyphen  = 0;
@@ -2728,7 +3000,7 @@ void psz_to_internal(char *psz)
   }
 
 static int
-get_scaled_rdigits(cblc_field_t *field)
+get_scaled_rdigits(const cblc_field_t *field)
   {
   int retval;
   if( !(field->attr & scaled_e) )
@@ -2833,7 +3105,7 @@ format_for_display_internal(char **dest,
         break;
         }
 
-      unsigned char *running_location = actual_location;
+      const unsigned char *running_location = actual_location;
 
       // We need the counts of digits to the left and right of the decimal point
       int rdigits = get_scaled_rdigits(var);
@@ -2848,7 +3120,6 @@ format_for_display_internal(char **dest,
         rdigits += ldigits;
         }
 
-      int index = 0;  // This is the running index into our output destination
       if( rdigits )
         {
         // We need room for the inside decimal point
@@ -2865,6 +3136,7 @@ format_for_display_internal(char **dest,
 
       if( actual_location )
         {
+        int index = 0;  // This is the running index into our output destination
         if( var->attr & signable_e )
           {
           if( var->attr & separate_e )
@@ -2909,7 +3181,7 @@ format_for_display_internal(char **dest,
             // the user.
             if( (*dest)[index-1] != (char)DEGENERATE_HIGH_VALUE )
               {
-              turn_sign_bit_off((unsigned char *)&ch);
+              turn_sign_bit_off( PTRCAST(unsigned char, &ch));
               }
             (*dest)[index++] = ch;
             }
@@ -2933,7 +3205,7 @@ format_for_display_internal(char **dest,
               char ch = *running_location++;
               if( (*dest)[index-1] != (char)DEGENERATE_HIGH_VALUE )
                 {
-                turn_sign_bit_off((unsigned char *)&ch);
+                turn_sign_bit_off(PTRCAST(unsigned char, &ch));
                 }
               (*dest)[index++] = ch;
               }
@@ -3042,11 +3314,9 @@ format_for_display_internal(char **dest,
         }
       __gg__realloc_if_necessary(dest, dest_size, nsize);
 
-      bool is_signed = value < 0;
-
       if( var->attr & signable_e )
         {
-        if( is_signed )
+        if( value < 0 )
           {
           (*dest)[index++] = internal_minus;
           }
@@ -3078,7 +3348,7 @@ format_for_display_internal(char **dest,
                                               actual_location,
                                               actual_length);
       char ach[64];
-      sprintf(ach, "%lu", (size_t)value);
+      sprintf(ach, "%lu", (unsigned long)value);
       __gg__realloc_if_necessary(dest, dest_size, strlen(ach)+1);
       strcpy(*dest, ach);
       }
@@ -3134,7 +3404,7 @@ format_for_display_internal(char **dest,
           // side, and 9999999 and then 1E+7 on the high side
           // 10,000,000 = 1E7
           char ach[64];
-          _Float32 floatval = *(_Float32 *)actual_location;
+          _Float32 floatval = *PTRCAST(_Float32, actual_location);
           strfromf32(ach, sizeof(ach), "%.9E", floatval);
           char *p = strchr(ach, 'E');
           if( !p )
@@ -3174,7 +3444,7 @@ format_for_display_internal(char **dest,
           // We will also format numbers so that we produce 0.01 and 1E-3 on the low
           // side, and 9999999 and then 1E+15 on the high side
           char ach[64];
-          _Float64 floatval = *(_Float64 *)actual_location;
+          _Float64 floatval = *PTRCAST(_Float64, actual_location);
           strfromf64(ach, sizeof(ach), "%.17E", floatval);
           char *p = strchr(ach, 'E');
           if( !p )
@@ -3218,9 +3488,9 @@ format_for_display_internal(char **dest,
           // We can't use *(_Float64 *)actual_location;
           // That uses the SSE registers, which won't work if the source isn't
           // on a 16-bit boundary.
-          _Float128 floatval;
+          GCOB_FP128 floatval;
           memcpy(&floatval, actual_location, 16);
-          strfromf128(ach, sizeof(ach), "%.36E", floatval);
+          strfromfp128(ach, sizeof(ach), "%.36" FP128_FMT "E", floatval);
           char *p = strchr(ach, 'E');
           if( !p )
             {
@@ -3242,8 +3512,8 @@ format_for_display_internal(char **dest,
 
               int precision = 36 - exp;
               char achFormat[24];
-              sprintf(achFormat, "%%.%df", precision);
-              strfromf128(ach, sizeof(ach), achFormat, floatval);
+              sprintf(achFormat, "%%.%d" FP128_FMT "f", precision);
+              strfromfp128(ach, sizeof(ach), achFormat, floatval);
               }
             __gg__remove_trailing_zeroes(ach);
             __gg__realloc_if_necessary(dest, dest_size, strlen(ach)+1);
@@ -3268,7 +3538,8 @@ format_for_display_internal(char **dest,
   if( var->attr & scaled_e && var->type != FldNumericDisplay )
     {
     static size_t buffer_size = MINIMUM_ALLOCATION_SIZE;
-    static char * buffer = (char *)malloc(buffer_size);
+    static char  *buffer = static_cast<char *>(malloc(buffer_size));
+    massert(buffer);
     if( var->rdigits > 0)
       {
       // We have something like 123 or +123.  We need to insert a decimal
@@ -3327,7 +3598,7 @@ format_for_display_internal(char **dest,
       {
       p2 += 1;
       }
-    strcpy((char *)p1, (char *)p2);
+    strcpy(PTRCAST(char, p1), PTRCAST(char, p2));
     }
 
   done:
@@ -3376,7 +3647,8 @@ compare_88( const char    *list,
     {
     // We are working with a figurative constant
 
-    test = (char *)malloc(conditional_length);
+    test = static_cast<char *>(malloc(conditional_length));
+    massert(test);
     test_len = conditional_length;
     // This is where we handle the zero-length strings that
     // nonetheless can magically be expanded into figurative
@@ -3413,14 +3685,16 @@ compare_88( const char    *list,
   else if( list_len < conditional_length )
     {
     // 'list' is too short; we have to right-fill with spaces:
-    test = (char *)malloc(conditional_length);
+    test = static_cast<char *>(malloc(conditional_length));
+    massert(test);
     test_len = conditional_length;
     memset(test, internal_space, conditional_length);
     memcpy(test, list, list_len);
     }
   else
     {
-    test = (char *)malloc(list_len);
+    test = static_cast<char *>(malloc(list_len));
+    massert(test);
     test_len = list_len;
     memcpy(test, list, list_len);
     }
@@ -3433,7 +3707,9 @@ compare_88( const char    *list,
     }
   else
     {
-    cmpval = cstrncmp(test, (char *)conditional_location, conditional_length);
+    cmpval = cstrncmp (test,
+                      PTRCAST(char, conditional_location),
+                      conditional_length);
     if( cmpval == 0 && (int)strlen(test) != conditional_length )
       {
       // When strncmp returns 0, the actual smaller string is the
@@ -3455,20 +3731,20 @@ compare_88( const char    *list,
   return cmpval;
   }
 
-static _Float128
-get_float128( cblc_field_t *field,
+static GCOB_FP128
+get_float128( const cblc_field_t *field,
               unsigned char *location )
   {
-  _Float128 retval=0;
+  GCOB_FP128 retval=0;
   if(field->type == FldFloat )
     {
     switch( field->capacity )
       {
       case 4:
-        retval = *(_Float32 *)location;
+        retval = *PTRCAST(_Float32 , location);
         break;
       case 8:
-        retval = *(_Float64 *)location;
+        retval = *PTRCAST(_Float64 , location);
         break;
       case 16:
         // retval = *(_Float128 *)location; doesn't work, because the SSE
@@ -3482,25 +3758,26 @@ get_float128( cblc_field_t *field,
     {
     if( __gg__decimal_point == '.' )
       {
-      retval = strtof128(field->initial, NULL);
+      retval = strtofp128(field->initial, NULL);
       }
     else
       {
       // We need to replace any commas with periods
       static size_t size = 128;
-      static char *buffer = (char *)malloc(size);
+      static char *buffer = static_cast<char *>(malloc(size));
       while( strlen(field->initial)+1 > size )
         {
         size *= 2;
-        buffer = (char *)malloc(size);
+        buffer = static_cast<char *>(malloc(size));
         }
+      massert(buffer);
       strcpy(buffer, field->initial);
       char *p = strchr(buffer, ',');
       if(p)
         {
         *p = '.';
         }
-      retval = strtof128(buffer, NULL);
+      retval = strtofp128(buffer, NULL);
       }
     }
   else
@@ -3538,7 +3815,7 @@ compare_field_class(cblc_field_t  *conditional,
                                       conditional,
                                       conditional_location,
                                       conditional_length);
-      char *walker = list->initial;
+      const char *walker = list->initial;
       while(*walker)
         {
         char   left_flag;
@@ -3684,8 +3961,8 @@ compare_field_class(cblc_field_t  *conditional,
 
     case FldFloat:
       {
-      _Float128 value = get_float128(conditional, conditional_location) ;
-      char *walker = list->initial;
+      GCOB_FP128 fp128 = get_float128(conditional, conditional_location) ;
+      const char *walker = list->initial;
       while(*walker)
         {
         char   left_flag;
@@ -3708,7 +3985,7 @@ compare_field_class(cblc_field_t  *conditional,
 
         walker = right + right_len;
 
-        _Float128 left_value;
+        GCOB_FP128 left_value;
         if( left_flag == 'F' && left[0] == 'Z' )
           {
           left_value = 0;
@@ -3719,7 +3996,7 @@ compare_field_class(cblc_field_t  *conditional,
                                             left_len);
           }
 
-        _Float128 right_value;
+        GCOB_FP128 right_value;
         if( right_flag == 'F' && right[0] == 'Z' )
           {
           right_value = 0;
@@ -3730,7 +4007,7 @@ compare_field_class(cblc_field_t  *conditional,
                                               right_len);
           }
 
-        if( left_value <= value && value <= right_value )
+        if( left_value <= fp128 && fp128 <= right_value )
           {
           retval = 0;
           break;
@@ -3810,12 +4087,12 @@ local_is_alpha(int type, bool address_of)
 
 static
 int
-compare_strings(char   *left_string,
-                size_t  left_length,
-                bool    left_all,
-                char   *right_string,
-                size_t  right_length,
-                bool    right_all)
+compare_strings(const char   *left_string,
+                size_t        left_length,
+                bool          left_all,
+                const char   *right_string,
+                size_t        right_length,
+                bool          right_all)
   {
   int retval = 0;
   size_t i = 0;
@@ -3893,22 +4170,16 @@ __gg__compare_2(cblc_field_t *left_side,
                 unsigned char   *left_location,
                 size_t  left_length,
                 int     left_attr,
-                bool    left_all,
-                bool    left_address_of,
+                int     left_flags,
                 cblc_field_t *right_side,
                 unsigned char   *right_location,
                 size_t  right_length,
                 int     right_attr,
-                bool    right_all,
-                bool    right_address_of,
+                int     right_flags,
                 int     second_time_through)
   {
   // First order of business:  If right_side is a FldClass, pass that off
   // to the speciality squad:
-
-  // static size_t converted_initial_size = MINIMUM_ALLOCATION_SIZE;
-  // static unsigned char *converted_initial =
-                                // (unsigned char *)malloc(converted_initial_size);
 
   if( right_side->type == FldClass )
     {
@@ -3919,8 +4190,17 @@ __gg__compare_2(cblc_field_t *left_side,
     }
 
   // Serene in our conviction that the left_side isn't a FldClass, we
-  // move on:
+  // move on.
 
+  // Extract the individual flags from the flag words:
+  bool left_all         = !!(left_flags  & REFER_T_MOVE_ALL  );
+  bool left_address_of  = !!(left_flags  & REFER_T_ADDRESS_OF);
+  bool right_all        = !!(right_flags & REFER_T_MOVE_ALL  );
+  bool right_address_of = !!(right_flags & REFER_T_ADDRESS_OF);
+//bool left_refmod      = !!(left_flags  & REFER_T_REFMOD    );
+  bool right_refmod     = !!(right_flags & REFER_T_REFMOD    );
+
+  // Figure out if we have any figurative constants
   cbl_figconst_t left_figconst  = (cbl_figconst_t)(left_attr  & FIGCONST_MASK);
   cbl_figconst_t right_figconst = (cbl_figconst_t)(right_attr & FIGCONST_MASK);
 
@@ -4066,16 +4346,18 @@ __gg__compare_2(cblc_field_t *left_side,
             retval = 0;
             retval = value < 0 ? -1 : retval;
             retval = value > 0 ?  1 : retval;
+            compare = true;
             break;
             }
 
           case FldFloat:
             {
-            _Float128 value = __gg__float128_from_location(left_side,
+            GCOB_FP128 value = __gg__float128_from_location(left_side,
                                                            left_location);
             retval = 0;
             retval = value < 0 ? -1 : retval;
             retval = value > 0 ?  1 : retval;
+            compare = true;
             break;
             }
 
@@ -4094,9 +4376,7 @@ __gg__compare_2(cblc_field_t *left_side,
             compare = true;
             break;
           }
-        compare = true;
         goto fixup_retval;
-        break;
         }
       }
     }
@@ -4111,10 +4391,10 @@ __gg__compare_2(cblc_field_t *left_side,
     if(    local_is_alpha(left_side->type,  left_address_of)
         && local_is_alpha(right_side->type, right_address_of) )
       {
-      retval = compare_strings(   (char *)left_location,
+      retval = compare_strings(   reinterpret_cast<char *>(left_location),
                                   left_length,
                                   left_all,
-                                  (char *)right_location,
+                                  reinterpret_cast<char *>(right_location),
                                   right_length,
                                   right_all );
 
@@ -4128,8 +4408,8 @@ __gg__compare_2(cblc_field_t *left_side,
       if( left_side->type == FldFloat && right_side->type == FldFloat )
         {
         // One or the other of the numerics is a FldFloat
-        _Float128 left_value  = __gg__float128_from_location(left_side,  left_location);
-        _Float128 right_value = __gg__float128_from_location(right_side, right_location);
+        GCOB_FP128 left_value  = __gg__float128_from_location(left_side,  left_location);
+        GCOB_FP128 right_value = __gg__float128_from_location(right_side, right_location);
         retval = 0;
         retval = left_value < right_value ? -1 : retval;
         retval = left_value > right_value ?  1 : retval;
@@ -4141,8 +4421,8 @@ __gg__compare_2(cblc_field_t *left_side,
         {
         // The left side is a FldFloat; the other is another type of numeric:
         int rdecimals;
-        _Float128 left_value;
-        _Float128 right_value;
+        GCOB_FP128 left_value;
+        GCOB_FP128 right_value;
 
         if( right_side->type == FldLiteralN)
           {
@@ -4150,12 +4430,13 @@ __gg__compare_2(cblc_field_t *left_side,
           // literal to be the same flavor as the left side:
           // We need to replace any commas with periods
           static size_t size = 128;
-          static char *buffer = (char *)malloc(size);
+          static char *buffer = static_cast<char *>(malloc(size));
           while( strlen(right_side->initial)+1 > size )
             {
             size *= 2;
-            buffer = (char *)malloc(size);
+            buffer = static_cast<char *>(malloc(size));
             }
+          massert(buffer);
           strcpy(buffer, right_side->initial);
           if( __gg__decimal_point == ',' )
             {
@@ -4173,31 +4454,31 @@ __gg__compare_2(cblc_field_t *left_side,
             {
             case 4:
               {
-              _Float32 left_value  = *(_Float32 *)left_location;
-              _Float32 right_value = strtof32(buffer, NULL);
+              _Float32 left_value4  = *PTRCAST(_Float32, left_location);
+              _Float32 right_value4 = strtof(buffer, NULL);
               retval = 0;
-              retval = left_value < right_value ? -1 : retval;
-              retval = left_value > right_value ?  1 : retval;
+              retval = left_value4 < right_value4 ? -1 : retval;
+              retval = left_value4 > right_value4 ?  1 : retval;
               break;
               }
             case 8:
               {
-              _Float64 left_value  = *(_Float64 *)left_location;
-              _Float64 right_value = strtof64(buffer, NULL);
+              _Float64 left_value8  = *PTRCAST(_Float64, left_location);
+              _Float64 right_value8 = strtod(buffer, NULL);
               retval = 0;
-              retval = left_value < right_value ? -1 : retval;
-              retval = left_value > right_value ?  1 : retval;
+              retval = left_value8 < right_value8 ? -1 : retval;
+              retval = left_value8 > right_value8 ?  1 : retval;
               break;
               }
             case 16:
               {
               //_Float128 left_value  = *(_Float128 *)left_location;
-              _Float128 left_value;
-              memcpy(&left_value, left_location, 16);
-              _Float128 right_value = strtof128(buffer, NULL);
+              GCOB_FP128 left_value16;
+              memcpy(&left_value16, left_location, 16);
+              GCOB_FP128 right_value16 = strtofp128(buffer, NULL);
               retval = 0;
-              retval = left_value < right_value ? -1 : retval;
-              retval = left_value > right_value ?  1 : retval;
+              retval = left_value16 < right_value16 ? -1 : retval;
+              retval = left_value16 > right_value16 ?  1 : retval;
               break;
               }
             }
@@ -4276,6 +4557,23 @@ __gg__compare_2(cblc_field_t *left_side,
       {
       // We are comparing an alphanumeric to a numeric.
 
+      // The right side is numeric.  Sometimes people write code where they
+      // take the refmod of a numeric displays.  If somebody did that here,
+      // just do a complete straight-up character by character comparison:
+
+      if( right_refmod )
+        {
+        retval = compare_strings(   reinterpret_cast<char *>(left_location),
+                                    left_length,
+                                    left_all,
+                                    reinterpret_cast<char *>(right_location),
+                                    right_length,
+                                    right_all);
+        compare = true;
+        goto fixup_retval;
+        }
+
+
       // The trick here is to convert the numeric to its display form,
       // and compare that to the alphanumeric. For example, when comparing
       // a VAL5 PIC X(3) VALUE 5 to literals,
@@ -4284,15 +4582,15 @@ __gg__compare_2(cblc_field_t *left_side,
       // VAL5 EQUAL  005  is TRUE
       // VAL5 EQUAL   "5" is FALSE
       // VAL5 EQUAL "005" is TRUE
-
       if( left_side->type == FldLiteralA )
         {
-        left_location = (unsigned char *)left_side->data;
+        left_location = reinterpret_cast<unsigned char *>(left_side->data);
         left_length   = left_side->capacity;
         }
 
       static size_t right_string_size = MINIMUM_ALLOCATION_SIZE;
-      static char *right_string = (char *)malloc(right_string_size);
+      static char *right_string
+                              = static_cast<char *>(malloc(right_string_size));
 
       right_string = format_for_display_internal(
                              &right_string,
@@ -4316,7 +4614,7 @@ __gg__compare_2(cblc_field_t *left_side,
         left_length -= 1;
         }
 
-      char *right_fixed;
+      const char *right_fixed;
       if( *right_string == internal_plus || *right_string == internal_minus )
         {
         right_fixed = right_string + 1;
@@ -4326,7 +4624,7 @@ __gg__compare_2(cblc_field_t *left_side,
         right_fixed = right_string;
         }
 
-      retval = compare_strings(   (char *)left_location,
+      retval = compare_strings(   reinterpret_cast<char *>(left_location),
                                   left_length,
                                   left_all,
                                   right_fixed,
@@ -4347,14 +4645,12 @@ fixup_retval:
                                 right_location,
                                 right_length,
                                 right_attr,
-                                right_all,
-                                right_address_of,
+                                right_flags,
                                 left_side,
                                 left_location,
                                 left_length,
                                 left_attr,
-                                left_all,
-                                left_address_of,
+                                left_flags,
                                 1);
     // And reverse the sense of the return value:
     compare = true;
@@ -4402,14 +4698,12 @@ __gg__compare(struct cblc_field_t *left,
                             left->data + left_offset,
                             left_length,
                             left->attr,
-                            !!(left_flags & REFER_T_MOVE_ALL),
-                            !!(left_flags & REFER_T_ADDRESS_OF),
+                            left_flags,
                             right,
                             right->data + right_offset,
                             right_length,
                             right->attr,
-                            !!(right_flags & REFER_T_MOVE_ALL),
-                            !!(right_flags & REFER_T_ADDRESS_OF),
+                            right_flags,
                             second_time_through);
   return retval;
   }
@@ -4563,16 +4857,16 @@ sort_contents(unsigned char       *contents,
 
 extern "C"
 void
-__gg__sort_table( cblc_field_t    *table,
-                  size_t           table_o,
-                  size_t          depending_on,
-                  size_t          nkeys,
-                  cblc_field_t  **keys,
-                  size_t         *ascending,
-                  int             duplicates )
+__gg__sort_table( const cblc_field_t    *table,
+                  size_t                 table_o,
+                  size_t                 depending_on,
+                  size_t                 nkeys,
+                  cblc_field_t         **keys,
+                  size_t                *ascending,
+                  int                    duplicates )
   {
   size_t buffer_size = 128;
-  unsigned char *contents = (unsigned char *)malloc(buffer_size);
+  unsigned char *contents = static_cast<unsigned char *>(malloc(buffer_size));
   size_t offset = 0;
   std::vector<size_t>offsets;
   size_t record_size = table->capacity;
@@ -4584,7 +4878,7 @@ __gg__sort_table( cblc_field_t    *table,
     while( offset + sizeof(size_t) + record_size > buffer_size )
       {
       buffer_size *= 2;
-      contents = (unsigned char *)realloc(contents, buffer_size);
+      contents = static_cast<unsigned char *>(realloc(contents, buffer_size));
       }
     offsets.push_back(offset);
     memcpy(contents+offset, &record_size, sizeof(size_t));
@@ -4664,7 +4958,7 @@ init_var_both(cblc_field_t  *var,
     {
     //fprintf(stderr, "ABORTING on %2.2d %s %d\n", var->level, var->name, var->type);
     //abort();
-    var->data = (unsigned char *)malloc(var->capacity);
+    var->data = static_cast<unsigned char *>(malloc(var->capacity));
     }
 
   // Set the "initialized" bit, which is tested in parser_symbol_add to make
@@ -4690,11 +4984,11 @@ init_var_both(cblc_field_t  *var,
     // We need to convert the options to the internal native codeset
 
     size_t buffer_size = 4;
-    char *buffer = (char *)malloc(buffer_size);
+    char *buffer = static_cast<char *>(malloc(buffer_size));
 
     size_t index = 0;
 
-    cblc_field_t *parent = var->parent;
+    const cblc_field_t *parent = var->parent;
     switch(parent->type)
       {
       case FldGroup:
@@ -4704,9 +4998,9 @@ init_var_both(cblc_field_t  *var,
         while(*walker)
           {
           static size_t first_size = MINIMUM_ALLOCATION_SIZE;
-          static char *first = (char *)malloc(first_size);
+          static char *first = static_cast<char *>(malloc(first_size));
           static size_t last_size = MINIMUM_ALLOCATION_SIZE;
-          static char *last = (char *)malloc(last_size);
+          static char *last = static_cast<char *>(malloc(last_size));
           if( (*walker & 0xFF) == 0xFF )
             {
             strcpy(first, walker);
@@ -4729,7 +5023,7 @@ init_var_both(cblc_field_t  *var,
           while(index + strlen(first) + strlen(last) + 3 > buffer_size)
             {
             buffer_size *= 2;
-            buffer = (char *)realloc(buffer, buffer_size);
+            buffer = static_cast<char *>(realloc(buffer, buffer_size));
             }
           strcpy(buffer+index, first);
           index += strlen(first) + 1;
@@ -4742,7 +5036,7 @@ init_var_both(cblc_field_t  *var,
       }
     if( index > 0 )
       {
-      buffer = (char *)realloc(buffer, index);
+      buffer = static_cast<char *>(realloc(buffer, index));
       local_initial = buffer;
       }
     }
@@ -4782,7 +5076,7 @@ init_var_both(cblc_field_t  *var,
   // memory to the default.  But if a parent has been initialized, we must not
   // touch our memory:
   bool a_parent_initialized = false;
-  if( var->data && !explicitly )
+  if( !explicitly )
     {
     while(parent)
       {
@@ -4998,7 +5292,7 @@ init_var_both(cblc_field_t  *var,
         __gg__abort("Unknown variable type");
       }
 
-    char *location = (char *)save_the_location;
+    char *location = reinterpret_cast<char *>(save_the_location);
 
     there_is_more = false;
     size_t i=0;
@@ -5024,7 +5318,7 @@ init_var_both(cblc_field_t  *var,
         }
       }
 
-    outer_location = (unsigned char *)location;
+    outer_location = reinterpret_cast<unsigned char *>(location);
     } while(there_is_more);
 
   var->data = save_the_location;
@@ -5071,7 +5365,7 @@ alpha_to_alpha_move_from_location(cblc_field_t *field,
   // and dest are alphanumeric
   dest_length = dest_length ? dest_length : field->capacity;
 
-  char *to         = (char *)field->data + dest_offset;
+  char *to         = reinterpret_cast<char *>(field->data + dest_offset);
   const char *from = source_location;
   size_t count     = std::min(dest_length, source_length);
 
@@ -5167,7 +5461,7 @@ static void
 alpha_to_alpha_move(cblc_field_t *dest,
                     size_t dest_offset,
                     size_t dest_size,
-                    cblc_field_t *source,
+                    const cblc_field_t *source,
                     size_t source_offset,
                     size_t source_size,
                     bool source_move_all)
@@ -5175,7 +5469,7 @@ alpha_to_alpha_move(cblc_field_t *dest,
   alpha_to_alpha_move_from_location(  dest,
                                       dest_offset,
                                       dest_size,
-                                      (char *)(source->data + source_offset),
+                                      reinterpret_cast<char *>(source->data + source_offset),
                                       source_size,
                                       source_move_all);
   }
@@ -5209,12 +5503,8 @@ __gg__move( cblc_field_t        *fdest,
   {
   int size_error = 0; // This is the return value
 
-  bool moved = true;
-
   __int128 value;
   int rdigits;
-
-  size_t min_length;
 
   cbl_figconst_t source_figconst =
                         (cbl_figconst_t)(fsource->attr & FIGCONST_MASK);
@@ -5259,7 +5549,7 @@ __gg__move( cblc_field_t        *fdest,
      *  standard COBOL and its use should be avoided
      */
 
-    int special_char;
+    int special_char = 0; // quiets cppcheck
     if( source_figconst == low_value_e )
       {
       special_char = ascii_to_internal(__gg__low_value_character);
@@ -5282,6 +5572,8 @@ __gg__move( cblc_field_t        *fdest,
     }
   else
     {
+    size_t min_length;
+    bool moved = true;
     switch( dest_type )
       {
       case FldGroup:
@@ -5361,9 +5653,6 @@ __gg__move( cblc_field_t        *fdest,
               // We are moving a integer NumericDisplay to an
               // alphanumeric.  We ignore any sign bit, and just
               // move the characters:
-
-              int rdigits;
-              __int128 value;
 
               size_t source_digits
                 = fsource->digits
@@ -5530,7 +5819,7 @@ __gg__move( cblc_field_t        *fdest,
                                                             fsource,
                                                             source_offset,
                                                             source_size);
-            sprintf(ach, "%lu", (size_t)value);
+            sprintf(ach, "%lu", (unsigned long)value);
 
             char *pach = ach;
 
@@ -5654,37 +5943,37 @@ __gg__move( cblc_field_t        *fdest,
             {
             rdigits = get_scaled_rdigits(fdest);
             bool negative = false;
-            __int128 value=0;
+            __int128 value128 = 0;
             switch(fsource->capacity)
               {
               case 4:
                 {
-                _Float32 val = *(_Float32 *)(fsource->data+source_offset);
+                _Float32 val = *PTRCAST(_Float32, fsource->data+source_offset);
                 if(val < 0)
                   {
                   negative = true;
                   val = -val;
                   }
-                val *= (_Float32)__gg__power_of_ten(rdigits);
-                value = (__int128)val;
+                val *= static_cast<_Float32>(__gg__power_of_ten(rdigits));
+                value128 = (__int128)val;
                 break;
                 }
               case 8:
                 {
-                _Float64 val = *(_Float64 *)(fsource->data+source_offset);
+                _Float64 val = *PTRCAST(_Float64, fsource->data+source_offset);
                 if(val < 0)
                   {
                   negative = true;
                   val = -val;
                   }
                 val *= (_Float32)__gg__power_of_ten(rdigits);
-                value = (__int128)val;
+                value128 = (__int128)val;
                 break;
                 }
               case 16:
                 {
                 //_Float128 val = *(_Float128 *)(fsource->data+source_offset);
-                _Float128 val;
+                GCOB_FP128 val;
                 memcpy(&val, fsource->data+source_offset, 16);
                 if(val < 0)
                   {
@@ -5692,19 +5981,19 @@ __gg__move( cblc_field_t        *fdest,
                   val = -val;
                   }
                 val *= (_Float32)__gg__power_of_ten(rdigits);
-                value = (__int128)val;
+                value128 = (__int128)val;
                 break;
                 }
               }
             if( negative )
               {
-              value = -value;
+              value128 = -value128;
               }
             __gg__int128_to_qualified_field(
                                   fdest,
                                   dest_offset,
                                   dest_size,
-                                  value,
+                                  value128,
                                   rdigits,
                                   rounded,
                                   &size_error );
@@ -5772,30 +6061,30 @@ __gg__move( cblc_field_t        *fdest,
             // We are converted a floating-point value fixed-point
 
             rdigits = get_scaled_rdigits(fdest);
-            _Float128 value=0;
+            GCOB_FP128 fp128=0;
             switch(fsource->capacity)
               {
               case 4:
                 {
-                value = *(_Float32 *)(fsource->data+source_offset);
+                fp128 = *reinterpret_cast<_Float32 *>(fsource->data+source_offset);
                 break;
                 }
               case 8:
                 {
-                value = *(_Float64 *)(fsource->data+source_offset);
+                fp128 = *reinterpret_cast<_Float64 *>(fsource->data+source_offset);
                 break;
                 }
               case 16:
                 {
                 // value = *(_Float128 *)(fsource->data+source_offset);
-                memcpy(&value, fsource->data+source_offset, 16);
+                memcpy(&fp128, fsource->data+source_offset, 16);
                 break;
                 }
               }
             __gg__float128_to_qualified_field(
                                     fdest,
                                     dest_offset,
-                                    value,
+                                    fp128,
                                     rounded,
                                     &size_error);
             break;
@@ -5826,9 +6115,6 @@ __gg__move( cblc_field_t        *fdest,
 
           case FldNumericDisplay:
             {
-            int rdigits;
-            __int128 value;
-
             int source_digits = fsource->digits + (fsource->rdigits<0 ? -fsource->rdigits : 0) ;
 
             // Pick up the absolute value of the source
@@ -5849,7 +6135,7 @@ __gg__move( cblc_field_t        *fdest,
               }
 
             // And move them into place:
-            __gg__string_to_alpha_edited( (char *)(fdest->data+dest_offset),
+            __gg__string_to_alpha_edited( reinterpret_cast<char *>(fdest->data+dest_offset),
                                           ach,
                                           source_digits,
                                           fdest->picture);
@@ -5859,7 +6145,7 @@ __gg__move( cblc_field_t        *fdest,
           default:
             {
             static size_t display_string_size = MINIMUM_ALLOCATION_SIZE;
-            static char *display_string = (char *)malloc(display_string_size);
+            static char *display_string = static_cast<char *>(malloc(display_string_size));
 
             size_t display_string_length = dest_size;
             __gg__realloc_if_necessary( &display_string,
@@ -5892,12 +6178,12 @@ __gg__move( cblc_field_t        *fdest,
                                 &display_string,
                                 &display_string_size,
                                 fsource,
-                                (unsigned char *)(fsource->data+source_offset),
+                                reinterpret_cast<unsigned char *>(fsource->data+source_offset),
                                 source_size,
                                 source_flags && REFER_T_ADDRESS_OF);
               display_string_length = strlen(display_string);
               }
-            __gg__string_to_alpha_edited( (char *)(fdest->data+dest_offset),
+            __gg__string_to_alpha_edited( reinterpret_cast<char *>(fdest->data+dest_offset),
                                           display_string,
                                           display_string_length,
                                           fdest->picture);
@@ -5922,22 +6208,21 @@ __gg__move( cblc_field_t        *fdest,
               {
               case 4:
                 {
-                *(float *)(fdest->data+dest_offset) = strtof32(ach, NULL);
+                *PTRCAST(float, fdest->data+dest_offset) = strtod(ach, NULL);
                 break;
                 }
               case 8:
                 {
-                *(double *)(fdest->data+dest_offset) = strtof64(ach, NULL);
+                *PTRCAST(double, fdest->data+dest_offset) = strtod(ach, NULL);
                 break;
                 }
               case 16:
                 {
-                //*(_Float128 *)(fdest->data+dest_offset) = strtof128(ach, NULL);
-                _Float128 t = strtof128(ach, NULL);
+                //*(_Float128 *)(fdest->data+dest_offset) = strtofp128(ach, NULL);
+                GCOB_FP128 t = strtofp128(ach, NULL);
                 memcpy(fdest->data+dest_offset, &t, 16);
                 break;
                 }
-              break;
               }
             break;
             }
@@ -6066,7 +6351,7 @@ __gg__move_literala(cblc_field_t *field,
     case FldAlphaEdited:
       {
       static size_t display_string_size = MINIMUM_ALLOCATION_SIZE;
-      static char *display_string = (char *)malloc(display_string_size);
+      static char *display_string = static_cast<char *>(malloc(display_string_size));
 
       __gg__realloc_if_necessary( &display_string,
                                   &display_string_size,
@@ -6075,7 +6360,7 @@ __gg__move_literala(cblc_field_t *field,
       memset(display_string, internal_space, display_string_size);
       size_t len = std::min(display_string_size, strlen);
       memcpy(display_string, str, len);
-      __gg__string_to_alpha_edited( (char *)(field->data+field_offset),
+      __gg__string_to_alpha_edited( reinterpret_cast<char *>(field->data+field_offset),
                                     display_string,
                                     field_size,
                                     field->picture);
@@ -6092,21 +6377,20 @@ __gg__move_literala(cblc_field_t *field,
         {
         case 4:
           {
-          *(float *)(field->data+field_offset) = strtof32(ach, NULL);
+          *PTRCAST(float, field->data+field_offset) = strtod(ach, NULL);
           break;
           }
         case 8:
           {
-          *(double *)(field->data+field_offset) = strtof64(ach, NULL);
+          *PTRCAST(double, field->data+field_offset) = strtod(ach, NULL);
           break;
           }
         case 16:
           {
-          _Float128 t = strtof128(ach, NULL);
+          GCOB_FP128 t = strtofp128(ach, NULL);
           memcpy(field->data+field_offset, &t, 16);
           break;
           }
-        break;
         }
       break;
       }
@@ -6138,6 +6422,7 @@ __gg__file_sort_ff_input(   cblc_file_t *workfile,
   // We are going to read records from input and write them to workfile.  These
   // files are already open.
 
+  sv_suppress_eof_ec = true;
   for(;;)
     {
     // Read the data from the input file into its record_area
@@ -6170,6 +6455,7 @@ __gg__file_sort_ff_input(   cblc_file_t *workfile,
                         before_advancing,
                         0); // non-random
     }
+  sv_suppress_eof_ec = false;
   }
 
 extern "C"
@@ -6184,6 +6470,7 @@ __gg__file_sort_ff_output(  cblc_file_t *output,
   // Make sure workfile is positioned at the beginning
   __gg__file_reopen(workfile, 'r');
 
+  sv_suppress_eof_ec = true;
   for(;;)
     {
     __gg__file_read(  workfile,
@@ -6205,6 +6492,7 @@ __gg__file_sort_ff_output(  cblc_file_t *output,
                         advancing,
                         0); // 1 would be is_random
     }
+  sv_suppress_eof_ec = false;
   }
 
 extern "C"
@@ -6223,12 +6511,13 @@ __gg__sort_workfile(cblc_file_t    *workfile,
 
   // Read the file into memory
   size_t buffer_size = 128;
-  unsigned char *contents = (unsigned char *)malloc(buffer_size);
+  unsigned char *contents = static_cast<unsigned char *>(malloc(buffer_size));
   size_t offset = 0;
   std::vector<size_t>offsets;
   size_t bytes_read;
   size_t bytes_to_write;
 
+  sv_suppress_eof_ec = true;
   for(;;)
     {
     __gg__file_read(workfile,
@@ -6252,7 +6541,7 @@ __gg__sort_workfile(cblc_file_t    *workfile,
     while( offset + sizeof(size_t) + bytes_read > buffer_size )
       {
       buffer_size *= 2;
-      contents = (unsigned char *)realloc(contents, buffer_size);
+      contents = static_cast<unsigned char *>(realloc(contents, buffer_size));
       }
     offsets.push_back(offset);
 
@@ -6264,6 +6553,7 @@ __gg__sort_workfile(cblc_file_t    *workfile,
     memcpy(contents+offset, workfile->default_record->data, bytes_read);
     offset += bytes_read;
     }
+  sv_suppress_eof_ec = false;
 
   sort_contents(contents,
                 offsets,
@@ -6350,7 +6640,8 @@ __gg__merge_files( cblc_file_t   *workfile,
     return;
     }
 
-  unsigned char *prior_winner = (unsigned char *)malloc(the_biggest);
+  unsigned char *prior_winner = static_cast<unsigned char *>(malloc(the_biggest));
+  massert(prior_winner);
   *prior_winner = '\0';
 
   for(;;)
@@ -6530,7 +6821,7 @@ normalize_id( const cblc_field_t *refer,
 
   if( refer )
     {
-    unsigned char *data = refer->data + refer_o;
+    const unsigned char *data = refer->data + refer_o;
     cbl_figconst_t figconst
       = (cbl_figconst_t)(refer->attr & FIGCONST_MASK);
 
@@ -6771,7 +7062,7 @@ the_alpha_and_omega_backward( const normalized_operand &id_before,
 
 static
 void
-inspect_backward_format_1(size_t integers[])
+inspect_backward_format_1(const size_t integers[])
   {
   size_t int_index = 0;
   size_t cblc_index = 0;
@@ -6784,9 +7075,9 @@ inspect_backward_format_1(size_t integers[])
   std::vector<id_2_result> id_2_results(n_identifier_2);
 
   // Pick up identifier_1, which is the string being inspected
-  cblc_field_t *id1   = __gg__treeplet_1f[cblc_index];
-  size_t        id1_o = __gg__treeplet_1o[cblc_index];
-  size_t        id1_s = __gg__treeplet_1s[cblc_index];
+  const cblc_field_t *id1   = __gg__treeplet_1f[cblc_index];
+  size_t              id1_o = __gg__treeplet_1o[cblc_index];
+  size_t              id1_s = __gg__treeplet_1s[cblc_index];
   cblc_index += 1;
   // normalize it, according to the language specification.
   normalized_operand normalized_id_1 = normalize_id(id1, id1_o, id1_s);
@@ -6819,19 +7110,19 @@ inspect_backward_format_1(size_t integers[])
           // We are counting characters.  There is no identifier-3,
           // but we we hard-code the length to one to represent a
           // single character.
-          comparand next_comparand;
+          comparand next_comparand = {};
           next_comparand.id_2_index = i;
           next_comparand.operation = operation;
           next_comparand.identifier_3.length = 1;
 
-          cblc_field_t *id4_before   = __gg__treeplet_1f  [cblc_index];
-          size_t        id4_before_o = __gg__treeplet_1o[cblc_index];
-          size_t        id4_before_s = __gg__treeplet_1s[cblc_index];
+          const cblc_field_t *id4_before   = __gg__treeplet_1f  [cblc_index];
+          size_t              id4_before_o = __gg__treeplet_1o[cblc_index];
+          size_t              id4_before_s = __gg__treeplet_1s[cblc_index];
           cblc_index += 1;
 
-          cblc_field_t *id4_after   = __gg__treeplet_1f  [cblc_index];
-          size_t        id4_after_o = __gg__treeplet_1o[cblc_index];
-          size_t        id4_after_s = __gg__treeplet_1s[cblc_index];
+          const cblc_field_t *id4_after   = __gg__treeplet_1f  [cblc_index];
+          size_t              id4_after_o = __gg__treeplet_1o[cblc_index];
+          size_t              id4_after_s = __gg__treeplet_1s[cblc_index];
           cblc_index += 1;
 
           normalized_operand normalized_id_4_before
@@ -6863,23 +7154,23 @@ inspect_backward_format_1(size_t integers[])
 
           for(size_t k=0; k<pair_count; k++)
             {
-            comparand next_comparand;
+            comparand next_comparand = {};
             next_comparand.id_2_index = i;
             next_comparand.operation = operation;
 
-            cblc_field_t *id3   = __gg__treeplet_1f[cblc_index];
-            size_t        id3_o = __gg__treeplet_1o[cblc_index];
-            size_t        id3_s = __gg__treeplet_1s[cblc_index];
+            const cblc_field_t *id3   = __gg__treeplet_1f[cblc_index];
+            size_t              id3_o = __gg__treeplet_1o[cblc_index];
+            size_t              id3_s = __gg__treeplet_1s[cblc_index];
             cblc_index += 1;
 
-            cblc_field_t *id4_before   = __gg__treeplet_1f[cblc_index];
-            size_t        id4_before_o = __gg__treeplet_1o[cblc_index];
-            size_t        id4_before_s = __gg__treeplet_1s[cblc_index];
+            const cblc_field_t *id4_before   = __gg__treeplet_1f[cblc_index];
+            size_t              id4_before_o = __gg__treeplet_1o[cblc_index];
+            size_t              id4_before_s = __gg__treeplet_1s[cblc_index];
             cblc_index += 1;
 
-            cblc_field_t *id4_after   = __gg__treeplet_1f[cblc_index];
-            size_t        id4_after_o = __gg__treeplet_1o[cblc_index];
-            size_t        id4_after_s = __gg__treeplet_1s[cblc_index];
+            const cblc_field_t *id4_after   = __gg__treeplet_1f[cblc_index];
+            size_t              id4_after_o = __gg__treeplet_1o[cblc_index];
+            size_t              id4_after_s = __gg__treeplet_1s[cblc_index];
             cblc_index += 1;
 
             next_comparand.identifier_3
@@ -7120,9 +7411,9 @@ __gg__inspect_format_1(int backward, size_t integers[])
   std::vector<id_2_result> id_2_results(n_identifier_2);
 
   // Pick up identifier_1, which is the string being inspected
-  cblc_field_t *id1   = __gg__treeplet_1f[cblc_index];
-  size_t        id1_o = __gg__treeplet_1o[cblc_index];
-  size_t        id1_s = __gg__treeplet_1s[cblc_index];
+  const cblc_field_t *id1   = __gg__treeplet_1f[cblc_index];
+  size_t              id1_o = __gg__treeplet_1o[cblc_index];
+  size_t              id1_s = __gg__treeplet_1s[cblc_index];
   cblc_index += 1;
   // normalize it, according to the language specification.
   normalized_operand normalized_id_1
@@ -7156,19 +7447,19 @@ __gg__inspect_format_1(int backward, size_t integers[])
           // We are counting characters.  There is no identifier-3,
           // but we we hard-code the length to one to represent a
           // single character.
-          comparand next_comparand;
+          comparand next_comparand = {};
           next_comparand.id_2_index = i;
           next_comparand.operation = operation;
           next_comparand.identifier_3.length = 1;
 
-          cblc_field_t *id4_before   = __gg__treeplet_1f  [cblc_index];
-          size_t        id4_before_o = __gg__treeplet_1o[cblc_index];
-          size_t        id4_before_s = __gg__treeplet_1s[cblc_index];
+          const cblc_field_t *id4_before   = __gg__treeplet_1f  [cblc_index];
+          size_t              id4_before_o = __gg__treeplet_1o[cblc_index];
+          size_t              id4_before_s = __gg__treeplet_1s[cblc_index];
           cblc_index += 1;
 
-          cblc_field_t *id4_after   = __gg__treeplet_1f  [cblc_index];
-          size_t        id4_after_o = __gg__treeplet_1o[cblc_index];
-          size_t        id4_after_s = __gg__treeplet_1s[cblc_index];
+          const cblc_field_t *id4_after   = __gg__treeplet_1f  [cblc_index];
+          size_t              id4_after_o = __gg__treeplet_1o[cblc_index];
+          size_t              id4_after_s = __gg__treeplet_1s[cblc_index];
           cblc_index += 1;
 
           normalized_operand normalized_id_4_before
@@ -7200,23 +7491,23 @@ __gg__inspect_format_1(int backward, size_t integers[])
 
           for(size_t k=0; k<pair_count; k++)
             {
-            comparand next_comparand;
+            comparand next_comparand = {};
             next_comparand.id_2_index = i;
             next_comparand.operation = operation;
 
-            cblc_field_t *id3   = __gg__treeplet_1f[cblc_index];
-            size_t        id3_o = __gg__treeplet_1o[cblc_index];
-            size_t        id3_s = __gg__treeplet_1s[cblc_index];
+            const cblc_field_t *id3   = __gg__treeplet_1f[cblc_index];
+            size_t              id3_o = __gg__treeplet_1o[cblc_index];
+            size_t              id3_s = __gg__treeplet_1s[cblc_index];
             cblc_index += 1;
 
-            cblc_field_t *id4_before   = __gg__treeplet_1f[cblc_index];
-            size_t        id4_before_o = __gg__treeplet_1o[cblc_index];
-            size_t        id4_before_s = __gg__treeplet_1s[cblc_index];
+            const cblc_field_t *id4_before   = __gg__treeplet_1f[cblc_index];
+            size_t              id4_before_o = __gg__treeplet_1o[cblc_index];
+            size_t              id4_before_s = __gg__treeplet_1s[cblc_index];
             cblc_index += 1;
 
-            cblc_field_t *id4_after   = __gg__treeplet_1f[cblc_index];
-            size_t        id4_after_o = __gg__treeplet_1o[cblc_index];
-            size_t        id4_after_s = __gg__treeplet_1s[cblc_index];
+            const cblc_field_t *id4_after   = __gg__treeplet_1f[cblc_index];
+            size_t              id4_after_o = __gg__treeplet_1o[cblc_index];
+            size_t              id4_after_s = __gg__treeplet_1s[cblc_index];
             cblc_index += 1;
 
             next_comparand.identifier_3
@@ -7445,7 +7736,7 @@ __gg__inspect_format_1(int backward, size_t integers[])
 
 static
 void
-inspect_backward_format_2(size_t integers[])
+inspect_backward_format_2(const size_t integers[])
   {
   size_t int_index = 0;
   size_t cblc_index = 0;
@@ -7475,22 +7766,22 @@ inspect_backward_format_2(size_t integers[])
       {
       case bound_characters_e:
         {
-        comparand next_comparand;
+        comparand next_comparand = {};
         next_comparand.operation = operation;
 
-        cblc_field_t *id5   = __gg__treeplet_1f[cblc_index];
-        size_t        id5_o = __gg__treeplet_1o[cblc_index];
-        size_t        id5_s = __gg__treeplet_1s[cblc_index];
+        const cblc_field_t *id5   = __gg__treeplet_1f[cblc_index];
+        size_t              id5_o = __gg__treeplet_1o[cblc_index];
+        size_t              id5_s = __gg__treeplet_1s[cblc_index];
         cblc_index += 1;
 
-        cblc_field_t *id4_before   = __gg__treeplet_1f[cblc_index];
-        size_t        id4_before_o = __gg__treeplet_1o[cblc_index];
-        size_t        id4_before_s = __gg__treeplet_1s[cblc_index];
+        const cblc_field_t *id4_before   = __gg__treeplet_1f[cblc_index];
+        size_t              id4_before_o = __gg__treeplet_1o[cblc_index];
+        size_t              id4_before_s = __gg__treeplet_1s[cblc_index];
         cblc_index += 1;
 
-        cblc_field_t *id4_after   = __gg__treeplet_1f  [cblc_index];
-        size_t        id4_after_o = __gg__treeplet_1o[cblc_index];
-        size_t        id4_after_s = __gg__treeplet_1s[cblc_index];
+        const cblc_field_t *id4_after   = __gg__treeplet_1f  [cblc_index];
+        size_t              id4_after_o = __gg__treeplet_1o[cblc_index];
+        size_t              id4_after_s = __gg__treeplet_1s[cblc_index];
         cblc_index += 1;
 
         next_comparand.identifier_5
@@ -7526,27 +7817,27 @@ inspect_backward_format_2(size_t integers[])
 
         for(size_t k=0; k<pair_count; k++)
           {
-          comparand next_comparand;
+          comparand next_comparand = {};
           next_comparand.operation = operation;
 
-          cblc_field_t *id3   = __gg__treeplet_1f[cblc_index];
-          size_t        id3_o = __gg__treeplet_1o[cblc_index];
-          size_t        id3_s = __gg__treeplet_1s[cblc_index];
+          const cblc_field_t *id3   = __gg__treeplet_1f[cblc_index];
+          size_t              id3_o = __gg__treeplet_1o[cblc_index];
+          size_t              id3_s = __gg__treeplet_1s[cblc_index];
           cblc_index += 1;
 
-          cblc_field_t *id5   = __gg__treeplet_1f[cblc_index];
-          size_t        id5_o = __gg__treeplet_1o[cblc_index];
-          size_t        id5_s = __gg__treeplet_1s[cblc_index];
+          const cblc_field_t *id5   = __gg__treeplet_1f[cblc_index];
+          size_t              id5_o = __gg__treeplet_1o[cblc_index];
+          size_t              id5_s = __gg__treeplet_1s[cblc_index];
           cblc_index += 1;
 
-          cblc_field_t *id4_before   = __gg__treeplet_1f[cblc_index];
-          size_t        id4_before_o = __gg__treeplet_1o[cblc_index];
-          size_t        id4_before_s = __gg__treeplet_1s[cblc_index];
+          const cblc_field_t *id4_before   = __gg__treeplet_1f[cblc_index];
+          size_t              id4_before_o = __gg__treeplet_1o[cblc_index];
+          size_t              id4_before_s = __gg__treeplet_1s[cblc_index];
           cblc_index += 1;
 
-          cblc_field_t *id4_after   = __gg__treeplet_1f[cblc_index];
-          size_t        id4_after_o = __gg__treeplet_1o[cblc_index];
-          size_t        id4_after_s = __gg__treeplet_1s[cblc_index];
+          const cblc_field_t *id4_after   = __gg__treeplet_1f[cblc_index];
+          size_t              id4_after_o = __gg__treeplet_1o[cblc_index];
+          size_t              id4_after_s = __gg__treeplet_1s[cblc_index];
           cblc_index += 1;
 
           next_comparand.identifier_3 = normalize_id(id3, id3_o, id3_s);
@@ -7823,22 +8114,22 @@ __gg__inspect_format_2(int backward, size_t integers[])
       {
       case bound_characters_e:
         {
-        comparand next_comparand;
+        comparand next_comparand = {} ;
         next_comparand.operation = operation;
 
-        cblc_field_t *id5   = __gg__treeplet_1f[cblc_index];
-        size_t        id5_o = __gg__treeplet_1o[cblc_index];
-        size_t        id5_s = __gg__treeplet_1s[cblc_index];
+        const cblc_field_t *id5   = __gg__treeplet_1f[cblc_index];
+        size_t              id5_o = __gg__treeplet_1o[cblc_index];
+        size_t              id5_s = __gg__treeplet_1s[cblc_index];
         cblc_index += 1;
 
-        cblc_field_t *id4_before   = __gg__treeplet_1f[cblc_index];
-        size_t        id4_before_o = __gg__treeplet_1o[cblc_index];
-        size_t        id4_before_s = __gg__treeplet_1s[cblc_index];
+        const cblc_field_t *id4_before   = __gg__treeplet_1f[cblc_index];
+        size_t              id4_before_o = __gg__treeplet_1o[cblc_index];
+        size_t              id4_before_s = __gg__treeplet_1s[cblc_index];
         cblc_index += 1;
 
-        cblc_field_t *id4_after   = __gg__treeplet_1f  [cblc_index];
-        size_t        id4_after_o = __gg__treeplet_1o[cblc_index];
-        size_t        id4_after_s = __gg__treeplet_1s[cblc_index];
+        const cblc_field_t *id4_after   = __gg__treeplet_1f  [cblc_index];
+        size_t              id4_after_o = __gg__treeplet_1o[cblc_index];
+        size_t              id4_after_s = __gg__treeplet_1s[cblc_index];
         cblc_index += 1;
 
         next_comparand.identifier_5
@@ -7874,27 +8165,27 @@ __gg__inspect_format_2(int backward, size_t integers[])
 
         for(size_t k=0; k<pair_count; k++)
           {
-          comparand next_comparand;
+          comparand next_comparand = {};
           next_comparand.operation = operation;
 
-          cblc_field_t *id3   = __gg__treeplet_1f[cblc_index];
-          size_t        id3_o = __gg__treeplet_1o[cblc_index];
-          size_t        id3_s = __gg__treeplet_1s[cblc_index];
+          const cblc_field_t *id3   = __gg__treeplet_1f[cblc_index];
+          size_t              id3_o = __gg__treeplet_1o[cblc_index];
+          size_t              id3_s = __gg__treeplet_1s[cblc_index];
           cblc_index += 1;
 
-          cblc_field_t *id5   = __gg__treeplet_1f[cblc_index];
-          size_t        id5_o = __gg__treeplet_1o[cblc_index];
-          size_t        id5_s = __gg__treeplet_1s[cblc_index];
+          const cblc_field_t *id5   = __gg__treeplet_1f[cblc_index];
+          size_t              id5_o = __gg__treeplet_1o[cblc_index];
+          size_t              id5_s = __gg__treeplet_1s[cblc_index];
           cblc_index += 1;
 
-          cblc_field_t *id4_before   = __gg__treeplet_1f[cblc_index];
-          size_t        id4_before_o = __gg__treeplet_1o[cblc_index];
-          size_t        id4_before_s = __gg__treeplet_1s[cblc_index];
+          const cblc_field_t *id4_before   = __gg__treeplet_1f[cblc_index];
+          size_t              id4_before_o = __gg__treeplet_1o[cblc_index];
+          size_t              id4_before_s = __gg__treeplet_1s[cblc_index];
           cblc_index += 1;
 
-          cblc_field_t *id4_after   = __gg__treeplet_1f[cblc_index];
-          size_t        id4_after_o = __gg__treeplet_1o[cblc_index];
-          size_t        id4_after_s = __gg__treeplet_1s[cblc_index];
+          const cblc_field_t *id4_after   = __gg__treeplet_1f[cblc_index];
+          size_t              id4_after_o = __gg__treeplet_1o[cblc_index];
+          size_t              id4_after_s = __gg__treeplet_1s[cblc_index];
           cblc_index += 1;
 
           next_comparand.identifier_3 = normalize_id(id3, id3_o, id3_s);
@@ -8169,12 +8460,12 @@ __gg__inspect_format_4( int backward,
   static size_t psz_before_size      = MINIMUM_ALLOCATION_SIZE;
   static size_t psz_figstring_size   = MINIMUM_ALLOCATION_SIZE;
 
-  static char *psz_input       = (char *)malloc(psz_input_size      );
-  static char *psz_original    = (char *)malloc(psz_original_size   );
-  static char *psz_replacement = (char *)malloc(psz_replacement_size);
-  static char *psz_after       = (char *)malloc(psz_after_size      );
-  static char *psz_before      = (char *)malloc(psz_before_size     );
-  static char *psz_figstring   = (char *)malloc(psz_figstring_size  );
+  static char *psz_input       = static_cast<char *>(malloc(psz_input_size      ));
+  static char *psz_original    = static_cast<char *>(malloc(psz_original_size   ));
+  static char *psz_replacement = static_cast<char *>(malloc(psz_replacement_size));
+  static char *psz_after       = static_cast<char *>(malloc(psz_after_size      ));
+  static char *psz_before      = static_cast<char *>(malloc(psz_before_size     ));
+  static char *psz_figstring   = static_cast<char *>(malloc(psz_figstring_size  ));
 
   bool all = replacement_size == (size_t)(-1LL);
   if( all )
@@ -8268,7 +8559,7 @@ __gg__inspect_format_4( int backward,
     }
 
   char *pstart = NULL;
-  char *pend = NULL;
+  const char *pend = NULL;
   if( backward )
     {
     if( strlen(psz_before) )
@@ -8361,7 +8652,7 @@ move_string(cblc_field_t *field,
     case FldAlphanumeric:
     case FldAlphaEdited:
       {
-      char *to = (char *)(field->data + offset);
+      char *to = reinterpret_cast<char *>(field->data + offset);
       size_t dest_length = length ? length : field->capacity;
       size_t source_length = strlen_from;
       size_t count = std::min(dest_length, source_length);
@@ -8470,7 +8761,7 @@ brute_force_trim(char *str)
 
 extern "C"
 int
-__gg__string(size_t integers[])
+__gg__string(const size_t integers[])
   {
   // The first integer is the count of identifier-2 values.  Call it N
   // The following N integers are the counts of each of the identifier-1 values,
@@ -8484,12 +8775,11 @@ __gg__string(size_t integers[])
   // And so on
 
   cblc_field_t **ref   = __gg__treeplet_1f;
-  size_t        *ref_o = __gg__treeplet_1o;
-  size_t        *ref_s = __gg__treeplet_1s;
+  const size_t  *ref_o = __gg__treeplet_1o;
+  const size_t  *ref_s = __gg__treeplet_1s;
 
   static const int INDEX_OF_POINTER = 1;
 
-  size_t index_int  = 0;
   size_t index_cblc = 0 ;
 
   char figlow[2]   = {ascii_to_internal(__gg__low_value_character), 0x00};
@@ -8507,15 +8797,13 @@ __gg__string(size_t integers[])
     fighigh[0] = ascii_to_internal(__gg__high_value_character);
     }
 
-  // Pick up the number of identifier-2 values
-  size_t N = integers[index_int++];
 
   // Pick up the target
-  cblc_field_t *tgt   = ref[index_cblc];
-  size_t tgt_o        = ref_o[index_cblc];
-  size_t tgt_s        = ref_s[index_cblc];
+  const cblc_field_t *tgt   = ref[index_cblc];
+  size_t tgt_o              = ref_o[index_cblc];
+  size_t tgt_s              = ref_s[index_cblc];
   index_cblc += 1;
-  char  *dest         = (char *)(tgt->data + tgt_o);
+  char  *dest         = reinterpret_cast<char *>(tgt->data + tgt_o);
   ssize_t dest_length = tgt_s;
 
   // Skip over the index of POINTER:
@@ -8542,18 +8830,23 @@ __gg__string(size_t integers[])
     {
     // We are go for looping through identifier-2 values:
 
+    size_t index_int  = 0;
+
+    // Pick up the number of identifier-2 values
+    size_t N = integers[index_int++];
+
     for( size_t i=0; i<N; i++ )
       {
       size_t M = integers[index_int++];
 
       // Pick up the identifier_2 DELIMITED BY value
-      cblc_field_t *id2   = ref[index_cblc];
-      size_t        id2_o = ref_o[index_cblc];
-      size_t        id2_s = ref_s[index_cblc];
+      const cblc_field_t *id2   = ref[index_cblc];
+      size_t              id2_o = ref_o[index_cblc];
+      size_t              id2_s = ref_s[index_cblc];
       index_cblc += 1;
 
       char *piece;
-      char *piece_end;
+      const char *piece_end;
       cbl_figconst_t figconst = (cbl_figconst_t) ( id2
                                   ? (id2->attr & FIGCONST_MASK)
                                   : 0 );
@@ -8580,24 +8873,24 @@ __gg__string(size_t integers[])
           piece_end = piece + 1;
           break;
         default:
-          piece = id2 ? (char *)(id2->data + id2_o) : NULL;
+          piece = id2 ? reinterpret_cast<char *>(id2->data + id2_o) : NULL;
           piece_end = id2 ? piece + id2_s : NULL;
           break;
         }
 
-      for(size_t i=0; i<M; i++)
+      for(size_t j=0; j<M; j++)
         {
         // Pick up the next identifier-1 source string:
-        cblc_field_t *id1 = ref[index_cblc];
+        const cblc_field_t *id1 = ref[index_cblc];
         size_t id1_o = ref_o[index_cblc];
         size_t id1_s = ref_s[index_cblc];
         index_cblc += 1;
 
-        const char *whole = id1 ? (const char *)(id1->data + id1_o): NULL ;
+        const char *whole = id1 ? reinterpret_cast<char *>(id1->data + id1_o): NULL ;
         const char *whole_end = id1 ? whole + id1_s : NULL;
 
         // As usual, we need to cope with figurative constants:
-        cbl_figconst_t figconst = (cbl_figconst_t) ( id1 ? (id1->attr & FIGCONST_MASK) : 0 );
+        figconst = (cbl_figconst_t) ( id1 ? (id1->attr & FIGCONST_MASK) : 0 );
         switch( figconst )
           {
           case low_value_e:
@@ -8630,11 +8923,7 @@ __gg__string(size_t integers[])
                                             whole, whole_end);
           if(found)
             {
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wcast-qual"
-            char *wfound = (char *)found;
-#pragma GCC diagnostic pop
-            whole_end = wfound;
+            whole_end = found;
             }
           }
         while(whole < whole_end)
@@ -8684,7 +8973,7 @@ display_both(cblc_field_t  *field,
              int            advance )
   {
   static size_t display_string_size = MINIMUM_ALLOCATION_SIZE;
-  static char *display_string = (char *)malloc(display_string_size);
+  static char *display_string = static_cast<char *>(malloc(display_string_size));
 
   format_for_display_internal(&display_string,
                               &display_string_size,
@@ -8695,7 +8984,7 @@ display_both(cblc_field_t  *field,
 
   // Let's honor the locale of the system, as best we can:
   static size_t converted_size = MINIMUM_ALLOCATION_SIZE;
-  static char *converted = (char *)malloc(converted_size);
+  static char *converted = static_cast<char *>(malloc(converted_size));
 
   internal_to_console(&converted, &converted_size, display_string, strlen(display_string));
 
@@ -8705,7 +8994,7 @@ display_both(cblc_field_t  *field,
   if(ss == -1)
     {
     fprintf(stderr, "__gg__display() %s %p\n", field->name, qual_data);
-    fprintf(stderr, "__gg__display() %zd\n", converted_size);
+    fprintf(stderr, "__gg__display() %ld\n", static_cast<long>(converted_size));
     fprintf(stderr, "__gg__display() ");
     for(size_t i=0; i<converted_size; i++)
       {
@@ -8717,9 +9006,9 @@ display_both(cblc_field_t  *field,
 
   if( advance )
     {
-    ss = write( file_descriptor,
-                "\n",
-                1);
+    write( file_descriptor,
+           "\n",
+           1);
     }
   }
 
@@ -8733,7 +9022,7 @@ __gg__display(    cblc_field_t *field,
   {
   display_both( field,
                 field->data + offset,
-                size ? size : field->capacity,
+                size,
                 0,
                 file_descriptor,
                 advance);
@@ -8758,20 +9047,20 @@ __gg__display_clean(cblc_field_t *field,
 
 extern "C"
 void
-__gg__display_string( int     file_descriptor,
-                      char   *str,
-                      size_t  length,
-                      int     advance )
+__gg__display_string( int           file_descriptor,
+                      const char   *str,
+                      size_t        length,
+                      int           advance )
   {
   // Let's honor the locale of the system, as best we can:
   static size_t converted_size = MINIMUM_ALLOCATION_SIZE;
-  static char *converted = (char *)malloc(converted_size);
+  static char *converted = static_cast<char *>(malloc(converted_size));
 
   size_t max_possible = 2 * length;
   if( max_possible > converted_size )
     {
     converted_size = max_possible;
-    converted = (char *)realloc(converted, converted_size);
+    converted = static_cast<char *>(realloc(converted, converted_size));
     }
 
   __gg__ascii_to_console(&converted, &converted_size, str, length);
@@ -8786,8 +9075,6 @@ __gg__display_string( int     file_descriptor,
            1);
     }
   }
-
-#pragma GCC diagnostic push
 
 static
 char *
@@ -8909,7 +9196,8 @@ __gg__accept(   enum special_name_t special_e,
       }
     }
 
-  char *buffer = (char *)malloc(max_chars+1);
+  char *buffer = static_cast<char *>(malloc(max_chars+1));
+  massert(buffer);
   memset(buffer, ascii_space, max_chars);
   buffer[max_chars] = NULLCH;
   size_t i = 0;
@@ -9075,7 +9363,7 @@ __gg__binary_value_from_field(   int *rdigits,
 extern "C"
 __int128
 __gg__binary_value_from_qualified_field(int          *rdigits,
-                                        cblc_field_t *var,
+                                        const cblc_field_t *var,
                                         size_t        offset,
                                         size_t        size)
   {
@@ -9086,10 +9374,10 @@ __gg__binary_value_from_qualified_field(int          *rdigits,
   }
 
 extern "C"
-_Float128
+GCOB_FP128
 __gg__float128_from_field( cblc_field_t *field )
   {
-  _Float128 retval=0;
+  GCOB_FP128 retval=0;
   if( field->type == FldFloat || field->type == FldLiteralN )
     {
     retval = get_float128(field, field->data);
@@ -9097,20 +9385,20 @@ __gg__float128_from_field( cblc_field_t *field )
   else
     {
     int rdigits;
-    retval = (_Float128)__gg__binary_value_from_field(&rdigits, field);
+    retval = (GCOB_FP128)__gg__binary_value_from_field(&rdigits, field);
     if( rdigits )
       {
-      retval /= (_Float128)__gg__power_of_ten(rdigits);
+      retval /= (GCOB_FP128)__gg__power_of_ten(rdigits);
       }
     }
   return retval;
   }
 
 extern "C"
-_Float128
-__gg__float128_from_qualified_field( cblc_field_t *field, size_t offset, size_t size)
+GCOB_FP128
+__gg__float128_from_qualified_field(const cblc_field_t *field, size_t offset, size_t size)
   {
-  _Float128 retval=0;
+  GCOB_FP128 retval=0;
   if( field->type == FldFloat || field->type == FldLiteralN )
     {
     retval = get_float128(field, field->data+offset);
@@ -9118,10 +9406,10 @@ __gg__float128_from_qualified_field( cblc_field_t *field, size_t offset, size_t 
   else
     {
     int rdigits;
-    retval = (_Float128)__gg__binary_value_from_qualified_field(&rdigits, field, offset, size);
+    retval = (GCOB_FP128)__gg__binary_value_from_qualified_field(&rdigits, field, offset, size);
     if( rdigits )
       {
-      retval /= (_Float128)__gg__power_of_ten(rdigits);
+      retval /= (GCOB_FP128)__gg__power_of_ten(rdigits);
       }
     }
   return retval;
@@ -9185,11 +9473,11 @@ __gg__int128_to_qualified_field(cblc_field_t   *tgt,
   }
 
 static __int128
-float128_to_int128( int          *rdigits,
-                    cblc_field_t *field,
-                    _Float128     value,
-                    cbl_round_t   rounded,
-                    int          *compute_error)
+float128_to_int128( int                *rdigits,
+                    const cblc_field_t *field,
+                    GCOB_FP128          value,
+                    cbl_round_t         rounded,
+                    int                *compute_error)
   {
   __int128 retval = 0;
   if( value == INFINITY )
@@ -9212,7 +9500,7 @@ float128_to_int128( int          *rdigits,
       // get away with.
 
       // Calculate the number of digits to the left of the decimal point:
-      int digits = (int)(floorf128(logf128(fabsf128(value)))+1);
+      int digits = (int)(FP128_FUNC(floor)(FP128_FUNC(log)(FP128_FUNC(fabs)(value)))+1);
 
       // Make sure it is not a negative number
       digits = std::max(0, digits);
@@ -9229,12 +9517,12 @@ float128_to_int128( int          *rdigits,
     // We now multiply our value by 10**rdigits, in order to make the
     // floating-point value have the same magnitude as our target __int128
 
-    value *= powf128(10.0Q, (_Float128)(*rdigits));
+    value *= FP128_FUNC(pow)(GCOB_FP128_LITERAL (10.0), (GCOB_FP128)(*rdigits));
 
     // We are ready to cast value to an __int128.  But this value could be
     // too large to fit, which is an error condition we want to flag:
 
-    if( fabsf128(value) >= 1.0E38Q )
+    if( FP128_FUNC(fabs)(value) >= GCOB_FP128_LITERAL (1.0E38) )
       {
       *compute_error = compute_error_overflow;
       }
@@ -9251,7 +9539,7 @@ static void
 float128_to_location( cblc_field_t   *tgt,
                       unsigned char  *data,
                       size_t          size,
-                      _Float128       value,
+                      GCOB_FP128       value,
                       enum cbl_round_t  rounded,
                       int            *compute_error)
   {
@@ -9262,8 +9550,8 @@ float128_to_location( cblc_field_t   *tgt,
       switch(tgt->capacity)
         {
         case 4:
-          if(    fabsf128(value) == (_Float128)INFINITY
-              || fabsf128(value) > 3.4028235E38Q )
+          if(    FP128_FUNC(fabs)(value) == (GCOB_FP128)INFINITY
+              || FP128_FUNC(fabs)(value) > GCOB_FP128_LITERAL (3.4028235E38) )
             {
             if( compute_error )
               {
@@ -9271,22 +9559,22 @@ float128_to_location( cblc_field_t   *tgt,
               }
             if( value < 0 )
               {
-              *(float *)(data) = -INFINITY;
+              *PTRCAST(float, data) = -INFINITY;
               }
             else
               {
-              *(float *)(data) = INFINITY;
+              *PTRCAST(float, data) = INFINITY;
               }
             }
           else
             {
-            *(float *)(data) = (float)value;
+            *PTRCAST(float, data) = static_cast<float>(value);
             }
           break;
 
         case 8:
-          if(    fabsf128(value) == (_Float128)INFINITY
-              || fabsf128(value) > 1.7976931348623157E308Q )
+          if(    FP128_FUNC(fabs)(value) == (GCOB_FP128)INFINITY
+              || FP128_FUNC(fabs)(value) > GCOB_FP128_LITERAL (1.7976931348623157E308) )
             {
             if( compute_error )
               {
@@ -9294,21 +9582,21 @@ float128_to_location( cblc_field_t   *tgt,
               }
             if( value < 0 )
               {
-              *(double *)(data) = -INFINITY;
+              *PTRCAST(double, data) = -INFINITY;
               }
             else
               {
-              *(double *)(data) = INFINITY;
+              *PTRCAST(double, data) = INFINITY;
               }
             }
           else
             {
-            *(double *)(data) = (double)value;
+            *PTRCAST(double, data) = static_cast<double>(value);
             }
           break;
 
         case 16:
-          if( fabsf128(value) == (_Float128)INFINITY )
+          if( FP128_FUNC(fabs)(value) == (GCOB_FP128)INFINITY )
             {
             if( compute_error )
               {
@@ -9337,7 +9625,7 @@ float128_to_location( cblc_field_t   *tgt,
           digits = tgt->digits;
           }
 
-        _Float128 maximum;
+        GCOB_FP128 maximum;
 
         if( digits )
           {
@@ -9346,7 +9634,7 @@ float128_to_location( cblc_field_t   *tgt,
 
         // When digits is zero, this is a binary value without a PICTURE string.
         // we don't truncate in that case
-        if( digits && fabsf128(value) >= maximum )
+        if( digits && FP128_FUNC(fabs)(value) >= maximum )
           {
           *compute_error |= compute_error_truncate;
           }
@@ -9374,7 +9662,7 @@ float128_to_location( cblc_field_t   *tgt,
 extern "C"
 void
 __gg__float128_to_field(cblc_field_t   *tgt,
-                        _Float128       value,
+                        GCOB_FP128       value,
                         enum cbl_round_t  rounded,
                         int            *compute_error)
   {
@@ -9390,7 +9678,7 @@ extern "C"
 void
 __gg__float128_to_qualified_field(cblc_field_t   *tgt,
                                   size_t          tgt_offset,
-                                  _Float128       value,
+                                  GCOB_FP128       value,
                                   enum cbl_round_t  rounded,
                                   int            *compute_error)
   {
@@ -9504,7 +9792,7 @@ __gg__set_initial_switch_value( )
   __int128 bit = 1;
   char ach[129];
   memset(ach, 0, sizeof(ach));
-  char *p = getenv("UPSI");
+  const char *p = getenv("UPSI");
   if( p )
     {
     snprintf(ach, sizeof(ach), "%s", p);
@@ -9537,7 +9825,7 @@ is_numeric_display_numeric(cblc_field_t *field, size_t offset, size_t size)
   bool leading  = !!(field->attr & leading_e);
   bool separate = !!(field->attr & separate_e);
 
-  char *digits   = (char *)(field->data + offset);
+  char *digits   = reinterpret_cast<char *>(field->data + offset);
   char *digits_e = digits + size;
 
   if( leading && separate && signable )
@@ -9609,13 +9897,13 @@ is_numeric_display_numeric(cblc_field_t *field, size_t offset, size_t size)
   }
 
 static int
-is_packed_numeric(cblc_field_t *field, size_t offset, size_t size)
+is_packed_numeric(const cblc_field_t *field, size_t offset, size_t size)
   {
   int retval = 1;
   bool is_comp6 = !!(field->attr&packed_no_sign_e);
   int digits = field->digits;
   bool signable = !!(field->attr & signable_e);
-  unsigned char *bytes   = field->data + offset;
+  const unsigned char *bytes   = field->data + offset;
 
   int nybble   = 0;
   int nybble_e = nybble + digits;
@@ -9684,10 +9972,12 @@ is_packed_numeric(cblc_field_t *field, size_t offset, size_t size)
   }
 
 static int
-is_alpha_a_number(cblc_field_t *field, size_t offset, size_t size)
+is_alpha_a_number(const cblc_field_t *field,
+                  size_t offset,
+                  size_t size)
   {
   int retval = 1;
-  unsigned char *bytes = (field->data + offset);
+  const unsigned char *bytes = (field->data + offset);
   for( size_t i=0; i<size; i++ )
     {
     unsigned char ch = bytes[i];
@@ -9711,7 +10001,7 @@ __gg__classify( classify_t type,
   // The default answer is TRUE
   int retval = 1;
 
-  const unsigned char *alpha = (unsigned char *)(field->data+offset);
+  const unsigned char *alpha = reinterpret_cast<unsigned char *>(field->data+offset);
 
   size_t str_length = size;
 
@@ -9842,52 +10132,70 @@ __gg__classify( classify_t type,
   return retval;
   }
 
+static
+int
+accept_envar( cblc_field_t *tgt,
+              size_t        tgt_offset,
+              size_t        tgt_length,
+              const char   *psz_name)
+  {
+  int retval = 1; // 1 means we couldn't find it
+  if( psz_name )
+    {
+    tgt_length = tgt_length  ? tgt_length  : tgt->capacity;
+
+    // Pick up the environment variable name, which is in the internal codeset
+    char *env = strdup(psz_name);
+    massert(env);
+
+    // Get rid of leading and trailing internal_space characters:
+    char *trimmed_env = brute_force_trim(env);
+
+    // Convert the name to the console codeset:
+    __gg__internal_to_console_in_place(trimmed_env, strlen(trimmed_env));
+
+    // Pick up the environment variable, and convert it to the internal codeset
+    const char *p = getenv(trimmed_env);
+    if(p)
+      {
+      char *pp = strdup(p);
+      massert(pp);
+      console_to_internal(pp, strlen(pp));
+      retval = 0; // Okay
+      move_string(tgt, tgt_offset, tgt_length, pp);
+      free(pp);
+      }
+    free(env);
+    }
+
+  if( retval == 1 )
+    {
+    // Could't find it
+    exception_raise(ec_argument_imp_environment_e);
+    }
+
+  return retval;
+  }
+
 extern "C"
 int
 __gg__accept_envar( cblc_field_t *tgt,
                     size_t        tgt_offset,
                     size_t        tgt_length,
-                    cblc_field_t *name,
+              const cblc_field_t *name,
                     size_t        name_offset,
                     size_t        name_length)
   {
-  int retval;
-  tgt_length  = tgt_length  ? tgt_length  : tgt->capacity;
-  name_length = name_length ? name_length : name->capacity;
-
-  // Pick up the environment variable name, which is in teh internal codeset
-  static char   *env        = NULL;
-  static size_t  env_length = 0;
-  if( env_length < name_length+1 )
-    {
-    env_length = name_length+1;
-    env = (char *)realloc(env, env_length);
-    }
-  memcpy(env, name->data + name_offset, name_length);
-  env[name_length] = '\0';
-
-  // Get rid of leading and trailing internal_space characters:
-  char *trimmed_env = brute_force_trim(env);
-
-  // Convert the name to the console codeset:
-  __gg__internal_to_console_in_place(trimmed_env, strlen(trimmed_env));
-
-  // Pick up the environment variable, and convert it to the internal codeset
-  char *p = getenv(trimmed_env);
-  if(p)
-    {
-    char *pp = strdup(p);
-    console_to_internal(pp, strlen(pp));
-    retval = 0; // Okay
-    move_string(tgt, tgt_offset, tgt_length, pp);
-    free(pp);
-    }
-  else
-    {
-    retval = 1; // Could't find it
-    exception_raise(ec_argument_imp_environment_e);
-    }
-
+  //  We need the name to be nul-terminated:
+  char *p = static_cast<char *>(malloc(name_length + 1));
+  massert(p);
+  memcpy(p, name->data+name_offset, name_length);
+  p[name_length] = '\0';
+  int retval = accept_envar(tgt,
+                            tgt_offset,
+                            tgt_length,
+                            p);
+  free(p);
   return retval;
   }
 
@@ -9912,13 +10220,16 @@ __gg__set_envar(cblc_field_t    *name,
   if( env_length < name_length+1 )
     {
     env_length = name_length+1;
-    env = (char *)realloc(env, env_length);
+    env = static_cast<char *>(realloc(env, env_length));
     }
   if( val_length < value_length+1 )
     {
     val_length = value_length+1;
-    val = (char *)realloc(val, val_length);
+    val = static_cast<char *>(realloc(val, val_length));
     }
+
+  massert(val);
+  massert(env);
 
   // The name and the value arrive in the internal codeset:
   memcpy(env, name->data+name_offset  , name_length);
@@ -9988,15 +10299,15 @@ command_line_plan_b()
       if( bytes_read )
         {
         char *p = input;
-        char *p_end = p + bytes_read;
+        const char *p_end = p + bytes_read;
         char prior_char = '\0';
         while( p < p_end )
           {
           if( prior_char == '\0' )
             {
             stashed_argc += 1;
-            stashed_argv = (char **)realloc(stashed_argv,
-                                            stashed_argc * sizeof(char *));
+            stashed_argv = static_cast<char **>(realloc(stashed_argv,
+                                            stashed_argc * sizeof(char *)));
             stashed_argv[stashed_argc-1] = p;
             }
           prior_char = *p++;
@@ -10067,7 +10378,8 @@ __gg__get_command_line( cblc_field_t *field,
   int retcode;
   command_line_plan_b();
   size_t length = 1;
-  char *retval = (char *)malloc(length);
+  char *retval = static_cast<char *>(malloc(length));
+  massert(retval);
   *retval = NULLCH;
 
   for( int i=1; i<stashed_argc; i++ )
@@ -10075,7 +10387,8 @@ __gg__get_command_line( cblc_field_t *field,
     while( strlen(retval) + strlen(stashed_argv[i]) + 2 > length )
       {
       length *= 2;
-      retval = (char *)realloc(retval, length);
+      retval = static_cast<char *>(realloc(retval, length));
+      massert(retval);
       }
     if( *retval )
       {
@@ -10103,12 +10416,12 @@ __gg__get_command_line( cblc_field_t *field,
 
 extern "C"
 void
-__gg__set_pointer(cblc_field_t *target,
-                  size_t        target_o,
-                  int           target_flags,
-                  cblc_field_t *source,
-                  size_t        source_o,
-                  int           source_flags)
+__gg__set_pointer(cblc_field_t       *target,
+                  size_t              target_o,
+                  int                 target_flags,
+                  const cblc_field_t *source,
+                  size_t              source_o,
+                  int                 source_flags)
   {
   void *source_address;
   if( source_flags & REFER_T_ADDRESS_OF )
@@ -10121,7 +10434,7 @@ __gg__set_pointer(cblc_field_t *target,
     // This is SET <something> TO POINTER
     if( source )
       {
-      source_address = *(void **)(source->data + source_o);
+      source_address = *reinterpret_cast<void **>(source->data + source_o);
       }
     else
       {
@@ -10134,7 +10447,7 @@ __gg__set_pointer(cblc_field_t *target,
     {
     // This is SET ADDRESS OF target TO ....
     // We know it has to be an unqualified LINKAGE level 01 or level 77
-    target->data  = (unsigned char *)source_address;
+    target->data  = reinterpret_cast<unsigned char *>(source_address);
     // The caller will propogate data + offset to their children.
     }
   else
@@ -10145,12 +10458,12 @@ __gg__set_pointer(cblc_field_t *target,
       // This is [almost certainly] INITIALIZE <pointer> when -fdefaultbyte
       // was specified.
       memset( target->data+target_o,
-              *(unsigned char *)source_address,
+              *reinterpret_cast<unsigned char *>(source_address),
               target->capacity);
       }
     else
       {
-      *(void **)(target->data+target_o) = source_address;
+      *reinterpret_cast<void **>(target->data+target_o) = source_address;
       }
     }
   }
@@ -10233,7 +10546,7 @@ extern "C"
 void
 __gg__ascii_to_internal_field(cblc_field_t *var)
   {
-  ascii_to_internal_str((char *)var->data, var->capacity);
+  ascii_to_internal_str(reinterpret_cast<char *>(var->data), var->capacity);
   }
 
 extern "C"
@@ -10285,7 +10598,7 @@ void
 __gg__internal_to_console_in_place(char *loc, size_t length)
   {
   static size_t dest_size = MINIMUM_ALLOCATION_SIZE;
-  static char *dest = (char *)malloc(dest_size);
+  static char *dest = static_cast<char *>(malloc(dest_size));
 
   internal_to_console(&dest, &dest_size, loc, length);
   memcpy(loc, dest, length);
@@ -10293,8 +10606,8 @@ __gg__internal_to_console_in_place(char *loc, size_t length)
 
 extern "C"
 int
-__gg__routine_to_call(char *name,
-                      int  program_id)
+__gg__routine_to_call(const char *name,
+                      int         program_id)
   {
   // The list of names is sorted, so at the very least this should be replaced
   // with a binary search:
@@ -10310,10 +10623,10 @@ __gg__routine_to_call(char *name,
   char **names = *(it->second);
 
   int retval = -1;
-  int i=0;
 
   if( names )
     {
+    int i=0;
     while(*names)
       {
       if( strstr(*names, name) )
@@ -10335,14 +10648,14 @@ __gg__routine_to_call(char *name,
 
 extern "C"
 __int128
-__gg__fetch_call_by_value_value(cblc_field_t *field,
+__gg__fetch_call_by_value_value(const cblc_field_t *field,
                                 size_t field_o,
                                 size_t field_s)
 
   {
   int rdigits;
-  unsigned char *data = field->data + field_o;
-  size_t         length = field_s;
+  unsigned char *data   = field->data + field_o;
+  const size_t   length = field_s;
 
   __int128 retval = 0;
   switch(field->type)
@@ -10351,7 +10664,7 @@ __gg__fetch_call_by_value_value(cblc_field_t *field,
     case FldAlphanumeric:
     case FldAlphaEdited:
     case FldLiteralA:
-      retval = *(char *)data;
+      retval = *reinterpret_cast<char *>(data);
       break;
 
     case FldFloat:
@@ -10359,16 +10672,16 @@ __gg__fetch_call_by_value_value(cblc_field_t *field,
       switch(length)
         {
         case 4:
-          *(float *)(&retval) = *(float *)data;
+          *PTRCAST(float, &retval) = *PTRCAST(float, data);
           break;
 
         case 8:
-          *(double *)(&retval) = *(double *)data;
+          *PTRCAST(double, &retval) = *PTRCAST(double, data);
           break;
 
         case 16:
           // *(_Float128 *)(&retval) = double(*(_Float128 *)data);
-          _Float128 t;
+          GCOB_FP128 t;
           memcpy(&t, data, 16);
           memcpy(&retval, &t, 16);
           break;
@@ -10420,16 +10733,16 @@ __gg__assign_value_from_stack(cblc_field_t *dest, __int128 parameter)
       switch(dest->capacity)
         {
         case 4:
-          *(float *)(dest->data) = *(float *)&parameter;
+          *PTRCAST(float, dest->data) = *PTRCAST(float, (&parameter));
           break;
 
         case 8:
-          *(double *)(dest->data) = *(double *)&parameter;
+          *PTRCAST(double, dest->data) = *PTRCAST(double, (&parameter));
           break;
 
         case 16:
           // *(_Float128 *)(dest->data) = *(_Float128 *)&parameter;
-          _Float128 t;
+          GCOB_FP128 t;
           memcpy(&t, &parameter, 16);
           memcpy(dest->data, &t, 16);
           break;
@@ -10458,28 +10771,31 @@ __gg__assign_value_from_stack(cblc_field_t *dest, __int128 parameter)
 
 extern "C"
 int
-__gg__literaln_alpha_compare(char *left_side,
-                             cblc_field_t *right,
-                             size_t        offset,
-                             size_t        length,
-                             int  flags)
+__gg__literaln_alpha_compare(const char         *left_side,
+                             const cblc_field_t *right,
+                             size_t              offset,
+                             size_t              length,
+                             int                 flags)
   {
   int retval;
   if( length == 0 )
     {
     length = right->capacity;
     }
-  retval = compare_strings(   (char *)left_side,
+  retval = compare_strings(   left_side,
                               strlen(left_side),
                               false,
-                              (char *)right->data + offset,
+                              reinterpret_cast<char *>((right->data + offset)),
                               length,
                               !!(flags & REFER_T_MOVE_ALL) );
   return retval;
   }
 
 static char *
-string_in(char *str, char *str_e, char *frag, char *frag_e)
+string_in(      char *str,
+          const char *str_e,
+          const char *frag,
+          const char *frag_e)
   {
   // This simple routine could be improved.  Instead of using memcmp, we could
   // use established, albeit complex, techniques of string searching:
@@ -10509,11 +10825,11 @@ string_in(char *str, char *str_e, char *frag, char *frag_e)
 
 extern "C"
 int
-__gg__unstring( cblc_field_t *id1,        // The string being unstring
-                size_t        id1_o,
-                size_t        id1_s,
+__gg__unstring( const cblc_field_t *id1,        // The string being unstring
+                size_t              id1_o,
+                size_t              id1_s,
                 size_t ndelimiteds,       // The number of DELIMITED entries
-                char *all_flags,          // The number of ALL flags, one per ndelimiteds
+                const char *all_flags,          // The number of ALL flags, one per ndelimiteds
                 size_t nreceivers,        // The number of DELIMITER receivers
                 cblc_field_t *id7,        // The index of characters, both for starting updated at end
                 size_t        id7_o,
@@ -10532,18 +10848,22 @@ __gg__unstring( cblc_field_t *id1,        // The string being unstring
   // resolved.  Each might have an identifier-5 delimiter, and each might have
   // an identifier-6 count.
 
-  cblc_field_t **id2   = __gg__treeplet_1f;      // The delimiting strings; one per ndelimiteds
-  size_t        *id2_o = __gg__treeplet_1o;
-  size_t        *id2_s = __gg__treeplet_1s;
-  cblc_field_t **id4   = __gg__treeplet_2f;      // The delimited string; one per nreceiver
-  size_t        *id4_o = __gg__treeplet_2o;
-  size_t        *id4_s = __gg__treeplet_2s;
-  cblc_field_t **id5   = __gg__treeplet_3f;      // The delimiting string; one per receiver
-  size_t        *id5_o = __gg__treeplet_3o;
-  size_t        *id5_s = __gg__treeplet_3s;
-  cblc_field_t **id6   = __gg__treeplet_4f;      // The count of characters examined;  one per receiver
-  size_t        *id6_o = __gg__treeplet_4o;
-  size_t        *id6_s = __gg__treeplet_4s;
+  // The delimiting strings; one per ndelimiteds
+  cblc_field_t **id2         = __gg__treeplet_1f;
+  const size_t        *id2_o = __gg__treeplet_1o;
+  const size_t        *id2_s = __gg__treeplet_1s;
+  // The delimited string; one per nreceiver
+  cblc_field_t **id4         = __gg__treeplet_2f;
+  const size_t        *id4_o = __gg__treeplet_2o;
+  const size_t        *id4_s = __gg__treeplet_2s;
+  // The delimiting string; one per receiver
+  cblc_field_t **id5         = __gg__treeplet_3f;
+  const size_t        *id5_o = __gg__treeplet_3o;
+  const size_t        *id5_s = __gg__treeplet_3s;
+  // The count of characters examined;  one per receiver
+  cblc_field_t **id6         = __gg__treeplet_4f;
+  const size_t        *id6_o = __gg__treeplet_4o;
+  const size_t        *id6_s = __gg__treeplet_4s;
 
   // Initialize the state variables
   int overflow = 0;
@@ -10586,8 +10906,8 @@ __gg__unstring( cblc_field_t *id1,        // The string being unstring
     goto done;
     }
 
-  left  = (char *)(id1->data+id1_o) + pointer-1;
-  right = (char *)(id1->data+id1_o) + id1_s;
+  left  = reinterpret_cast<char *>(id1->data+id1_o) + pointer-1;
+  right = reinterpret_cast<char *>(id1->data+id1_o) + id1_s;
 
   if( ndelimiteds == 0 )
     {
@@ -10685,8 +11005,9 @@ __gg__unstring( cblc_field_t *id1,        // The string being unstring
         default:
           pfound = string_in( left,
                               right,
-                              (char *)(id2[i]->data+id2_o[i]),
-                              (char *)(id2[i]->data+id2_o[i]) + id2_s[i]);
+                              reinterpret_cast<char *>(id2[i]->data+id2_o[i]),
+                              reinterpret_cast<char *>((id2[i]->data+id2_o[i])
+                                                                 + id2_s[i]));
           break;
         }
 
@@ -10763,7 +11084,7 @@ __gg__unstring( cblc_field_t *id1,        // The string being unstring
         else
           {
           move_string(id5[nreceiver], id5_o[nreceiver], id5_s[nreceiver],
-                      (char *)(id2[ifound]->data+id2_o[ifound]),
+                      reinterpret_cast<char *>(id2[ifound]->data+id2_o[ifound]),
                       id2_s[ifound]);
           }
         }
@@ -10857,57 +11178,29 @@ int __gg__is_canceled(size_t function_pointer)
 static inline ec_type_t
 local_ec_type_of( file_status_t status )
   {
-  ec_type_t retval;
   int status10 = (int)status / 10;
-  if( !(status10 < 10 && status10 >= 0) )
+  assert( 0 <= status10 ); // was enum, can't be negative.
+  if( 10 < status10 )
     {
     __gg__abort("local_ec_type_of(): status10 out of range");
     }
-  switch(status10)
-    {
-    case 0:
-      // This actually should be ec_io_warning_e, but that's new for ISO 1989:2013
-      retval = ec_none_e;
-      break;
-    case 1:
-      retval = ec_io_at_end_e;
-      break;
-    case 2:
-      retval = ec_io_invalid_key_e;
-      break;
-    case 3:
-      retval = ec_io_permanent_error_e;
-      break;
-    case 4:
-      retval = ec_io_logic_error_e;
-      break;
-    case 5:
-      retval = ec_io_record_operation_e;
-      break;
-    case 6:
-      retval = ec_io_file_sharing_e;
-      break;
-    case 7:
-      retval = ec_io_record_content_e;
-      break;
-    case 9:
-      retval = ec_io_imp_e;
-      break;
 
-    default:
-      retval = ec_none_e;
-      break;
-    }
-  return retval;
+  static const std::vector<ec_type_t> ec_by_status {
+    /* 0 */ ec_none_e, // ec_io_warning_e if low byte is nonzero
+    /* 1 */ ec_io_at_end_e,
+    /* 2 */ ec_io_invalid_key_e,
+    /* 3 */ ec_io_permanent_error_e,
+    /* 4 */ ec_io_logic_error_e,
+    /* 5 */ ec_io_record_operation_e,
+    /* 6 */ ec_io_file_sharing_e,
+    /* 7 */ ec_io_record_content_e,
+    /* 8 */ ec_none_e, // unused, not defined by ISO
+    /* 9 */ ec_io_imp_e,
+  };
+  assert(ec_by_status.size() == 10);
+
+  return ec_by_status[status10];
   }
-
-bool
-cbl_enabled_exceptions_array_t::match( ec_type_t ec, size_t file ) const {
-  auto output = enabled_exception_match( ecs, ecs + nec, ec, file );
-  return output < ecs + nec? output->enabled : false;
-}
-
-static cbl_enabled_exceptions_array_t enabled_ECs;
 
 /*
  * Store and report the enabled exceptions.
@@ -10916,288 +11209,418 @@ static cbl_enabled_exceptions_array_t enabled_ECs;
  */
 struct exception_descr_t {
   bool location;
-  std::set<size_t> files;
+  //std::set<size_t> files;
+};
+
+struct cbl_exception_t {
+//  size_t program,
+  size_t file;
+  ec_type_t type;
+  cbl_file_mode_t mode;
 };
 
 /*
  * Compare the raised exception, cbl_exception_t, to the USE critera
- * of a declarative, cbl_declarative_t.  Return FALSE if the exception
- * raised was already handled by the statement that provoked the
- * exception, as indicated by the "handled" file status.
- *
- * This copes with I/O exceptions: ec_io_e and friends.
+ * of a declarative, cbl_declarative_t.
  */
-
-class match_file_declarative {
-  const cbl_exception_t& oops;
-  const ec_type_t handled_type;
- protected:
-  bool handled() const {
-    return oops.type == handled_type || oops.type == ec_none_e;
+static bool
+match_declarative( bool enabled,
+                   const cbl_exception_t& raised,
+                   const cbl_declarative_t& dcl )
+{
+  if( MATCH_DECLARATIVE && raised.type) {
+    warnx("match_declarative: checking:    ec %s vs. dcl %s (%s enabled and %s format_1)",
+          local_ec_type_str(raised.type),
+          local_ec_type_str(dcl.type),
+          enabled? "is" : "not",
+          dcl.is_format_1()? "is" : "not");
   }
- public:
-  match_file_declarative( const cbl_exception_t& oops, file_status_t handled )
-    : oops(oops), handled_type( local_ec_type_of(handled) )
-  {}
+  if( ! (enabled || dcl.is_format_1()) ) return false;
 
-  bool operator()( const cbl_declarative_t& dcl ) {
+  bool matches = ec_cmp(raised.type, (dcl.type));
 
-    if( getenv("match_declarative") && oops.type) {
-      warnx("match_file_declarative: checking:    oops %s dcl %s (handled %s) ",
-            local_ec_type_str(oops.type),
-            local_ec_type_str(dcl.type),
-            local_ec_type_str(handled_type));
-    }
+  if( matches && dcl.nfile > 0 ) {
+    matches = dcl.match_file(raised.file);
+  }
 
-    // Declarative is for the raised exception and not handled by the statement.
-    if( handled() ) return false;
-    bool matches = enabled_ECs.match(dcl.type);
-
+  // Having matched, the EC must either be enabled, or
+  // the Declarative must be USE Format 1.
+  if( matches ) {
     // I/O declaratives match by file or mode, not EC.
     if( dcl.is_format_1() ) { // declarative is for particular files or mode
-      if( dcl.nfile > 0 ) {
-        matches = dcl.match_file(oops.file);
-      } else {
-        matches = oops.mode == dcl.mode;
+      if( dcl.nfile == 0 ) {
+        matches = raised.mode == dcl.mode;
       }
+    } else {
+      matches = enabled;
     }
 
-    if( matches && getenv("match_declarative") ) {
-      warnx("                   matches exception      %s (file %zu mode %s)",
-            local_ec_type_str(oops.type),
-            oops.file,
-            cbl_file_mode_str(oops.mode));
+    if( matches && MATCH_DECLARATIVE ) {
+      warnx("                   matches exception      %s (file %u mode %s)",
+            local_ec_type_str(raised.type),
+            static_cast<unsigned int>(raised.file),
+            cbl_file_mode_str(raised.mode));
     }
-
-    return matches;
   }
-};
+  return matches;
+}
 
-cblc_file_t * __gg__file_stashed();
-static ec_type_t ec_raised_and_handled;
-
-static void
-default_exception_handler( ec_type_t ec)
+static
+void open_syslog(int option, int facility)
 {
-  if( ec != ec_none_e ) {
-    auto p = std::find_if( __gg__exception_table, __gg__exception_table_end,
-                           [ec](const ec_descr_t& descr) {
-                             return descr.type == ec;
-                           } );
-    if( p == __gg__exception_table_end ) {
-      err(EXIT_FAILURE,
-          "logic error: %s:%zu: %s unknown exception %x",
-           ec_status.source_file,
-           ec_status.lineno,
-           ec_status.statement,
-           ec );
-    }
-
-    const char *disposition = NULL;
-
-    switch( p->disposition ) {
-    case ec_category_fatal_e:
-      warnx("fatal exception at %s:%zu:%s %s (%s)",
-            ec_status.source_file,
-            ec_status.lineno,
-            ec_status.statement,
-            p->name,
-            p->description );
-      abort();
-      break;
-    case ec_category_none_e:
-      disposition = "category none?";
-      break;
-    case ec_category_nonfatal_e:
-      disposition = "nonfatal";
-      break;
-    case ec_category_implementor_e:
-      disposition = "implementor";
-      break;
-    case uc_category_none_e:
-      disposition = "uc_category_none_e";
-      break;
-    case uc_category_fatal_e:
-      disposition = "uc_category_fatal_e";
-      break;
-    case uc_category_nonfatal_e:
-      disposition = "uc_category_nonfatal_e";
-      break;
-    case uc_category_implementor_e:
-      disposition = "uc_category_implementor_e";
-      break;
-    }
-
-    // If the EC was handled by a declarative, keep mum.
-    if( ec == ec_raised_and_handled ) {
-      ec_raised_and_handled = ec_none_e;
-      return;
-    }
-
-    warnx("%s exception at %s:%zu:%s %s (%s)",
-          disposition,
-          ec_status.source_file,
-          ec_status.lineno,
-          ec_status.statement,
-          p->name,
-          p->description );
+  static bool first_time = true;
+  if( first_time ) {
+#if HAVE_DECL_PROGRAM_INVOCATION_SHORT_NAME
+  /* Declared in errno.h, when available.  */
+    static const char * const ident = program_invocation_short_name;
+#elif defined (HAVE_GETPROGNAME)
+  /* Declared in stdlib.h.  */
+    static const char * const ident = getprogname();
+#else
+  /* Avoid a NULL entry.  */
+    static const char * const ident = "unnamed_COBOL_program";
+#endif
+    // TODO: Program to set option in library via command-line and/or environment.
+    //       Library listens to program, not to the environment.
+    openlog(ident, option, facility);
+    first_time = false;
   }
 }
 
+/*
+ * The default exception handler is called if:
+ *   1.  The EC is enabled and was not handled by a Declarative, or
+ *   2.  The EC is EC-I-O and was not handled by a Format-1 Declarative, or
+ *   3.  The EC is EC-I-O, associated with a file, and is not OPEN or CLOSE.
+ */
+static void
+default_exception_handler( ec_type_t ec )
+{
+  static const int priority = LOG_INFO, option = LOG_PERROR, facility = LOG_USER;
+  open_syslog(option, facility);
+
+  ec_disposition_t disposition = ec_category_fatal_e;
+
+
+  if( ec != ec_none_e ) {
+    auto pec = std::find_if( __gg__exception_table, __gg__exception_table_end,
+                           [ec](const ec_descr_t& descr) {
+                             return descr.type == ec;
+                           } );
+    if( pec != __gg__exception_table_end ) {
+      disposition = pec->disposition;
+    } else {
+      warnx("logic error: unknown exception %x", ec );
+    }
+    /*
+     * An enabled, unhandled fatal EC normally results in termination. But
+     * EC-I-O is a special case:
+     *   OPEN and CLOSE never result in termination.
+     *   A SELECT statement with FILE STATUS indicates the user will handle the error.
+     *   Only I/O statements are considered.
+     * Declaratives are handled first.  We are in the default handler here,
+     * which is reached only if no Declarative was matched.
+     */
+    auto file = ec_status.file_status();
+    const char *filename = nullptr;
+
+    if( file.ifile ) {
+      filename = file.filename;
+      switch( last_exception_file_operation ) {
+      case file_op_none:   // not an I/O statement
+        assert(false);
+        abort();
+      case file_op_open:
+      case file_op_close:  // No OPEN/CLOSE results in a fatal error.
+        disposition = ec_category_none_e;
+        break;
+      default:
+        if( file.user_status ) {
+          // Not fatal if FILE STATUS is part of the file's SELECT statement.
+          disposition = ec_category_none_e;
+        }
+        break;
+      }
+    } else {
+      assert( ec_status.is_enabled() );
+      assert( ec_status.is_enabled(ec) );
+    }
+
+    switch( disposition ) {
+    case ec_category_none_e:
+    case uc_category_none_e:
+      break;
+    case ec_category_fatal_e:
+    case uc_category_fatal_e:
+      if( filename ) {
+        syslog(priority, "fatal exception: %s:%d: %s %s: %s (%s)",
+               program_name,
+               ec_status.lineno,
+               ec_status.statement,
+               filename, // show affected file before EC name
+               pec->name,
+               pec->description);
+      } else {
+        syslog(priority, "fatal exception: %s:%d: %s: %s (%s)",
+               program_name,
+               ec_status.lineno,
+               ec_status.statement,
+               pec->name,
+               pec->description);
+      }
+      abort();
+      break;
+    case ec_category_nonfatal_e:
+    case uc_category_nonfatal_e:
+      syslog(priority, "%s:%d: %s: %s (%s)",
+             program_name,
+             ec_status.lineno,
+             ec_status.statement,
+             pec->name,
+             pec->description);
+      break;
+    case ec_category_implementor_e:
+    case uc_category_implementor_e:
+      break;
+    }
+
+    ec_status.clear();
+  }
+}
+
+/*
+ * To reach the default handler, an EC must have effect and not have been
+ * handled by program logic.  To have effect, it must have been enabled
+ * explictly, or be of type EC-I-O.  An EC may be handled by the statement or
+ * by a Declarative.
+ *
+ * Any EC handled by statement's conditional clause (e.g. ON SIZE ERROR)
+ * prevents an EC from being raised.  Because it is not raised, it is handled
+ * neither by a Declarative, nor by the the default handler.
+ *
+ * A nonfatal EC matched to a Declarative is considered handled.  A fatal EC is
+ * considered handled if the Declarative uses RESUME.  For any EC that is
+ * handled (with RESUME for fatal), program control passes to the next
+ * statement. Else control passes here first.
+ *
+ * Any EC explicitly enabled (with >>TURN) must be explicitly handled.  Only
+ * explicitly enabled ECs appear in enabled_ECs.  when EC-I-O is raised as a
+ * byproduct of error status on a file operation, we say it is "implicitly
+ * enabled".  It need not be explicitly handled.
+ *
+ * Implicit EC-I-O not handled by the statement or a Declarative is considered
+ * handled if the statement includes the FILE STATUS phrase.  OPEN and CLOSE
+ * never cause program termination with EC-I-O; for those two statements the
+ * fatal status is ignored.  These conditions are screened out by
+ * __gg__check_fatal_exception(), so that the default handler is not called.
+ *
+ * An unhandled EC reaches the default handler for any of 3 reasons:
+ *   1.  It is EC-I-O (enabled does not matter).
+ *   2.  It is enabled.
+ *   3.  It is fatal and was matched to a Declarative that did not use RESUME.
+ * The default handler, default_exception_handler(), logs the EC.  For a fatal
+ * EC, the process terminated with abort(3).
+ *
+ * Except for OPEN and CLOSE, I/O statements that raise an unhandled fatal EC
+ * cause program termination, consistent with IBM documentation.  See
+ * Enterprise COBOL for z/OS: Enterprise COBOL for z/OS 6.4 Programming Guide,
+ * page 244, "Handling errors in input and output operations".
+ */
 extern "C"
 void
 __gg__check_fatal_exception()
 {
-  if( ec_raised_and_handled == ec_none_e ) return;
-  /*
-   * "... if checking for EC-I-O exception conditions is not enabled,
-   * there is no link between EC-I-O exception conditions and I-O
-   * status values."
-   */
-  if( ec_cmp(ec_raised_and_handled, ec_io_e) ) return;
+  if( MATCH_DECLARATIVE )
+    warnx("%s: ec_status is %s", __func__, ec_status.unset()? "unset" : "set");
 
-  default_exception_handler(ec_raised_and_handled);
-  ec_raised_and_handled = ec_none_e;
+  if( ec_status.copy_environment().unset() )
+    {
+    ec_status.update();  // __gg__match_exception was not called first
+    // This is a good time to set the exception code back to zero
+    __gg__exception_code = 0;
+    }
+
+  if( ec_status.done() ) { // false for part-handled fatal
+    if( MATCH_DECLARATIVE )
+      warnx("%s: clearing ec_status", __func__);
+    ec_status.clear();
+    return; // already handled
+  }
+
+  auto ec = ec_status.unhandled();
+
+  if( MATCH_DECLARATIVE )
+    warnx("%s: %s was not handled %s enabled", __func__,
+          local_ec_type_str(ec), ec_status.is_enabled(ec)? "is" : "is not");
+
+  // Look for ways I/O statement might have dealt with EC.
+  auto file = ec_status.file_status();
+  if( file.ifile && ec_cmp(ec, ec_io_e) ) {
+    if( MATCH_DECLARATIVE )
+      warnx("%s: %s with %sFILE STATUS", __func__,
+            file.op_str(), file.user_status? "" : "no ");
+    if( file.user_status ) {
+      ec_status.clear();
+      return; // has FILE STATUS, ok
+    }
+    switch( file.operation ) {
+    case file_op_none:
+      assert(false);
+      abort();
+    case file_op_open: // implicit, no Declarative, no FILE STATUS, but ok
+    case file_op_close:
+      ec_status.clear();
+      return;
+    case file_op_start:
+    case file_op_read:
+    case file_op_write:
+    case file_op_rewrite:
+    case file_op_delete:
+      break;
+    }
+  } else {
+    if( ! ec_status.is_enabled() ) {
+      if( MATCH_DECLARATIVE )
+        warnx("%s: %s is not enabled", __func__, local_ec_type_str(ec));
+      ec_status.clear();
+      return;
+    }
+    if( MATCH_DECLARATIVE )
+      warnx("%s: %s is enabled", __func__, local_ec_type_str(ec));
+  }
+
+  if( MATCH_DECLARATIVE )
+    warnx("%s: calling default_exception_handler(%s)", __func__,
+          local_ec_type_str(ec));
+
+  default_exception_handler(ec);
 }
 
+/*
+ * Preserve the state of the raised EC during Declarative execution.
+ */
+extern "C"
+void
+__gg__exception_push()
+{
+  ec_stack.push(ec_status);
+  if( MATCH_DECLARATIVE )
+    warnx("%s: %s: %u ECs, %u declaratives", __func__,
+          __gg__exception_statement,
+	  static_cast<unsigned int>(enabled_ECs.size()),
+	  static_cast<unsigned int>(declaratives.size()));
+}
+
+/*
+ * Restore the state of the raised EC after Declarative execution.
+ */
+extern "C"
+void
+__gg__exception_pop()
+{
+  ec_status = ec_stack.top();
+  ec_stack.pop();
+  ec_status.reset_environment();
+  if( MATCH_DECLARATIVE )
+    warnx("%s: %s: %u ECs, %u declaratives", __func__,
+          __gg__exception_statement,
+	  static_cast<unsigned int>(enabled_ECs.size()),
+	  static_cast<unsigned int>(declaratives.size()));
+  __gg__check_fatal_exception();
+}
+
+// Called for RESUME in a Declarative to indicate a fatal EC was handled.
 extern "C"
 void
 __gg__clear_exception()
 {
-  ec_raised_and_handled = ec_none_e;
+  ec_stack.top().clear();
 }
 
-
-cbl_enabled_exceptions_array_t&
-cbl_enabled_exceptions_array_t::operator=( const cbl_enabled_exceptions_array_t& input )
-{
-  if( nec == input.nec ) {
-    if( nec == 0 || 0 == memcmp(ecs, input.ecs, nbytes()) ) return *this;
-  }
-
-  if( nec < input.nec ) {
-    if( nec > 0 ) delete[] ecs;
-    ecs = new cbl_enabled_exception_t[1 + input.nec];
-  }
-  if( input.nec > 0 ) {
-    auto pend = std::copy( input.ecs, input.ecs + input.nec, ecs );
-    std::fill(pend, ecs + input.nec, cbl_enabled_exception_t());
-  }
-  nec = input.nec;
-  return *this;
-}
-
-// Update the list of compiler-maintained enabled exceptions.
-extern "C"
 void
-__gg__stash_exceptions( size_t nec, cbl_enabled_exception_t *ecs )
-{
-  enabled_ECs = cbl_enabled_exceptions_array_t(nec, ecs);
-
-  if( false && getenv("match_declarative") )
-    warnx("%s: %zu exceptions enabled", __func__, nec);
+cbl_enabled_exception_t::dump( int i ) const {
+  warnx("cbl_enabled_exception_t: %2d  {%s, %s, %u}",
+        i,
+        location? "location" : "    none",
+        local_ec_type_str(ec),
+        static_cast<unsigned int>(file) );
 }
-
 
 /*
- * Match the raised exception against a declarative handler
+ * Match the raised exception against a Declarative.
  *
- * ECs unrelated to I/O are not matched to a Declarative unless
- * enabled.  Declaratives for I/O errors, on the other hand, match
- * regardless of whether or not any EC is enabled.
+ * A Declarative that handles I/O errors with USE Format 1 doesn't name a
+ * specific EC.  It's matched based on the file's status, irrespective of
+ * whether or not EC-I-O is enabled.  USE Format 1 Declaratives are honored
+ * regardless of any >>TURN directive.
  *
- * Declaratives handle I-O errors with USE Format 1. They don't name a
- * specific EC.  They're matched based on the file's status,
- * irrespective of whether or not EC-I-O is enabled.  If EC-I-O is
- * enabled, and mentioned in a Declarative USE statement, then it is
- * matched just like any other Format 3 USE statement.
+ * An EC is enabled by the >>TURN directive.  The only ECs that can be disabled
+ * are those that were explicitly enabled.  If EC-I-O is enabled, and mentioned
+ * in a Declarative with USE Format 3, then it is matched just like any other.
  */
 extern "C"
 void
-__gg__match_exception( cblc_field_t *index,
-                       const cbl_declarative_t *dcls )
+__gg__match_exception( cblc_field_t *index )
 {
-  static const cbl_declarative_t no_declaratives[1] = {};
+  size_t isection = 0;
 
-  size_t ifile = __gg__exception_file_number;
-  // The exception file number is assumed to always be zero, unless it's
-  // been set to a non-zero value.  Having picked up that value it is our job
-  // to immediately set it back to zero:
-  __gg__exception_file_number = 0;
-
-  int  handled = __gg__exception_handled;
-  cblc_file_t *stashed = __gg__file_stashed();
-
-  if( dcls == NULL ) dcls = no_declaratives;
-  size_t ndcl = dcls[0].section;
-  auto eodcls  = dcls + 1 + ndcl, p = eodcls;
+  if( MATCH_DECLARATIVE ) enabled_ECs.dump("match_exception begin");
 
   auto ec = ec_status.update().unhandled();
 
-  // We need to set exception handled back to 0.  We do it here because
-  // ec_status.update() looks at it
-  __gg__exception_handled = 0;
+  if( ec != ec_none_e ) {
+    /*
+     * An EC was raised and was not handled by the statement.
+     * We know the EC and, for I/O, the current file and its mode.
+     * Scan declaratives for a match:
+     *   - EC is enabled or program has a Format 1 Declarative
+     *   - EC matches the Declarative's USE statement
+     * Format 1 declaratives apply only to EC-I-O, whether or not enabled.
+     * Format 1 may be restricted to a particular mode (for all files).
+     * Format 1 and 3 may be restricted to a set of files.
+     */
 
-  if(__gg__exception_code != ec_none_e) // cleared by ec_status_t::update
-    {
-    __gg__abort("__gg__match_exception(): __gg__exception_code should be ec_none_e");
-    }
-  if( ec == ec_none_e ) {
-    if( ifile == 0) goto set_exception_section;
+    // This is a good time to set the actual exception code back to zero.
+    __gg__exception_code = 0;
 
-    if( stashed == nullptr )
-      {
-      __gg__abort("__gg__match_exception(): stashed is null");
-      }
-    ec = local_ec_type_of( stashed->io_status );
-  }
+    auto f = ec_status.file_status();
+    cbl_exception_t raised = { /*0,*/ f.ifile, ec, f.mode };
+    bool enabled = enabled_ECs.match(ec);
 
-  if( ifile > 0 ) { // an I/O exception is raised
-    if( stashed == nullptr )
-      {
-      __gg__abort("__gg__match_exception(): stashed is null (2)");
-      }
-    auto mode = cbl_file_mode_t(stashed->mode_char);
-    cbl_exception_t oops = {0, ifile, ec, mode };
-    p = std::find_if( dcls + 1, eodcls,
-                      match_file_declarative(oops, file_status_t(handled)) );
+    if( MATCH_DECLARATIVE ) enabled_ECs.dump("match_exception enabled");
 
-  } else {  // non-I/O exception
-    auto enabled = enabled_ECs.match(ec);
-    if( enabled ) {
-      p = std::find_if( dcls + 1, eodcls, [ec] (const cbl_declarative_t& dcl) {
-                          if( ! enabled_ECs.match(dcl.type) ) return false;
-                          if( ! ec_cmp(ec, dcl.type) ) return false;
+    auto p = std::find_if( declaratives.begin(), declaratives.end(),
+                           [enabled, raised]( const cbl_declarative_t& dcl ) {
+                             return match_declarative(enabled, raised, dcl);
+                           } );
 
-                          if( getenv("match_declarative") ) {
-                            warnx("__gg__match_exception:%d: matched "
-                                  "%s against mask %s for section #%zu",
-                                  __LINE__,
-                                  local_ec_type_str(ec), local_ec_type_str(dcl.type),
-                                  dcl.section);
-                          }
-                          return true;
-                        } );
-      if( p == eodcls ) {
-        default_exception_handler(ec);
-      }
-    } else { // not enabled
-      if( getenv("match_declarative") ) {
+    if( p == declaratives.end() ) {
+      if( MATCH_DECLARATIVE ) {
         warnx("__gg__match_exception:%d: raised exception "
-              "%s is disabled (%zu enabled)", __LINE__,
-              local_ec_type_str(ec), enabled_ECs.nec);
+              "%s not matched (%u enabled)", __LINE__,
+              local_ec_type_str(ec),
+	      static_cast<unsigned int>(enabled_ECs.size()));
+      }
+    } else {
+      isection = p->section;
+      ec_status.handled_by(isection);
+
+      if( MATCH_DECLARATIVE ) {
+        warnx("__gg__match_exception:%d: matched "
+              "%s against mask %s for section #%u",
+              __LINE__,
+              local_ec_type_str(ec),
+              local_ec_type_str(p->type),
+              static_cast<unsigned int>(p->section));
       }
     }
-  }
-
- set_exception_section:
-  size_t retval = p == eodcls? 0 : p->section;
-  ec_raised_and_handled = retval? ec : ec_none_e;
+    assert(ec != ec_none_e);
+  } // end EC match logic
 
   // If a declarative matches the raised exception, return its
   // symbol_table index.
   __gg__int128_to_field(index,
-                        (__int128)retval,
+                        (__int128)isection,
                         0,
                         truncation_e,
                         NULL);
@@ -11265,21 +11688,24 @@ __gg__pseudo_return_flush()
   }
 
 extern "C"
-_Float128
-__gg__float128_from_location(cblc_field_t *var, unsigned char *location)
+GCOB_FP128
+__gg__float128_from_location( const cblc_field_t *var,
+                              const unsigned char *location)
   {
-  _Float128 retval = 0;
+  GCOB_FP128 retval = 0;
   switch( var->capacity )
     {
     case 4:
       {
-      retval = *(_Float32 *)location;
+      retval = *reinterpret_cast<_Float32 *>(
+                                    const_cast<unsigned char *>(location));
       break;
       }
 
     case 8:
       {
-      retval = *(_Float64 *)location;
+      retval = *reinterpret_cast<_Float64 *>(
+                                    const_cast<unsigned char *>(location));
       break;
       }
 
@@ -11295,11 +11721,11 @@ __gg__float128_from_location(cblc_field_t *var, unsigned char *location)
 
 extern "C"
 __int128
-__gg__integer_from_float128(cblc_field_t *field)
+__gg__integer_from_float128(const cblc_field_t *field)
   {
-  _Float128 fvalue = __gg__float128_from_location(field, field->data);
+  GCOB_FP128 fvalue = __gg__float128_from_location(field, field->data);
   // we round() to take care of the possible 2.99999999999... problem.
-  fvalue = roundf128(fvalue);
+  fvalue = FP128_FUNC(round)(fvalue);
   return (__int128)fvalue;
   }
 
@@ -11312,8 +11738,10 @@ __gg__adjust_dest_size(cblc_field_t *dest, size_t ncount)
     {
     if( dest->allocated < ncount )
       {
-      dest->allocated = ncount;
-      dest->data = (unsigned char *)realloc(dest->data, ncount);
+      fprintf(stderr, "libgcobol.cc:__gg__adjust_dest_size(): Adjusting size upward is not possible.\n");
+      abort();
+//      dest->allocated = ncount;
+//      dest->data = (unsigned char *)realloc(dest->data, ncount);
       }
     dest->capacity = ncount;
     }
@@ -11324,41 +11752,41 @@ void
 __gg__func_exception_location(cblc_field_t *dest)
   {
   char ach[512] = " ";
-  if( stashed_exception_code )
+  if( last_exception_code )
     {
     ach[0] = '\0';
-    if( stashed_exception_program_id )
+    if( last_exception_program_id )
       {
-      strcat(ach, stashed_exception_program_id);
+      strcat(ach, last_exception_program_id);
       strcat(ach, "; ");
       }
 
-    if( stashed_exception_paragraph )
+    if( last_exception_paragraph )
       {
-      strcat(ach, stashed_exception_paragraph );
-      if( stashed_exception_section )
+      strcat(ach, last_exception_paragraph );
+      if( last_exception_section )
         {
         strcat(ach, " OF ");
-        strcat(ach, stashed_exception_section);
+        strcat(ach, last_exception_section);
         }
       }
     else
       {
-      if( stashed_exception_section )
+      if( last_exception_section )
         {
-        strcat(ach, stashed_exception_section);
+        strcat(ach, last_exception_section);
         }
       }
     strcat(ach, "; ");
 
-    if( stashed_exception_source_file )
+    if( last_exception_source_file )
       {
       char achSource[128] = "";
       snprintf( achSource,
                 sizeof(achSource),
                 "%s:%d ",
-                stashed_exception_source_file,
-                stashed_exception_line_number);
+                last_exception_source_file,
+                last_exception_line_number);
       strcat(ach, achSource);
       }
     else
@@ -11375,9 +11803,9 @@ void
 __gg__func_exception_statement(cblc_field_t *dest)
   {
   char ach[128] = " ";
-  if(stashed_exception_statement)
+  if(last_exception_statement)
     {
-    snprintf(ach, sizeof(ach), "%s", stashed_exception_statement);
+    snprintf(ach, sizeof(ach), "%s", last_exception_statement);
     ach[sizeof(ach)-1] = '\0';
     }
   __gg__adjust_dest_size(dest, strlen(ach));
@@ -11389,12 +11817,12 @@ void
 __gg__func_exception_status(cblc_field_t *dest)
   {
   char ach[128] = "<not in table?>";
-  if(stashed_exception_code)
+  if(last_exception_code)
     {
     ec_descr_t *p = __gg__exception_table;
     while(p < __gg__exception_table_end )
       {
-      if( p->type == (ec_type_t)stashed_exception_code )
+      if( p->type == (ec_type_t)last_exception_code )
         {
         snprintf(ach, sizeof(ach), "%s", p->name);
         break;
@@ -11410,47 +11838,52 @@ __gg__func_exception_status(cblc_field_t *dest)
   memcpy(dest->data, ach, strlen(ach));
   }
 
-static cblc_file_t *recent_file = NULL;
-
 extern "C"
 void
-__gg__set_exception_file(cblc_file_t *file)
+__gg__set_exception_file(const cblc_file_t *file)
   {
-  if( getenv("match_declarative") )
-    {
-    warnx("%s: %s", __func__, file->name);
-    }
-  recent_file = file;
   ec_type_t ec = local_ec_type_of( file->io_status );
   if( ec )
     {
-    exception_raise(ec);
+    // During SORT operations, which routinely read files until they end, we
+    // need to suppress them.
+    if( ec != ec_io_at_end_e || !sv_suppress_eof_ec )
+      {
+      last_exception_file_operation = file->prior_op;
+      last_exception_file_status    = file->io_status;
+      last_exception_file_name      = file->name;
+      exception_raise(ec);
+      }
     }
   }
 
-
 extern "C"
 void
-__gg__func_exception_file(cblc_field_t *dest, cblc_file_t *file)
+__gg__func_exception_file(cblc_field_t      *dest,
+                          const cblc_file_t *file)
   {
   char ach[128];
   if( !file )
     {
     // This is where we process FUNCTION EXCEPTION-FILE <no parameter>
-    if( !(stashed_exception_code & ec_io_e) || !recent_file)
+    if( !(last_exception_code & ec_io_e) )
       {
-      // There is no EC-I-O exception code, so we return two spaces
+      // There is no EC-I-O exception code, so we return two alphanumeric zeros.
       strcpy(ach, "00");
       }
     else
       {
+      // The last exception code is an EC-I-O
       if( sv_from_raise_statement )
         {
         strcpy(ach, "  ");
         }
       else
         {
-        snprintf(ach, sizeof(ach), "%2.2d%s", recent_file->io_status, recent_file->name);
+        snprintf( ach,
+                  sizeof(ach), "%2.2d%s",
+                  last_exception_file_status,
+                  last_exception_file_name);
         }
       }
     }
@@ -11476,40 +11909,50 @@ extern "C"
 void
 __gg__set_exception_code(ec_type_t ec, int from_raise_statement)
   {
-  if( getenv("match_declarative") )
+  if( MATCH_DECLARATIVE )
     {
-    warnx("%s: raised %02x", __func__, ec);
+    warnx("%s: %s:%u: %s: %s",
+          __func__,
+          __gg__exception_source_file,
+          __gg__exception_line_number,
+          __gg__exception_statement,
+          local_ec_type_str(ec));
     }
   sv_from_raise_statement = from_raise_statement;
 
   __gg__exception_code = ec;
   if( ec == ec_none_e)
     {
-    stashed_exception_code          = 0    ;
-    stashed_exception_handled       = 0    ;
-    stashed_exception_file_number   = 0    ;
-    stashed_exception_file_status   = 0    ;
-    stashed_exception_file_name     = NULL ;
-    stashed_exception_program_id    = NULL ;
-    stashed_exception_section       = NULL ;
-    stashed_exception_paragraph     = NULL ;
-    stashed_exception_source_file   = NULL ;
-    stashed_exception_line_number   = 0    ;
-    stashed_exception_statement     = NULL ;
+    last_exception_code           = 0            ;
+    last_exception_program_id     = NULL         ;
+    last_exception_section        = NULL         ;
+    last_exception_paragraph      = NULL         ;
+    last_exception_source_file    = NULL         ;
+    last_exception_line_number    = 0            ;
+    last_exception_statement      = NULL         ;
+    last_exception_file_operation = file_op_none ;
+    last_exception_file_status    = FsSuccess    ;
+    last_exception_file_name      = NULL         ;
     }
   else
     {
-    stashed_exception_code          = __gg__exception_code         ;
-    stashed_exception_handled       = __gg__exception_handled      ;
-    stashed_exception_file_number   = __gg__exception_file_number  ;
-    stashed_exception_file_status   = __gg__exception_file_status  ;
-    stashed_exception_file_name     = __gg__exception_file_name    ;
-    stashed_exception_program_id    = __gg__exception_program_id   ;
-    stashed_exception_section       = __gg__exception_section      ;
-    stashed_exception_paragraph     = __gg__exception_paragraph    ;
-    stashed_exception_source_file   = __gg__exception_source_file  ;
-    stashed_exception_line_number   = __gg__exception_line_number  ;
-    stashed_exception_statement     = __gg__exception_statement    ;
+    last_exception_code           = __gg__exception_code         ;
+    last_exception_program_id     = __gg__exception_program_id   ;
+    last_exception_section        = __gg__exception_section      ;
+    last_exception_paragraph      = __gg__exception_paragraph    ;
+    last_exception_source_file    = __gg__exception_source_file  ;
+    last_exception_line_number    = __gg__exception_line_number  ;
+    last_exception_statement      = __gg__exception_statement    ;
+
+    // These are set in __gg__set_exception_file just before this routine is
+    // called.  In cases where the ec is not a file-i-o operation, we clear
+    // them here:
+    if( !(ec & ec_io_e) )
+      {
+      last_exception_file_operation = file_op_none ;
+      last_exception_file_status    = FsSuccess  ;
+      last_exception_file_name      = NULL    ;
+      }
     }
   }
 
@@ -11523,13 +11966,13 @@ __gg__float32_from_int128(cblc_field_t *destination,
                           int *size_error)
   {
   int rdigits;
-  _Float128 value = get_binary_value_local( &rdigits,
+  GCOB_FP128 value = get_binary_value_local( &rdigits,
                                             source,
                                             source->data + source_offset,
                                             source->capacity);
   value /= __gg__power_of_ten(rdigits);
 
-  if( fabsf128(value) > 3.4028235E38Q )
+  if( FP128_FUNC(fabs)(value) > GCOB_FP128_LITERAL (3.4028235E38) )
     {
     if(size_error)
       {
@@ -11564,7 +12007,7 @@ __gg__float64_from_int128(cblc_field_t *destination,
     *size_error = 0;
     }
   int rdigits;
-  _Float128 value = get_binary_value_local( &rdigits,
+  GCOB_FP128 value = get_binary_value_local( &rdigits,
                                             source,
                                             source->data + source_offset,
                                             source->capacity);
@@ -11587,7 +12030,7 @@ __gg__float128_from_int128(cblc_field_t *destination,
   {
   if(size_error) *size_error = 0;
   int rdigits;
-  _Float128 value = get_binary_value_local( &rdigits,
+  GCOB_FP128 value = get_binary_value_local( &rdigits,
                                             source,
                                             source->data + source_offset,
                                             source->capacity);
@@ -11601,20 +12044,20 @@ __gg__float128_from_int128(cblc_field_t *destination,
 
 extern "C"
 int
-__gg__is_float_infinite(cblc_field_t *source, size_t offset)
+__gg__is_float_infinite(const cblc_field_t *source, size_t offset)
   {
   int retval = 0;
   switch(source->capacity)
     {
     case 4:
-      retval = fpclassify(  *(_Float32*)(source->data+offset)) == FP_INFINITE;
+      retval = fpclassify(  *reinterpret_cast<_Float32*>(source->data+offset)) == FP_INFINITE;
       break;
     case 8:
-      retval = fpclassify(  *(_Float64*)(source->data+offset)) == FP_INFINITE;
+      retval = fpclassify(  *reinterpret_cast<_Float64*>(source->data+offset)) == FP_INFINITE;
       break;
     case 16:
       // retval = *(_Float128*)(source->data+offset) == INFINITY;
-      _Float128 t;
+      GCOB_FP128 t;
       memcpy(&t, source->data+offset, 16);
       retval = t == INFINITY;
       break;
@@ -11624,64 +12067,64 @@ __gg__is_float_infinite(cblc_field_t *source, size_t offset)
 
 extern "C"
 int
-__gg__float32_from_128( cblc_field_t *dest,
-                        size_t        dest_offset,
-                        cblc_field_t *source,
-                        size_t        source_offset)
+__gg__float32_from_128( const cblc_field_t *dest,
+                        size_t              dest_offset,
+                        const cblc_field_t *source,
+                        size_t              source_offset)
   {
   int retval = 0;
   //_Float128 value = *(_Float128*)(source->data+source_offset);
-  _Float128 value;
+  GCOB_FP128 value;
   memcpy(&value, source->data+source_offset, 16);
-  if( fabsf128(value) > 3.4028235E38Q )
+  if( FP128_FUNC(fabs)(value) > GCOB_FP128_LITERAL (3.4028235E38) )
     {
     retval = 1;
     }
   else
     {
-    *(_Float32 *)(dest->data+dest_offset) = (_Float32)value;
+    *reinterpret_cast<_Float32 *>(dest->data+dest_offset) = (_Float32)value;
     }
   return retval;
   }
 
 extern "C"
 int
-__gg__float32_from_64(  cblc_field_t *dest,
-                        size_t        dest_offset,
-                        cblc_field_t *source,
-                        size_t        source_offset)
+__gg__float32_from_64(  const cblc_field_t *dest,
+                        size_t              dest_offset,
+                        const cblc_field_t *source,
+                        size_t              source_offset)
   {
   int retval = 0;
-  _Float64 value = *(_Float64*)(source->data+source_offset);
-  if( fabsf128(value) > 3.4028235E38Q )
+  _Float64 value = *reinterpret_cast<_Float64*>(source->data+source_offset);
+  if( FP128_FUNC(fabs)(value) > GCOB_FP128_LITERAL (3.4028235E38) )
     {
     retval = 1;
     }
   else
     {
-    *(_Float32 *)(dest->data+dest_offset) = (_Float32)value;
+    *reinterpret_cast<_Float32 *>(dest->data+dest_offset) = (_Float32)value;
     }
   return retval;
   }
 
 extern "C"
 int
-__gg__float64_from_128( cblc_field_t *dest,
-                        size_t        dest_offset,
-                        cblc_field_t *source,
-                        size_t        source_offset)
+__gg__float64_from_128( const cblc_field_t *dest,
+                        size_t              dest_offset,
+                        const cblc_field_t *source,
+                        size_t              source_offset)
   {
   int retval = 0;
   // _Float128 value = *(_Float128*)(source->data+source_offset);
-  _Float128 value;
+  GCOB_FP128 value;
   memcpy(&value, source->data+source_offset, 16);
-  if( fabsf128(value) > 1.7976931348623157E308 )
+  if( FP128_FUNC(fabs)(value) > GCOB_FP128_LITERAL(1.7976931348623157E308) )
     {
     retval = 1;
     }
   else
     {
-    *(_Float64 *)(dest->data+dest_offset) = (_Float64)value;
+    *reinterpret_cast<_Float64 *>(dest->data+dest_offset) = (_Float64)value;
     }
   return retval;
   }
@@ -11753,7 +12196,8 @@ __gg__pop_local_variables()
 
 extern "C"
 void
-__gg__copy_as_big_endian(unsigned char *dest, unsigned char *source)
+__gg__copy_as_big_endian( unsigned char *dest,
+                          const unsigned char *source)
   {
   // copy eight bytes of source to dest, flipping the endianness
   for(size_t i=0; i<8; i++)
@@ -11776,7 +12220,7 @@ __gg__codeset_figurative_constants()
 
 extern "C"
 unsigned char *
-__gg__get_figconst_data(cblc_field_t *field)
+__gg__get_figconst_data(const cblc_field_t *field)
   {
   unsigned char *retval = NULL;
   cbl_figconst_t figconst = (cbl_figconst_t)(size_t)(field->initial);
@@ -11861,7 +12305,7 @@ find_in_dirs(const char *dirs, char *unmangled_name, char *mangled_name)
         {
         while( !retval )
           {
-          dirent *entry = readdir(dir);
+          const dirent *entry = readdir(dir);
           if( !entry )
             {
             break;
@@ -11917,7 +12361,7 @@ __gg__function_handle_from_cobpath( char *unmangled_name, char *mangled_name)
     {
     handle_executable = dlopen(NULL, RTLD_LAZY);
     }
-  if( !retval )
+  //if( !retval )
     {
     retval = dlsym(handle_executable, unmangled_name);
     }
@@ -11927,7 +12371,7 @@ __gg__function_handle_from_cobpath( char *unmangled_name, char *mangled_name)
     }
   if( !retval )
     {
-    const char *COBPATH = getenv("COBPATH");
+    const char *COBPATH = getenv("GCOBOL_LIBRARY_PATH");
     retval = find_in_dirs(COBPATH, unmangled_name, mangled_name);
     }
   if( !retval )
@@ -11941,13 +12385,16 @@ __gg__function_handle_from_cobpath( char *unmangled_name, char *mangled_name)
 
 extern "C"
 void
-__gg__just_mangle_name( cblc_field_t *field,
-                        char        **mangled_name
+__gg__just_mangle_name( const cblc_field_t  *field,
+                        char               **mangled_name
                         )
   {
   static char ach_name[1024];
   static char ach_unmangled[1024];
   static char ach_mangled[1024];
+
+  assert(field);
+  assert(field->data);
 
   size_t         length;
   length = field->capacity;
@@ -11962,7 +12409,7 @@ __gg__just_mangle_name( cblc_field_t *field,
 
   bool is_pointer = false;
 
-  if( (field && field->type == FldPointer) )
+  if( field->type == FldPointer )
     {
     is_pointer = true;
     }
@@ -11986,8 +12433,8 @@ __gg__just_mangle_name( cblc_field_t *field,
 
 extern "C"
 void *
-__gg__function_handle_from_literal(int   program_id,
-                                   char *literal)
+__gg__function_handle_from_literal(int         program_id,
+                                   const char *literal)
   {
   void *retval = NULL;
   static char ach_unmangled[1024];
@@ -12015,7 +12462,7 @@ __gg__function_handle_from_literal(int   program_id,
       }
     PFUNC **pointers_p = it->second;
     PFUNC  *pointers   = *pointers_p;
-    retval = (void *)pointers[function_index];
+    retval = reinterpret_cast<void *>(pointers[function_index]);
     }
   else
     {
@@ -12027,10 +12474,10 @@ __gg__function_handle_from_literal(int   program_id,
 
 extern "C"
 void *
-__gg__function_handle_from_name(int           program_id,
-                                cblc_field_t *field,
-                                size_t        offset,
-                                size_t        length )
+__gg__function_handle_from_name(int                 program_id,
+                                const cblc_field_t *field,
+                                size_t              offset,
+                                size_t              length )
   {
   void *retval = NULL;
   static char ach_name[1024];
@@ -12068,7 +12515,7 @@ __gg__function_handle_from_name(int           program_id,
       }
     PFUNC **pointers_p = it->second;
     PFUNC  *pointers   = *pointers_p;
-    retval = (void *)pointers[function_index];
+    retval = reinterpret_cast<void *>(pointers[function_index]);
     }
   else
     {
@@ -12104,10 +12551,10 @@ __gg__mirror_range( size_t         nrows,
                     cblc_field_t  *src,     // The row
                     size_t         src_o,
                     size_t         nspans,  // The number of spans
-                    size_t        *spans,
+                    const size_t  *spans,
                     size_t         table,
                     size_t         ntbl,
-                    size_t        *tbls)
+                    const size_t  *tbls)
   {
   static std::unordered_map<size_t, size_t> rows_in_table;
   static std::unordered_map<size_t, size_t> widths_of_table;
@@ -12128,7 +12575,7 @@ __gg__mirror_range( size_t         nrows,
   // We need to know the width of one row of this table, which is different
   // depending on type of src:
 
-  cblc_field_t *parent = src;
+  const cblc_field_t *parent = src;
   while( parent )
     {
     if( parent->occurs_upper )
@@ -12250,7 +12697,7 @@ __gg__mirror_range( size_t         nrows,
         std::vector<size_t> subtable_spans
                                 = spans_in_table [subtable_index];
 
-        unsigned char *subtable_source = source + subtable_offset;
+        const unsigned char *subtable_source = source + subtable_offset;
 
         if( subtable_spans.size() == 0 )
           {
@@ -12335,15 +12782,17 @@ __gg__deallocate( cblc_field_t *target,
     {
     // Target is a pointer.  Free the data location
     int rdigits;
-    void *ptr = (void *)get_binary_value_local(&rdigits,
+    size_t addrv =  get_binary_value_local(&rdigits,
                                                target,
                                                target->data + offset,
                                                sizeof(void *));
+    void *ptr = reinterpret_cast<void *>(addrv);
     if( ptr )
       {
       free(ptr);
       // And set the data location to zero
-      *(char **)(target->data + offset) = NULL;
+      *static_cast<char **>(static_cast<void *>(target->data + offset))
+                                                                      = NULL;
       }
     }
   }
@@ -12385,17 +12834,18 @@ get_the_byte(cblc_field_t *field)
 
 extern "C"
 void
-__gg__allocate( cblc_field_t *first,
-                size_t        first_offset,
-                int           initialized,
-                int           default_byte,
-                cblc_field_t *f_working_byte,
-                cblc_field_t *f_local_byte,
-                cblc_field_t *returning,
-                size_t        returning_offset)
+__gg__allocate( cblc_field_t       *first,
+                size_t              first_offset,
+                int                 initialized,
+                int                 default_byte,
+                cblc_field_t       *f_working_byte,
+                cblc_field_t       *f_local_byte,
+                const cblc_field_t *returning,
+                size_t              returning_offset)
   {
   int working_byte = get_the_byte(f_working_byte);
   int local_byte   = get_the_byte(f_local_byte);
+  int fill_char;
 
   unsigned char *retval = NULL;
   if( first->attr & based_e )
@@ -12403,12 +12853,12 @@ __gg__allocate( cblc_field_t *first,
     // first is the BASED variable we are allocating memory for
     if( first->capacity )
       {
-      retval = (unsigned char *)malloc(first->capacity);
+      retval = static_cast<unsigned char *>(malloc(first->capacity));
 
+      fill_char = 0;
       if( initialized )
         {
         // This is ISO 2023 ALLOCATE rule 7 (ALL TO VALUE)
-        int fill_char = 0;
         if( default_byte >= 0 )
           {
           fill_char = default_byte;
@@ -12418,7 +12868,6 @@ __gg__allocate( cblc_field_t *first,
       else
         {
         // This is ISO 2023 ALLOCATE rule 9 (pointers NULL, otherwise OPT_INIT)
-        int fill_char = 0;
         if( default_byte >= 0 )
           {
           fill_char = default_byte;
@@ -12462,9 +12911,13 @@ __gg__allocate( cblc_field_t *first,
     tsize /= pof10;
     if( tsize )
       {
-      retval = (unsigned char *)malloc(tsize);
+      retval = static_cast<unsigned char *>(malloc(tsize));
+      if(!retval)
+        {
+        abort();
+        }
 
-      int fill_char = 0;
+      fill_char = 0;
       if( initialized )
         {
         // This is ISO 2023 rule 6 (defaultbyte if specified, else zero)
@@ -12503,7 +12956,7 @@ __gg__allocate( cblc_field_t *first,
   if( returning )
     {
     // 'returning' has to be a FldPointer variable; assign the retval to it.
-    *(unsigned char **)(returning->data + returning_offset) = retval;
+    *reinterpret_cast<unsigned char **>(returning->data + returning_offset) = retval;
     }
   }
 
@@ -12532,7 +12985,8 @@ void
 __gg__module_name(cblc_field_t *dest, module_type_t type)
   {
   static size_t result_size = 64;
-  static char *result = (char *)malloc(result_size);
+  static char *result = static_cast<char *>(malloc(result_size));
+  massert(result);
 
   strcpy(result, "");
 
@@ -12621,7 +13075,7 @@ __gg__module_name(cblc_field_t *dest, module_type_t type)
           if( strlen(result) + module_name_stack[i].substr(1).length() + 4 > result_size)
             {
             result_size *= 2;
-            result = (char *)realloc(result, result_size);
+            result = static_cast<char *>(realloc(result, result_size));
             }
           strcat(result, module_name_stack[i].substr(1).c_str());
           strcat(result, ";");
@@ -12643,7 +13097,315 @@ __gg__module_name(cblc_field_t *dest, module_type_t type)
       break;
     }
 
-__gg__adjust_dest_size(dest, strlen(result));
+  __gg__adjust_dest_size(dest, strlen(result));
   memcpy(dest->data, result, strlen(result)+1);
   }
 
+/*
+ * Runtime functions defined for cbl_enabled_exceptions_t
+ */
+cbl_enabled_exceptions_t&
+cbl_enabled_exceptions_t::decode( const std::vector<uint64_t>& encoded ) {
+  auto p = encoded.begin();
+  while( p != encoded.end() ) {
+    auto location = static_cast<bool>(*p++);
+    auto ec = static_cast<ec_type_t>(*p++);
+    auto file = *p++;
+    cbl_enabled_exception_t enabled(location, ec, file);
+    insert(enabled);
+  }
+  return *this;
+}
+const cbl_enabled_exception_t *
+cbl_enabled_exceptions_t::match( ec_type_t type, size_t file ) const {
+  auto output = enabled_exception_match( begin(), end(), type, file );
+
+  if( output != end() ) {
+    if( MATCH_DECLARATIVE )
+      warnx("          enabled_exception_match found %x in input\n", type);
+    return &*output;
+  }
+  return nullptr;
+}
+
+void
+cbl_enabled_exceptions_t::dump( const char tag[] ) const {
+  if( empty() ) {
+    warnx("%s:  no enabled exceptions", tag );
+    return;
+  }
+  int i = 1;
+  for( auto& elem : *this ) {
+    warnx("%s: %2d  {%s, %04x %s, %u}", tag,
+	  i++,
+	  elem.location? "with location" : "  no location",
+	  elem.ec,
+	  local_ec_type_str(elem.ec),
+	  static_cast<unsigned int>(elem.file) );
+  }
+}
+
+
+static std::vector<cbl_declarative_t>&
+decode( std::vector<cbl_declarative_t>& dcls,
+        const std::vector<uint64_t>& encoded ) {
+  auto p = encoded.begin();
+  while( p != encoded.end() ) {
+    auto section = static_cast<size_t>(*p++);
+    auto global = static_cast<bool>(*p++);
+    auto type = static_cast<ec_type_t>(*p++);
+    auto nfile = static_cast<uint32_t>(*p++);
+    std::list<size_t> files;
+    assert(nfile <= cbl_declarative_t::files_max);
+    auto pend = p + nfile;
+    std::copy(p, pend, std::back_inserter(files));
+    p += cbl_declarative_t::files_max;
+    auto mode = cbl_file_mode_t(*p++);
+    cbl_declarative_t dcl( section, type, files, mode, global );
+    dcls.push_back(dcl);
+  }
+  return dcls;
+}
+
+static std::vector<cbl_declarative_t>&
+operator<<( std::vector<cbl_declarative_t>& dcls,
+            const std::vector<uint64_t>& encoded ) {
+  return decode( dcls, encoded );
+}
+
+// The first element of each array is the number of elements that follow
+// The first element of each array is the number of elements that follow
+extern "C"
+void
+__gg__set_exception_environment( uint64_t *ecs, uint64_t *dcls )
+  {
+  static struct prior_t {
+    uint64_t *ecs = nullptr, *dcls = nullptr;
+  } prior;
+
+  if( MATCH_DECLARATIVE )
+    if( prior.ecs != ecs || prior.dcls != dcls )
+      warnx("set_exception_environment: %s: %p, %p",
+            __gg__exception_statement, ecs, dcls);
+
+  if( ecs ) {
+    if( prior.ecs != ecs ) {
+      uint64_t *ecs_begin = ecs + 1, *ecs_end = ecs_begin + ecs[0];
+      if( MATCH_DECLARATIVE ) {
+        warnx("%u elements implies %u ECs",
+	      static_cast<unsigned int>(ecs[0]),
+	      static_cast<unsigned int>(ecs[0] / 3));
+      }
+      cbl_enabled_exceptions_t enabled;
+      enabled_ECs = enabled.decode( std::vector<uint64_t>(ecs_begin, ecs_end) );
+      if( MATCH_DECLARATIVE ) enabled_ECs.dump("set_exception_environment");
+    }
+  } else {
+    enabled_ECs.clear();
+  }
+
+  if( dcls ) {
+    if( prior.dcls != dcls ) {
+      uint64_t *dcls_begin = dcls + 1, *dcls_end = dcls_begin + dcls[0];
+      if( MATCH_DECLARATIVE ) {
+        warnx("%u elements implies %u declaratives",
+	      static_cast<unsigned int>(dcls[0]),
+	      static_cast<unsigned int>(dcls[0] / 21));
+      }
+      declaratives.clear();
+      declaratives << std::vector<uint64_t>( dcls_begin, dcls_end );
+    }
+  } else {
+    declaratives.clear();
+  }
+
+  __gg__exception_code = ec_none_e;
+
+  prior.ecs = ecs;
+  prior.dcls = dcls;
+  }
+
+static char *sv_envname = NULL;
+
+extern "C"
+void
+__gg__set_env_name( const cblc_field_t *var,
+                    size_t              offset,
+                    size_t              length )
+  {
+  // implements DISPLAY UPON ENVIRONMENT-NAME
+  free(sv_envname);
+  sv_envname = static_cast<char *>(malloc(length+1));
+  massert(sv_envname);
+  memcpy(sv_envname, var->data+offset, length);
+  sv_envname[length] = '\0';
+  }
+
+
+extern "C"
+void
+__gg__get_env_name( cblc_field_t *dest,
+                    size_t dest_offset,
+                    size_t dest_length)
+  {
+  // Implements ACCEPT FROM ENVIRONMENT-NAME
+  // It returns the value previously established by __gg__set_env_name.
+  if( sv_envname )
+    {
+    sv_envname = strdup("");
+    }
+  move_string(dest, dest_offset, dest_length, sv_envname);
+  }
+
+extern "C"
+int
+__gg__get_env_value(cblc_field_t *dest,
+                    size_t dest_offset,
+                    size_t dest_length)
+  {
+  return accept_envar(dest,
+                      dest_offset,
+                      dest_length,
+                      sv_envname);
+  }
+
+extern "C"
+void
+__gg__set_env_value(const cblc_field_t *value,
+                    size_t              offset,
+                    size_t              length )
+  {
+  // implements DISPLAY UPON ENVIRONMENT-VALUE
+  size_t name_length  = strlen(sv_envname);
+  size_t value_length = length;
+
+  static size_t  env_length = 16;
+  static char   *env        = static_cast<char *>(malloc(env_length+1));
+  static size_t  val_length = 16;
+  static char   *val        = static_cast<char *>(malloc(val_length+1));
+  if( env_length < name_length+1 )
+    {
+    env_length = name_length+1;
+    env = static_cast<char *>(realloc(env, env_length));
+    }
+  if( val_length < value_length+1 )
+    {
+    val_length = value_length+1;
+    val = static_cast<char *>(realloc(val, val_length));
+    }
+  massert(env);
+  massert(val);
+
+  // The name and the value arrive in the internal codeset:
+  memcpy(env, sv_envname, name_length);
+  env[name_length] = '\0';
+  memcpy(val, value->data+offset, value_length);
+  val[value_length] = '\0';
+
+  // Get rid of leading and trailing internal_space characters
+  char *trimmed_env = brute_force_trim(env);
+  char *trimmed_val = brute_force_trim(val);
+
+  // Conver them to the console codeset
+  __gg__internal_to_console_in_place(trimmed_env, strlen(trimmed_env));
+  __gg__internal_to_console_in_place(trimmed_val, strlen(trimmed_val));
+
+  // And now, anticlimactically, set the variable:
+  setenv(trimmed_env, trimmed_val, 1);
+  }
+
+extern "C"
+void
+__gg__fprintf_stderr(const char *format_string, ...)
+  __attribute__ ((__format__ (__printf__, 1, 2)));
+
+extern "C"
+void
+__gg__fprintf_stderr(const char *format_string, ...)
+  {
+  /*  This routine allows the compiler to send stuff to stderr in a way
+      that is straightforward to use..  */
+  va_list ap;
+  va_start(ap, format_string);
+  vfprintf(stderr, format_string, ap);
+  va_end(ap);
+  }
+
+
+static int sv_argument_number = 0;
+
+extern "C"
+void
+__gg__set_arg_num( const cblc_field_t *index,
+                   size_t              index_offset,
+                   size_t              index_size )
+  {
+  // Implements DISPLAY UPON ARGUMENT-NUMBER.
+  int rdigits;
+  __int128 N = get_binary_value_local(&rdigits,
+                                      index,
+                                      index->data + index_offset,
+                                      index_size);
+  // If he gives us fractional digits, just truncate
+  N /= __gg__power_of_ten(rdigits);
+
+  // N is 1-based, per normal COBOL.  We have to decrement it here:
+  N -= 1;
+  sv_argument_number = static_cast<int>(N);
+  }
+
+extern "C"
+int
+__gg__accept_arg_value( cblc_field_t *dest,
+                        size_t dest_offset,
+                        size_t dest_length)
+  {
+  // Implements ACCEPT FROM ARGUMENT-VALUE
+  int retcode;
+  command_line_plan_b();
+  if( sv_argument_number >= stashed_argc || sv_argument_number < 0 )
+    {
+    exception_raise(ec_argument_imp_command_e);
+    retcode = 1;  // Error
+    }
+  else
+    {
+    char *retval = strdup(stashed_argv[sv_argument_number]);
+    console_to_internal(retval, strlen(retval));
+    move_string(dest, dest_offset, dest_length, retval);
+    free(retval);
+    retcode = 0;  // Okay
+
+    // The Fujitsu spec says bump this value by one.
+    sv_argument_number += 1;
+    }
+  return retcode;
+  }
+
+extern "C"
+int
+__gg__get_file_descriptor(const char *device)
+  {
+  int retval = open(device, O_WRONLY);
+  
+  if( retval == -1 )
+    {
+    char *msg;
+    int ec = asprintf(&msg,
+                      "Trying to open %s.  Got error %s",
+                      device,
+                      strerror(errno));
+    if( ec != -1 )
+      {
+      static const int priority = LOG_INFO,
+                         option = LOG_PERROR,
+                       facility = LOG_USER;
+      open_syslog(option, facility);
+      syslog(priority, "%s", msg);
+      }
+    
+    // Open a new handle to /dev/stdout, since our caller will be closing it
+    retval = open("/dev/stdout", O_WRONLY);
+    }
+  return retval;
+  }

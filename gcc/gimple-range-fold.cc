@@ -51,6 +51,7 @@ along with GCC; see the file COPYING3.  If not see
 #include "sreal.h"
 #include "ipa-cp.h"
 #include "ipa-prop.h"
+#include "rtl.h"
 // Construct a fur_source, and set the m_query field.
 
 fur_source::fur_source (range_query *q)
@@ -759,15 +760,17 @@ fold_using_range::range_of_range_op (vrange &r,
 		}
 	      if (gimple_range_ssa_p (op1))
 		{
-		  rel = handler.lhs_op1_relation (r, range1, range2, rel);
-		  if (rel != VREL_VARYING)
-		    src.register_relation (s, rel, lhs, op1);
+		  relation_kind rel2 = handler.lhs_op1_relation (r, range1,
+								 range2, rel);
+		  if (rel2 != VREL_VARYING)
+		    src.register_relation (s, rel2, lhs, op1);
 		}
 	      if (gimple_range_ssa_p (op2))
 		{
-		  rel = handler.lhs_op2_relation (r, range1, range2, rel);
-		  if (rel != VREL_VARYING)
-		    src.register_relation (s, rel, lhs, op2);
+		  relation_kind rel2 = handler.lhs_op2_relation (r, range1,
+								 range2, rel);
+		  if (rel2 != VREL_VARYING)
+		    src.register_relation (s, rel2, lhs, op2);
 		}
 	    }
 	  // Check for an existing BB, as we maybe asked to fold an
@@ -776,11 +779,14 @@ fold_using_range::range_of_range_op (vrange &r,
 	    {
 	      basic_block bb = gimple_bb (s);
 	      edge e0 = EDGE_SUCC (bb, 0);
-	      edge e1 = EDGE_SUCC (bb, 1);
+	      /* During RTL expansion one of the edges can be removed
+		 if expansion proves the jump is unconditional.  */
+	      edge e1 = single_succ_p (bb) ? NULL : EDGE_SUCC (bb, 1);
 
+	      gcc_checking_assert (e1 || currently_expanding_to_rtl);
 	      if (!single_pred_p (e0->dest))
 		e0 = NULL;
-	      if (!single_pred_p (e1->dest))
+	      if (e1 && !single_pred_p (e1->dest))
 		e1 = NULL;
 	      src.register_outgoing_edges (as_a<gcond *> (s),
 					   as_a <irange> (r), e0, e1);

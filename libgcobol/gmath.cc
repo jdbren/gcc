@@ -27,34 +27,36 @@
  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-#include <ctype.h>
-#include <errno.h>
+
 #include <fcntl.h>
-#include <math.h>
-#include <fenv.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <time.h>
 #include <unistd.h>
+
+#include <cctype>
+#include <cerrno>
+#include <cmath>
+#include <cfenv>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <ctime>
+
 #include <algorithm>
+#include <vector>
+
+#include "config.h"
+#include "libgcobol-fp.h"
 
 #include "ec.h"
 #include "common-defs.h"
 #include "io.h"
 #include "gcobolio.h"
 #include "libgcobol.h"
-#include "common-defs.h"
 #include "gmath.h"
 #include "gcobolio.h"
 
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
-
-#ifdef __aarch64__
-#define __float128 _Float128
-#endif
 
 #define MAX_INTERMEDIATE_BITS 126
 #define MAX_INTERMEDIATE_DECIMALS 16
@@ -86,7 +88,8 @@ conditional_stash(  cblc_field_t *destination,
     // This is slightly more complex, because in the event of a
     // SIZE ERROR. we need to leave the original value untouched
 
-    unsigned char *stash = (unsigned char *)malloc(destination_s);
+    unsigned char *stash = static_cast<unsigned char *>(malloc(destination_s));
+    massert(stash);
     memcpy(stash, destination->data+destination_o, destination_s);
 
     __gg__int128_to_qualified_field(destination,
@@ -112,7 +115,7 @@ conditional_stash(  cblc_field_t *destination,
                     size_t        destination_o,
                     size_t        destination_s,
                     bool          on_error_flag,
-                    _Float128     value,
+                    GCOB_FP128    value,
                     cbl_round_t     rounded)
   {
   int retval = compute_error_none;
@@ -130,7 +133,9 @@ conditional_stash(  cblc_field_t *destination,
     {
     // This is slightly more complex, because in the event of a
     // SIZE ERROR. we need to leave the original value untouched
-    unsigned char *stash = (unsigned char *)malloc(destination_s);
+    assert(destination_s);
+    unsigned char *stash = static_cast<unsigned char *>(malloc(destination_s));
+    massert(stash);
     memcpy(stash, destination->data+destination_o, destination_s);
     __gg__float128_to_qualified_field(destination,
                                       destination_o,
@@ -148,15 +153,10 @@ conditional_stash(  cblc_field_t *destination,
   return retval;
   }
 
-
-#if defined(__aarch64__)
-# define __float128 _Float128 /* double */
-#endif
-
 static
-_Float128
-divide_helper_float(_Float128 a_value,
-                    _Float128 b_value,
+GCOB_FP128
+divide_helper_float(GCOB_FP128 a_value,
+                    GCOB_FP128 b_value,
                     int      *compute_error)
   {
   if( b_value == 0 )
@@ -185,9 +185,9 @@ divide_helper_float(_Float128 a_value,
   }
 
 static
-_Float128
-multiply_helper_float(_Float128 a_value,
-                      _Float128 b_value,
+GCOB_FP128
+multiply_helper_float(GCOB_FP128 a_value,
+                      GCOB_FP128 b_value,
                       int      *compute_error)
   {
   a_value *= b_value;
@@ -208,9 +208,9 @@ multiply_helper_float(_Float128 a_value,
   }
 
 static
-_Float128
-addition_helper_float(_Float128 a_value,
-                      _Float128 b_value,
+GCOB_FP128
+addition_helper_float(GCOB_FP128 a_value,
+                      GCOB_FP128 b_value,
                       int      *compute_error)
   {
   a_value += b_value;
@@ -231,9 +231,9 @@ addition_helper_float(_Float128 a_value,
   }
 
 static
-_Float128
-subtraction_helper_float(_Float128 a_value,
-                         _Float128 b_value,
+GCOB_FP128
+subtraction_helper_float(GCOB_FP128 a_value,
+                         GCOB_FP128 b_value,
                          int      *compute_error)
   {
   a_value -= b_value;
@@ -259,24 +259,24 @@ __gg__pow(  cbl_arith_format_t,
             size_t,
             size_t,
             size_t,
-            cbl_round_t  *rounded,
+      const cbl_round_t  *rounded,
             int           on_error_flag,
             int          *compute_error
             )
   {
-  cblc_field_t **A  = __gg__treeplet_1f;
-  size_t       *A_o = __gg__treeplet_1o;
-  size_t       *A_s = __gg__treeplet_1s;
-  cblc_field_t **B  = __gg__treeplet_2f;
-  size_t       *B_o = __gg__treeplet_2o;
-  size_t       *B_s = __gg__treeplet_2s;
-  cblc_field_t **C  = __gg__treeplet_3f;
-  size_t       *C_o = __gg__treeplet_3o;
-  size_t       *C_s = __gg__treeplet_3s;
+        cblc_field_t **A  = __gg__treeplet_1f;
+  const size_t       *A_o = __gg__treeplet_1o;
+  const size_t       *A_s = __gg__treeplet_1s;
+        cblc_field_t **B  = __gg__treeplet_2f;
+  const size_t       *B_o = __gg__treeplet_2o;
+  const size_t       *B_s = __gg__treeplet_2s;
+        cblc_field_t **C  = __gg__treeplet_3f;
+  const size_t       *C_o = __gg__treeplet_3o;
+  const size_t       *C_s = __gg__treeplet_3s;
 
-  _Float128 avalue = __gg__float128_from_qualified_field(A[0], A_o[0], A_s[0]);
-  _Float128 bvalue = __gg__float128_from_qualified_field(B[0], B_o[0], B_s[0]);
-  _Float128 tgt_value;
+  GCOB_FP128 avalue = __gg__float128_from_qualified_field(A[0], A_o[0], A_s[0]);
+  GCOB_FP128 bvalue = __gg__float128_from_qualified_field(B[0], B_o[0], B_s[0]);
+  GCOB_FP128 tgt_value;
 
   if( avalue == 0 && bvalue == 0 )
     {
@@ -293,7 +293,7 @@ __gg__pow(  cbl_arith_format_t,
     // Calculate our answer, in floating point:
     errno = 0;
     feclearexcept(FE_ALL_EXCEPT);
-    tgt_value = powf128(avalue, bvalue);
+    tgt_value = FP128_FUNC(pow)(avalue, bvalue);
     if( errno || fetestexcept(FE_INVALID | FE_DIVBYZERO | FE_OVERFLOW | FE_UNDERFLOW) )
       {
       // One of a large number of errors took place. See math_error(7) and
@@ -371,8 +371,8 @@ multiply_int256_by_int64(int256 &product, const uint64_t multiplier)
   for(int i=0; i<4; i++)
     {
     uint128 temp = (uint128)product.i64[i] * multiplier;
-    product.i64[i] = *(uint64_t *)(&temp);
-    overflows[i+1] = *(uint64_t *)((uint8_t *)(&temp) + 8);
+    product.i64[i] = *PTRCAST(uint64_t, &temp);
+    overflows[i+1] = *PTRCAST(uint64_t, PTRCAST(uint8_t, &temp) + 8);
     }
 
   for(int i=1; i<4; i++)
@@ -389,7 +389,7 @@ multiply_int256_by_int64(int256 &product, const uint64_t multiplier)
   }
 
 static int
-add_int256_to_int256(int256 &sum, const int256 addend)
+add_int256_to_int256(int256 &sum, const int256 &addend)
   {
   uint128 overflows[3] = {};
   for(int i=0; i<2; i++)
@@ -454,10 +454,11 @@ divide_int256_by_int64(int256 &val, uint64_t divisor)
   for( int i=3; i>=0; i-- )
     {
     // Left shift temp 64 bits:
-    *(uint64_t *)(((uint8_t *)&temp)+8) = *(uint64_t *)(((uint8_t *)&temp)+0);
+    *PTRCAST(uint64_t, ((PTRCAST(uint8_t, &temp))+8))
+                          = *PTRCAST(uint64_t, ((PTRCAST(uint8_t, &temp))+0));
 
     // Put the high digit of val into the bottom of temp
-    *(uint64_t *)(((uint8_t *)&temp)+0) = val.i64[i];
+    *PTRCAST(uint64_t, ((PTRCAST(uint8_t, &temp))+0)) = val.i64[i];
 
     // Divide that combinary by divisor to get the new digits
     val.i64[i] = temp / divisor;
@@ -472,7 +473,8 @@ squeeze_int256(int256 &val, int &rdigits)
   {
   int overflow = 0;
   // It has been decreed that at this juncture the result must fit into
-  // MAX_FIXED_POINT_DIGITS.  If the result does not, we have an OVERFLOW error.
+  // MAX_FIXED_POINT_DIGITS.  If the result does not, we have an OVERFLOW
+  // error.
 
   int is_negative = val.data[31] & 0x80;
   if( is_negative )
@@ -480,9 +482,9 @@ squeeze_int256(int256 &val, int &rdigits)
     negate_int256(val);
     }
 
-  // As long as there are some decimal places left, we hold our nose and right-
-  // shift a too-large value rightward by decimal digits.  In other words, we
-  // truncate the fractional part to make room for the integer part:
+  // As long as there are some decimal places left, we hold our nose and
+  // right-shift a too-large value rightward by decimal digits.  In other
+  // words, we truncate the fractional part to make room for the integer part:
   while(rdigits > 0 && val.i128[1] )
     {
     divide_int256_by_int64(val, 10UL);
@@ -507,7 +509,7 @@ squeeze_int256(int256 &val, int &rdigits)
     // These sixteen bytes comprise the binary value of 10^38
     static const uint8_t C1038[] = {0x00, 0x00, 0x00, 0x00, 0x40, 0x22, 0x8a, 0x09,
                                 0x7a, 0xc4, 0x86, 0x5a, 0xa8, 0x4c, 0x3b, 0x4b};
-    static const uint128 biggest = *(uint128 *)C1038;
+    static const uint128 biggest = *reinterpret_cast<const uint128 *>(C1038);
 
     // If we still have some rdigits to throw away, we can keep shrinking
     // the value:
@@ -543,7 +545,7 @@ squeeze_int256(int256 &val, int &rdigits)
 static void
 get_int256_from_qualified_field(int256 &var,
                                 int &rdigits,
-                                cblc_field_t *field,
+                          const cblc_field_t *field,
                                 size_t field_o,
                                 size_t field_s)
   {
@@ -566,7 +568,7 @@ get_int256_from_qualified_field(int256 &var,
 static int256 phase1_result;
 static int    phase1_rdigits;
 
-static _Float128 phase1_result_float;
+static GCOB_FP128 phase1_result_float;
 
 extern "C"
 void
@@ -574,7 +576,7 @@ __gg__add_fixed_phase1( cbl_arith_format_t ,
                         size_t nA,
                         size_t ,
                         size_t ,
-                        cbl_round_t  *,
+                  const cbl_round_t  *,
                         int           ,
                         int          *compute_error
                         )
@@ -583,9 +585,9 @@ __gg__add_fixed_phase1( cbl_arith_format_t ,
 
   // The result goes into the temporary phase1_result.
 
-  cblc_field_t **A  = __gg__treeplet_1f;
-  size_t       *A_o = __gg__treeplet_1o;
-  size_t       *A_s = __gg__treeplet_1s;
+        cblc_field_t **A  = __gg__treeplet_1f;
+  const size_t       *A_o = __gg__treeplet_1o;
+  const size_t       *A_s = __gg__treeplet_1s;
 
   // Let us prime the pump with the first value of A[]
   get_int256_from_qualified_field(phase1_result, phase1_rdigits, A[0], A_o[0], A_s[0]);
@@ -603,7 +605,6 @@ __gg__add_fixed_phase1( cbl_arith_format_t ,
     if( phase1_rdigits > temp_rdigits )
       {
       scale_int256_by_digits(temp, phase1_rdigits - temp_rdigits);
-      temp_rdigits = phase1_rdigits;
       }
     else if( phase1_rdigits < temp_rdigits )
       {
@@ -631,14 +632,14 @@ __gg__addf1_fixed_phase2( cbl_arith_format_t ,
                           size_t ,
                           size_t ,
                           size_t ,
-                          cbl_round_t  *rounded,
+                    const cbl_round_t  *rounded,
                           int           on_error_flag,
                           int          *compute_error
                           )
   {
-  cblc_field_t **C  = __gg__treeplet_3f;
-  size_t       *C_o = __gg__treeplet_3o;
-  size_t       *C_s = __gg__treeplet_3s;
+        cblc_field_t **C  = __gg__treeplet_3f;
+  const size_t       *C_o = __gg__treeplet_3o;
+  const size_t       *C_s = __gg__treeplet_3s;
 
   // This is the assignment phase of an ADD Format 1
 
@@ -652,11 +653,11 @@ __gg__addf1_fixed_phase2( cbl_arith_format_t ,
     // proceed accordingly.
 
     // Convert the intermediate
-    _Float128 value_a = (_Float128)phase1_result.i128[0];
+    GCOB_FP128 value_a = (GCOB_FP128)phase1_result.i128[0];
     value_a /= __gg__power_of_ten(phase1_rdigits);
 
     // Pick up the target
-    _Float128 value_b = __gg__float128_from_qualified_field(C[0], C_o[0], C_s[0]);
+    GCOB_FP128 value_b = __gg__float128_from_qualified_field(C[0], C_o[0], C_s[0]);
 
     value_a += value_b;
 
@@ -683,7 +684,6 @@ __gg__addf1_fixed_phase2( cbl_arith_format_t ,
     if( rdigits_a > rdigits_b )
       {
       scale_int256_by_digits(value_b, rdigits_a - rdigits_b);
-      rdigits_b = rdigits_a;
       }
     else if( rdigits_a < rdigits_b )
       {
@@ -716,16 +716,16 @@ __gg__fixed_phase2_assign_to_c( cbl_arith_format_t ,
                                 size_t ,
                                 size_t ,
                                 size_t ,
-                                cbl_round_t  *rounded,
+                          const cbl_round_t  *rounded,
                                 int           on_error_flag,
                                 int          *compute_error
                                 )
   {
   // This is the assignment phase of an ADD Format 2
 
-  cblc_field_t **C  = __gg__treeplet_3f;
-  size_t       *C_o = __gg__treeplet_3o;
-  size_t       *C_s = __gg__treeplet_3s;
+        cblc_field_t **C  = __gg__treeplet_3f;
+  const size_t       *C_o = __gg__treeplet_3o;
+  const size_t       *C_s = __gg__treeplet_3s;
 
 
   // We take phase1_result and put it into C
@@ -738,7 +738,7 @@ __gg__fixed_phase2_assign_to_c( cbl_arith_format_t ,
     // proceed accordingly.
 
     // Convert the intermediate
-    _Float128 value_a = (_Float128)phase1_result.i128[0];
+    GCOB_FP128 value_a = (GCOB_FP128)phase1_result.i128[0];
     value_a /= __gg__power_of_ten(phase1_rdigits);
 
     *compute_error |= conditional_stash(C[0], C_o[0], C_s[0],
@@ -774,7 +774,7 @@ __gg__add_float_phase1( cbl_arith_format_t ,
                         size_t nA,
                         size_t ,
                         size_t ,
-                        cbl_round_t  *,
+                  const cbl_round_t  *,
                         int           ,
                         int          *compute_error
                         )
@@ -783,9 +783,9 @@ __gg__add_float_phase1( cbl_arith_format_t ,
 
   // The result goes into the temporary phase1_result_ffloat.
 
-  cblc_field_t **A  = __gg__treeplet_1f;
-  size_t       *A_o = __gg__treeplet_1o;
-  size_t       *A_s = __gg__treeplet_1s;
+        cblc_field_t **A  = __gg__treeplet_1f;
+  const size_t       *A_o = __gg__treeplet_1o;
+  const size_t       *A_s = __gg__treeplet_1s;
 
   // Let us prime the pump with the first value of A[]
   phase1_result_float = __gg__float128_from_qualified_field(A[0], A_o[0], A_s[0]);
@@ -794,7 +794,7 @@ __gg__add_float_phase1( cbl_arith_format_t ,
 
   for( size_t i=1; i<nA; i++ )
     {
-    _Float128 temp = __gg__float128_from_qualified_field(A[i], A_o[i], A_s[i]);
+    GCOB_FP128 temp = __gg__float128_from_qualified_field(A[i], A_o[i], A_s[i]);
     phase1_result_float = addition_helper_float(phase1_result_float,
                                                 temp,
                                                 compute_error);
@@ -807,20 +807,20 @@ __gg__addf1_float_phase2( cbl_arith_format_t ,
                           size_t ,
                           size_t ,
                           size_t ,
-                          cbl_round_t  *rounded,
+                    const cbl_round_t  *rounded,
                           int           on_error_flag,
                           int          *compute_error
                           )
   {
-  cblc_field_t **C  = __gg__treeplet_3f;
-  size_t       *C_o = __gg__treeplet_3o;
-  size_t       *C_s = __gg__treeplet_3s;
+        cblc_field_t **C  = __gg__treeplet_3f;
+  const size_t       *C_o = __gg__treeplet_3o;
+  const size_t       *C_s = __gg__treeplet_3s;
 
   bool on_size_error = !!(on_error_flag & ON_SIZE_ERROR);
   // This is the assignment phase of an ADD Format 2
   // We take phase1_result and accumulate it into C
 
-  _Float128 temp = __gg__float128_from_qualified_field(C[0], C_o[0], C_s[0]);
+  GCOB_FP128 temp = __gg__float128_from_qualified_field(C[0], C_o[0], C_s[0]);
   temp = addition_helper_float(temp, phase1_result_float, compute_error);
   *compute_error |= conditional_stash(C[0], C_o[0], C_s[0],
                                       on_size_error,
@@ -834,14 +834,14 @@ __gg__float_phase2_assign_to_c( cbl_arith_format_t ,
                           size_t ,
                           size_t ,
                           size_t ,
-                          cbl_round_t  *rounded,
+                    const cbl_round_t  *rounded,
                           int           on_error_flag,
                           int          *compute_error
                           )
   {
-  cblc_field_t **C  = __gg__treeplet_3f;
-  size_t       *C_o = __gg__treeplet_3o;
-  size_t       *C_s = __gg__treeplet_3s;
+        cblc_field_t **C  = __gg__treeplet_3f;
+  const size_t       *C_o = __gg__treeplet_3o;
+  const size_t       *C_s = __gg__treeplet_3s;
 
   bool on_size_error = !!(on_error_flag & ON_SIZE_ERROR);
   // This is the assignment phase of an ADD Format 2
@@ -859,7 +859,7 @@ __gg__addf3(cbl_arith_format_t ,
             size_t nA,
             size_t ,
             size_t ,
-            cbl_round_t  *rounded,
+      const cbl_round_t  *rounded,
             int           on_error_flag,
             int          *compute_error
             )
@@ -867,13 +867,13 @@ __gg__addf3(cbl_arith_format_t ,
   // This is an ADD Format 3.  Each A[i] gets accumulated into each C[i].  When
   // both are fixed, we do fixed arithmetic.  When either is a FldFloat, we
   // do floating-point arithmetic.
-  cblc_field_t **A  = __gg__treeplet_1f;
-  size_t       *A_o = __gg__treeplet_1o;
-  size_t       *A_s = __gg__treeplet_1s;
+        cblc_field_t **A  = __gg__treeplet_1f;
+  const size_t       *A_o = __gg__treeplet_1o;
+  const size_t       *A_s = __gg__treeplet_1s;
 
-  cblc_field_t **C  = __gg__treeplet_3f;
-  size_t       *C_o = __gg__treeplet_3o;
-  size_t       *C_s = __gg__treeplet_3s;
+        cblc_field_t **C  = __gg__treeplet_3f;
+  const size_t       *C_o = __gg__treeplet_3o;
+  const size_t       *C_s = __gg__treeplet_3s;
 
   bool on_size_error = !!(on_error_flag & ON_SIZE_ERROR);
 
@@ -881,8 +881,8 @@ __gg__addf3(cbl_arith_format_t ,
     {
     if( A[i]->type == FldFloat || C[i]->type == FldFloat )
       {
-      _Float128 value_a = __gg__float128_from_qualified_field(A[i], A_o[i], A_s[i]);
-      _Float128 value_b = __gg__float128_from_qualified_field(C[i], C_o[i], C_s[i]);
+      GCOB_FP128 value_a = __gg__float128_from_qualified_field(A[i], A_o[i], A_s[i]);
+      GCOB_FP128 value_b = __gg__float128_from_qualified_field(C[i], C_o[i], C_s[i]);
 
       value_a = addition_helper_float(value_a, value_b, compute_error);
 
@@ -909,7 +909,6 @@ __gg__addf3(cbl_arith_format_t ,
       if( rdigits_a > rdigits_b )
         {
         scale_int256_by_digits(value_b, rdigits_a - rdigits_b);
-        rdigits_b = rdigits_a;
         }
       else if( rdigits_a < rdigits_b )
         {
@@ -943,14 +942,14 @@ __gg__subtractf1_fixed_phase2(cbl_arith_format_t ,
                               size_t ,
                               size_t ,
                               size_t ,
-                              cbl_round_t  *rounded,
+                        const cbl_round_t  *rounded,
                               int           on_error_flag,
                               int          *compute_error
                               )
   {
-  cblc_field_t **C  = __gg__treeplet_3f;
-  size_t       *C_o = __gg__treeplet_3o;
-  size_t       *C_s = __gg__treeplet_3s;
+        cblc_field_t **C  = __gg__treeplet_3f;
+  const size_t       *C_o = __gg__treeplet_3o;
+  const size_t       *C_s = __gg__treeplet_3s;
 
   // This is the assignment phase of an ADD Format 1
 
@@ -964,11 +963,11 @@ __gg__subtractf1_fixed_phase2(cbl_arith_format_t ,
     // proceed accordingly.
 
     // Convert the intermediate
-    _Float128 value_a = (_Float128)phase1_result.i128[0];
+    GCOB_FP128 value_a = (GCOB_FP128)phase1_result.i128[0];
     value_a /= __gg__power_of_ten(phase1_rdigits);
 
     // Pick up the target
-    _Float128 value_b = __gg__float128_from_qualified_field(C[0], C_o[0], C_s[0]);
+    GCOB_FP128 value_b = __gg__float128_from_qualified_field(C[0], C_o[0], C_s[0]);
 
     value_b -= value_a;
 
@@ -1000,7 +999,6 @@ __gg__subtractf1_fixed_phase2(cbl_arith_format_t ,
     else if( rdigits_a < rdigits_b )
       {
       scale_int256_by_digits(value_a, rdigits_b - rdigits_a);
-      rdigits_a = rdigits_b;
       }
 
     // The two numbers have the same number of rdigits.  It's now safe to add
@@ -1028,16 +1026,16 @@ __gg__subtractf2_fixed_phase1(cbl_arith_format_t ,
                               size_t nA,
                               size_t ,
                               size_t ,
-                              cbl_round_t  *rounded,
+                        const cbl_round_t  *rounded,
                               int           on_error_flag,
                               int          *compute_error
                               )
   {
   // This is the calculation phase of a fixed-point SUBTRACT Format 2
 
-  cblc_field_t **B  = __gg__treeplet_2f;
-  size_t       *B_o = __gg__treeplet_2o;
-  size_t       *B_s = __gg__treeplet_2s;
+        cblc_field_t **B  = __gg__treeplet_2f;
+  const size_t       *B_o = __gg__treeplet_2o;
+  const size_t       *B_s = __gg__treeplet_2s;
 
   // Add up all the A values
   __gg__add_fixed_phase1( not_expected_e ,
@@ -1068,7 +1066,6 @@ __gg__subtractf2_fixed_phase1(cbl_arith_format_t ,
   else if( rdigits_a < rdigits_b )
     {
     scale_int256_by_digits(value_a, rdigits_b - rdigits_a);
-    rdigits_a = rdigits_b;
     }
 
   // The two numbers have the same number of rdigits.  It's now safe to add
@@ -1084,27 +1081,26 @@ __gg__subtractf2_fixed_phase1(cbl_arith_format_t ,
   phase1_rdigits = rdigits_b;
   }
 
-
 extern "C"
 void
 __gg__subtractf1_float_phase2(cbl_arith_format_t ,
                               size_t ,
                               size_t ,
                               size_t ,
-                              cbl_round_t  *rounded,
+                        const cbl_round_t  *rounded,
                               int           on_error_flag,
                               int          *compute_error
                               )
   {
-  cblc_field_t **C  = __gg__treeplet_3f;
-  size_t       *C_o = __gg__treeplet_3o;
-  size_t       *C_s = __gg__treeplet_3s;
+        cblc_field_t **C  = __gg__treeplet_3f;
+  const size_t       *C_o = __gg__treeplet_3o;
+  const size_t       *C_s = __gg__treeplet_3s;
 
   bool on_size_error = !!(on_error_flag & ON_SIZE_ERROR);
   // This is the assignment phase of an ADD Format 2
   // We take phase1_result and subtract it from C
 
-  _Float128 temp = __gg__float128_from_qualified_field(C[0], C_o[0], C_s[0]);
+  GCOB_FP128 temp = __gg__float128_from_qualified_field(C[0], C_o[0], C_s[0]);
   temp = subtraction_helper_float(temp, phase1_result_float, compute_error);
   *compute_error |= conditional_stash(C[0], C_o[0], C_s[0],
                                       on_size_error,
@@ -1112,23 +1108,22 @@ __gg__subtractf1_float_phase2(cbl_arith_format_t ,
                                      *rounded++);
   }
 
-
 extern "C"
 void
 __gg__subtractf2_float_phase1(cbl_arith_format_t ,
                               size_t nA,
                               size_t ,
                               size_t ,
-                              cbl_round_t  *rounded,
+                        const cbl_round_t  *rounded,
                               int           on_error_flag,
                               int          *compute_error
                               )
   {
   // This is the calculation phase of a fixed-point SUBTRACT Format 2
 
-  cblc_field_t **B  = __gg__treeplet_2f;
-  size_t       *B_o = __gg__treeplet_2o;
-  size_t       *B_s = __gg__treeplet_2s;
+        cblc_field_t **B  = __gg__treeplet_2f;
+  const size_t       *B_o = __gg__treeplet_2o;
+  const size_t       *B_s = __gg__treeplet_2s;
 
   // Add up all the A values
   __gg__add_float_phase1( not_expected_e ,
@@ -1141,7 +1136,7 @@ __gg__subtractf2_float_phase1(cbl_arith_format_t ,
                           );
 
   // Subtract that from the B value:
-  _Float128 value_b = __gg__float128_from_qualified_field(B[0], B_o[0], B_s[0]);
+  GCOB_FP128 value_b = __gg__float128_from_qualified_field(B[0], B_o[0], B_s[0]);
 
   // The two numbers have the same number of rdigits.  It's now safe to add
   // them.
@@ -1154,7 +1149,7 @@ __gg__subtractf3( cbl_arith_format_t ,
                   size_t nA,
                   size_t ,
                   size_t ,
-                  cbl_round_t  *rounded,
+            const cbl_round_t  *rounded,
                   int           on_error_flag,
                   int          *compute_error
                   )
@@ -1162,12 +1157,12 @@ __gg__subtractf3( cbl_arith_format_t ,
   // This is an ADD Format 3.  Each A[i] gets accumulated into each C[i].  Each
   // SUBTRACTION is treated separately.
 
-  cblc_field_t **A  = __gg__treeplet_1f;
-  size_t       *A_o = __gg__treeplet_1o;
-  size_t       *A_s = __gg__treeplet_1s;
-  cblc_field_t **C  = __gg__treeplet_3f;
-  size_t       *C_o = __gg__treeplet_3o;
-  size_t       *C_s = __gg__treeplet_3s;
+        cblc_field_t **A  = __gg__treeplet_1f;
+  const size_t       *A_o = __gg__treeplet_1o;
+  const size_t       *A_s = __gg__treeplet_1s;
+        cblc_field_t **C  = __gg__treeplet_3f;
+  const size_t       *C_o = __gg__treeplet_3o;
+  const size_t       *C_s = __gg__treeplet_3s;
 
   bool on_size_error = !!(on_error_flag & ON_SIZE_ERROR);
 
@@ -1175,8 +1170,8 @@ __gg__subtractf3( cbl_arith_format_t ,
     {
     if( A[i]->type == FldFloat || C[i]->type == FldFloat)
       {
-      _Float128 value_a = __gg__float128_from_qualified_field(A[i], A_o[i], A_s[i]);
-      _Float128 value_b = __gg__float128_from_qualified_field(C[i], C_o[i], C_s[i]);
+      GCOB_FP128 value_a = __gg__float128_from_qualified_field(A[i], A_o[i], A_s[i]);
+      GCOB_FP128 value_b = __gg__float128_from_qualified_field(C[i], C_o[i], C_s[i]);
 
       value_b = subtraction_helper_float(value_b, value_a, compute_error);
 
@@ -1208,7 +1203,6 @@ __gg__subtractf3( cbl_arith_format_t ,
       else if( rdigits_a < rdigits_b )
         {
         scale_int256_by_digits(value_a, rdigits_b - rdigits_a);
-        rdigits_a = rdigits_b;
         }
 
       // The two numbers have the same number of rdigits.  It's now safe to add
@@ -1233,7 +1227,7 @@ __gg__subtractf3( cbl_arith_format_t ,
   }
 
 static bool multiply_intermediate_is_float;
-static _Float128 multiply_intermediate_float;
+static GCOB_FP128 multiply_intermediate_float;
 static __int128  multiply_intermediate_int128;
 static int       multiply_intermediate_rdigits;
 
@@ -1243,16 +1237,16 @@ __gg__multiplyf1_phase1(cbl_arith_format_t ,
                         size_t ,
                         size_t ,
                         size_t ,
-                        cbl_round_t  *,
+                  const cbl_round_t  *,
                         int           ,
                         int          *)
   {
   // We are getting just the one value, which we are converting to the necessary
   // intermediate form
 
-  cblc_field_t **A  = __gg__treeplet_1f;
-  size_t       *A_o = __gg__treeplet_1o;
-  size_t       *A_s = __gg__treeplet_1s;
+        cblc_field_t **A  = __gg__treeplet_1f;
+  const size_t       *A_o = __gg__treeplet_1o;
+  const size_t       *A_s = __gg__treeplet_1s;
 
   if( A[0]->type == FldFloat )
     {
@@ -1277,7 +1271,8 @@ void multiply_int128_by_int128(int256 &ABCD,
                                __int128 ab_value,
                                __int128 cd_value)
   {
-  int is_negative = ( ((uint8_t *)(&ab_value))[15]^((uint8_t *)(&cd_value))[15]) & 0x80;
+  int is_negative = ( (PTRCAST(uint8_t, (&ab_value)))[15]
+                                ^(PTRCAST(uint8_t, (&cd_value)))[15]) & 0x80;
   if( ab_value < 0 )
     {
     ab_value = -ab_value;
@@ -1293,10 +1288,10 @@ void multiply_int128_by_int128(int256 &ABCD,
   uint128 BD;
 
   // Let's extract the digits.
-  uint64_t a = *(uint64_t *)((unsigned char *)(&ab_value)+8);
-  uint64_t b = *(uint64_t *)((unsigned char *)(&ab_value)+0);
-  uint64_t c = *(uint64_t *)((unsigned char *)(&cd_value)+8);
-  uint64_t d = *(uint64_t *)((unsigned char *)(&cd_value)+0);
+  uint64_t a = *PTRCAST(uint64_t, (PTRCAST(unsigned char, (&ab_value))+8));
+  uint64_t b = *PTRCAST(uint64_t, (PTRCAST(unsigned char, (&ab_value))+0));
+  uint64_t c = *PTRCAST(uint64_t, (PTRCAST(unsigned char, (&cd_value))+8));
+  uint64_t d = *PTRCAST(uint64_t, (PTRCAST(unsigned char, (&cd_value))+0));
 
   // multiply (a0 + b) * (c0 + d)
 
@@ -1337,20 +1332,20 @@ __gg__multiplyf1_phase2(cbl_arith_format_t ,
                         size_t ,
                         size_t ,
                         size_t ,
-                        cbl_round_t  *rounded,
+                  const cbl_round_t  *rounded,
                         int           on_error_flag,
                         int          *compute_error
                         )
   {
-  cblc_field_t **C  = __gg__treeplet_3f;
-  size_t       *C_o = __gg__treeplet_3o;
-  size_t       *C_s = __gg__treeplet_3s;
+        cblc_field_t **C  = __gg__treeplet_3f;
+  const size_t       *C_o = __gg__treeplet_3o;
+  const size_t       *C_s = __gg__treeplet_3s;
 
   bool on_size_error = !!(on_error_flag & ON_SIZE_ERROR);
   int error_this_time=0;
 
-  _Float128 a_value;
-  _Float128 b_value;
+  GCOB_FP128 a_value;
+  GCOB_FP128 b_value;
 
   if( multiply_intermediate_is_float )
     {
@@ -1372,10 +1367,10 @@ __gg__multiplyf1_phase2(cbl_arith_format_t ,
     if( C[0]->type == FldFloat )
       {
       // gixed * float
-      a_value = (_Float128) multiply_intermediate_int128;
+      a_value = (GCOB_FP128) multiply_intermediate_int128;
       if( multiply_intermediate_rdigits )
         {
-        a_value /= (_Float128)__gg__power_of_ten(multiply_intermediate_rdigits);
+        a_value /= (GCOB_FP128)__gg__power_of_ten(multiply_intermediate_rdigits);
         }
       b_value = __gg__float128_from_qualified_field(C[0], C_o[0], C_s[0]);
       goto float_float;
@@ -1418,14 +1413,13 @@ __gg__multiplyf1_phase2(cbl_arith_format_t ,
   if( error_this_time && on_size_error)
     {
     *compute_error |= error_this_time;
-    rounded++;
     }
   else
     {
     *compute_error |= conditional_stash(C[0], C_o[0], C_s[0],
                                         on_size_error,
                                         a_value,
-                                        *rounded++);
+                                        *rounded);
     }
   done:
   return;
@@ -1437,32 +1431,32 @@ __gg__multiplyf2( cbl_arith_format_t ,
                   size_t ,
                   size_t ,
                   size_t nC,
-                  cbl_round_t  *rounded,
+            const cbl_round_t  *rounded,
                   int           on_error_flag,
                   int          *compute_error
                   )
   {
-  cblc_field_t **A  = __gg__treeplet_1f;
-  size_t       *A_o = __gg__treeplet_1o;
-  size_t       *A_s = __gg__treeplet_1s;
-  cblc_field_t **B  = __gg__treeplet_2f;
-  size_t       *B_o = __gg__treeplet_2o;
-  size_t       *B_s = __gg__treeplet_2s;
-  cblc_field_t **C  = __gg__treeplet_3f;
-  size_t       *C_o = __gg__treeplet_3o;
-  size_t       *C_s = __gg__treeplet_3s;
+        cblc_field_t **A  = __gg__treeplet_1f;
+  const size_t       *A_o = __gg__treeplet_1o;
+  const size_t       *A_s = __gg__treeplet_1s;
+        cblc_field_t **B  = __gg__treeplet_2f;
+  const size_t       *B_o = __gg__treeplet_2o;
+  const size_t       *B_s = __gg__treeplet_2s;
+        cblc_field_t **C  = __gg__treeplet_3f;
+  const size_t       *C_o = __gg__treeplet_3o;
+  const size_t       *C_s = __gg__treeplet_3s;
 
   bool on_size_error = !!(on_error_flag & ON_SIZE_ERROR);
 
   bool      got_float = false;
-  _Float128 product_float;
+  GCOB_FP128 product_float;
   int256    product_fix;
   int       product_fix_digits;
 
   if( A[0]->type == FldFloat || B[0]->type == FldFloat )
     {
-    _Float128 a_value = __gg__float128_from_qualified_field(A[0], A_o[0], A_s[0]);
-    _Float128 b_value = __gg__float128_from_qualified_field(B[0], B_o[0], B_s[0]);
+    GCOB_FP128 a_value = __gg__float128_from_qualified_field(A[0], A_o[0], A_s[0]);
+    GCOB_FP128 b_value = __gg__float128_from_qualified_field(B[0], B_o[0], B_s[0]);
     product_float = multiply_helper_float(a_value, b_value, compute_error);
     got_float = true;
     }
@@ -1520,7 +1514,7 @@ shift_in_place128(uint8_t *buf, int size, int bits)
   uint128 temp;
   uint128 overflow = 0;
 
-  uint128 *as128 = (uint128 *)buf;
+  uint128 *as128 = PTRCAST(uint128, buf);
 
   for( size_t i=0; i<places; i++ )
     {
@@ -1601,7 +1595,7 @@ divide_int128_by_int128(int256   &quotient,
     }
 
   // We are going to be referencing the 64-bit pices of the 128-bit divisor:
-  uint64_t *divisor64 = (uint64_t *)&divisor;
+  uint64_t *divisor64 = PTRCAST(uint64_t, &divisor);
 
   quotient.i128[1] = 0;
   quotient.i128[0] = dividend;
@@ -1670,12 +1664,11 @@ divide_int128_by_int128(int256   &quotient,
 
     int bits_to_shift = 0;
     int i=15;
-    while( ((uint8_t *)(&divisor))[i] == 0 )
+    while( (PTRCAST(uint8_t, &divisor))[i] == 0 )
       {
       i -= 1;
       bits_to_shift += 8;
-      }
-    uint8_t tail = ((uint8_t *)(&divisor))[i];
+      }    uint8_t tail = (  PTRCAST(uint8_t, &divisor)  )[i];
     while( !(tail & 0x80) )
       {
       bits_to_shift += 1;
@@ -1684,9 +1677,8 @@ divide_int128_by_int128(int256   &quotient,
 
     // Shift both the numerator and the divisor that number of bits
 
-    shift_in_place128((uint8_t *)&numerator, sizeof(numerator), bits_to_shift);
-    shift_in_place128((uint8_t *)&divisor,   sizeof(divisor),   bits_to_shift);
-
+    shift_in_place128( PTRCAST(uint8_t, &numerator), sizeof(numerator), bits_to_shift);
+    shift_in_place128( PTRCAST(uint8_t, &divisor),   sizeof(divisor),   bits_to_shift);
 
     // We are now ready to do the guess-multiply-subtract loop.  We know that
     // the result will have two places, so we know we are going to go through
@@ -1703,7 +1695,7 @@ divide_int128_by_int128(int256   &quotient,
       // We develop our guess for a quotient by dividing the top two places of
       // the numerator area by C
       uint128 temp;
-      uint64_t *temp64 = (uint64_t *)&temp;
+      uint64_t *temp64 = PTRCAST(uint64_t, &temp);
 
       temp64[1] = numerator.i64[q_place+2];
       temp64[0] = numerator.i64[q_place+1];
@@ -1717,10 +1709,10 @@ divide_int128_by_int128(int256   &quotient,
       subber[2] = 0;
 
       // Start with the bottom 128 bits of the "subber"
-      *(uint128 *)subber = (uint128) divisor64[0] * quotient.i64[q_place];
+      *PTRCAST(uint128, subber) = (uint128) divisor64[0] * quotient.i64[q_place];
 
       // Get the next 128 bits of subber
-      temp             = (uint128) divisor64[1] * quotient.i64[q_place];
+      temp = (uint128) divisor64[1] * quotient.i64[q_place];
 
       // Add the top of the first product to the bottom of the second:
       subber[1] += temp64[0];
@@ -1741,20 +1733,20 @@ divide_int128_by_int128(int256   &quotient,
       // the numerator:
 
       uint64_t borrow = 0;
-      for(size_t i=0; i<3; i++)
+      for(size_t j=0; j<3; j++)
         {
-        if( numerator.i64[q_place + i] == 0 && borrow )
+        if( numerator.i64[q_place + j] == 0 && borrow )
           {
           // We are subtracting from zero and we have a borrow.  Leave the
           // borrow on and just do the subtraction:
-          numerator.i64[q_place + i] -= subber[i];
+          numerator.i64[q_place + j] -= subber[j];
           }
         else
           {
-          uint64_t stash = numerator.i64[q_place + i];
-          numerator.i64[q_place + i] -= borrow;
-          numerator.i64[q_place + i] -= subber[i];
-          if( numerator.i64[q_place + i] > stash )
+          uint64_t stash = numerator.i64[q_place + j];
+          numerator.i64[q_place + j] -= borrow;
+          numerator.i64[q_place + j] -= subber[j];
+          if( numerator.i64[q_place + j] > stash )
             {
             // After subtracting, the value got bigger, which means we have
             // to borrow from the next value to the left
@@ -1778,21 +1770,21 @@ divide_int128_by_int128(int256   &quotient,
         {
         // We need to add subber back into the numerator area
         uint64_t carry = 0;
-        for(size_t i=0; i<3; i++)
+        for(size_t ii=0; ii<3; ii++)
           {
-          if( numerator.i64[q_place + i] == 0xFFFFFFFFFFFFFFFFUL && carry )
+          if( numerator.i64[q_place + ii] == 0xFFFFFFFFFFFFFFFFUL && carry )
             {
             // We are at the top and have a carry.  Just leave the carry on
             // and do the addition:
-            numerator.i64[q_place + i] += subber[i];
+            numerator.i64[q_place + ii] += subber[ii];
             }
           else
             {
             // We are not at the top.
-            uint64_t stash = numerator.i64[q_place + i];
-            numerator.i64[q_place + i] += carry;
-            numerator.i64[q_place + i] += subber[i];
-            if( numerator.i64[q_place + i] < stash )
+            uint64_t stash = numerator.i64[q_place + ii];
+            numerator.i64[q_place + ii] += carry;
+            numerator.i64[q_place + ii] += subber[ii];
+            if( numerator.i64[q_place + ii] < stash )
               {
               // The addition caused the result to get smaller, meaning that
               // we wrapped around:
@@ -1820,20 +1812,20 @@ __gg__dividef1_phase2(cbl_arith_format_t ,
                       size_t ,
                       size_t ,
                       size_t ,
-                      cbl_round_t  *rounded,
+                const cbl_round_t  *rounded,
                       int           on_error_flag,
                       int          *compute_error
                       )
   {
-  cblc_field_t **C  = __gg__treeplet_3f;
-  size_t       *C_o = __gg__treeplet_3o;
-  size_t       *C_s = __gg__treeplet_3s;
+        cblc_field_t **C  = __gg__treeplet_3f;
+  const size_t       *C_o = __gg__treeplet_3o;
+  const size_t       *C_s = __gg__treeplet_3s;
 
   bool on_size_error = !!(on_error_flag & ON_SIZE_ERROR);
   int error_this_time=0;
 
-  _Float128 a_value;
-  _Float128 b_value;
+  GCOB_FP128 a_value;
+  GCOB_FP128 b_value;
 
   if( multiply_intermediate_is_float )
     {
@@ -1855,10 +1847,10 @@ __gg__dividef1_phase2(cbl_arith_format_t ,
     if( C[0]->type == FldFloat )
       {
       // gixed * float
-      a_value = (_Float128) multiply_intermediate_int128;
+      a_value = (GCOB_FP128) multiply_intermediate_int128;
       if( multiply_intermediate_rdigits )
         {
-        a_value /= (_Float128)__gg__power_of_ten(multiply_intermediate_rdigits);
+        a_value /= (GCOB_FP128)__gg__power_of_ten(multiply_intermediate_rdigits);
         }
       b_value = __gg__float128_from_qualified_field(C[0], C_o[0], C_s[0]);
       goto float_float;
@@ -1907,14 +1899,13 @@ __gg__dividef1_phase2(cbl_arith_format_t ,
 
   if( error_this_time && on_size_error)
     {
-    rounded++;
     }
   else
     {
     *compute_error |= conditional_stash(C[0], C_o[0], C_s[0],
                                         on_size_error,
                                         b_value,
-                                        *rounded++);
+                                        *rounded);
     }
   done:
   return;
@@ -1926,29 +1917,29 @@ __gg__dividef23(cbl_arith_format_t ,
                 size_t ,
                 size_t ,
                 size_t nC,
-                cbl_round_t  *rounded,
+          const cbl_round_t  *rounded,
                 int           on_error_flag,
                 int          *compute_error
                 )
   {
-  cblc_field_t **A  = __gg__treeplet_1f;
-  size_t       *A_o = __gg__treeplet_1o;
-  size_t       *A_s = __gg__treeplet_1s;
-  cblc_field_t **B  = __gg__treeplet_2f;
-  size_t       *B_o = __gg__treeplet_2o;
-  size_t       *B_s = __gg__treeplet_2s;
-  cblc_field_t **C  = __gg__treeplet_3f;
-  size_t       *C_o = __gg__treeplet_3o;
-  size_t       *C_s = __gg__treeplet_3s;
+        cblc_field_t **A  = __gg__treeplet_1f;
+  const size_t       *A_o = __gg__treeplet_1o;
+  const size_t       *A_s = __gg__treeplet_1s;
+        cblc_field_t **B  = __gg__treeplet_2f;
+  const size_t       *B_o = __gg__treeplet_2o;
+  const size_t       *B_s = __gg__treeplet_2s;
+        cblc_field_t **C  = __gg__treeplet_3f;
+  const size_t       *C_o = __gg__treeplet_3o;
+  const size_t       *C_s = __gg__treeplet_3s;
 
   bool on_size_error = !!(on_error_flag & ON_SIZE_ERROR);
   int error_this_time=0;
 
   if( A[0]->type == FldFloat ||  B[0]->type == FldFloat  )
     {
-    _Float128 a_value;
-    _Float128 b_value;
-    _Float128 c_value;
+    GCOB_FP128 a_value;
+    GCOB_FP128 b_value;
+    GCOB_FP128 c_value;
     a_value = __gg__float128_from_qualified_field(A[0], A_o[0], A_s[0]);
     b_value = __gg__float128_from_qualified_field(B[0], B_o[0], B_s[0]);
     c_value = divide_helper_float(a_value, b_value, &error_this_time);
@@ -2012,24 +2003,24 @@ __gg__dividef45(cbl_arith_format_t ,
                 int          *compute_error
                 )
   {
-  cblc_field_t **A  = __gg__treeplet_1f;  // Numerator
-  size_t       *A_o = __gg__treeplet_1o;
-  size_t       *A_s = __gg__treeplet_1s;
-  cblc_field_t **B  = __gg__treeplet_2f;  // Denominator
-  size_t       *B_o = __gg__treeplet_2o;
-  size_t       *B_s = __gg__treeplet_2s;
-  cblc_field_t **C  = __gg__treeplet_3f;  // Has remainder, then quotient
-  size_t       *C_o = __gg__treeplet_3o;
-  size_t       *C_s = __gg__treeplet_3s;
+        cblc_field_t **A  = __gg__treeplet_1f;  // Numerator
+  const size_t       *A_o = __gg__treeplet_1o;
+  const size_t       *A_s = __gg__treeplet_1s;
+        cblc_field_t **B  = __gg__treeplet_2f;  // Denominator
+  const size_t       *B_o = __gg__treeplet_2o;
+  const size_t       *B_s = __gg__treeplet_2s;
+        cblc_field_t **C  = __gg__treeplet_3f;  // Has remainder, then quotient
+  const size_t       *C_o = __gg__treeplet_3o;
+  const size_t       *C_s = __gg__treeplet_3s;
 
   bool on_size_error = !!(on_error_flag & ON_SIZE_ERROR);
   int error_this_time=0;
 
   if( A[0]->type == FldFloat ||  B[0]->type == FldFloat  )
     {
-    _Float128 a_value;
-    _Float128 b_value;
-    _Float128 c_value;
+    GCOB_FP128 a_value;
+    GCOB_FP128 b_value;
+    GCOB_FP128 c_value;
     a_value = __gg__float128_from_qualified_field(A[0], A_o[0], A_s[0]);
     b_value = __gg__float128_from_qualified_field(B[0], B_o[0], B_s[0]);
     c_value = divide_helper_float(a_value, b_value, &error_this_time);

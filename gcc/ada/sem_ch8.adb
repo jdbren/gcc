@@ -77,6 +77,7 @@ with Style;
 with Table;
 with Tbuild;         use Tbuild;
 with Uintp;          use Uintp;
+with Uname;          use Uname;
 with Warnsw;         use Warnsw;
 
 package body Sem_Ch8 is
@@ -4269,6 +4270,40 @@ package body Sem_Ch8 is
          Local_Restrict.Check_Actual_Subprogram_For_Instance
            (Actual_Subp_Name => Nam, Formal_Subp => Formal_Spec);
       end if;
+
+      --  If pragma Short_Circuit_And_Or is specified, then we give an error
+      --  for renaming an operator that is made short circuit.
+      --  For example, this is illegal:
+      --
+      --      function My_And (X, Y: Boolean) return Boolean renames "and";
+      --
+      --  if "and" denotes the usual predefined Boolean operator. Otherwise,
+      --  the semantics are confusing (sometimes short circuit, and sometimes
+      --  not, for calls to My_And). If we ever relax this rule, we will need
+      --  to clean up that run-time semantics.
+
+      if Short_Circuit_And_Or
+        and then Chars (Old_S) in Name_Op_And | Name_Op_Or
+        and then In_Extended_Main_Source_Unit (N)
+        and then Etype (Old_S) = Standard_Boolean
+        and then Is_Intrinsic_Subprogram (Old_S)
+      then
+         if Comes_From_Source (N) then
+            Error_Msg_N
+              ("pragma Short_Circuit_And_Or disallows renaming of " &
+               "operator", N);
+
+         --  Same error in case of an instantiation with My_And => "and"
+
+         elsif Present (Corresponding_Formal_Spec (N)) then
+            Error_Msg_N
+              ("pragma Short_Circuit_And_Or disallows passing of " &
+               "operator as a generic actual", N);
+
+         else
+            raise Program_Error;
+         end if;
+      end if;
    end Analyze_Subprogram_Renaming;
 
    -------------------------
@@ -4300,6 +4335,44 @@ package body Sem_Ch8 is
 
       begin
          pragma Assert (Nkind (Clause) = N_Use_Package_Clause);
+
+         --  Perform "use implies with" expansion (when extensions are enabled)
+         --  by inserting an extra with clause since redundant clauses don't
+         --  really matter.
+
+         if All_Extensions_Allowed and then Is_In_Context_Clause (Clause) then
+            declare
+               Unum        : Unit_Number_Type;
+               With_Clause : constant Node_Id :=
+                 Make_With_Clause (Sloc (Clause),
+                   Name => New_Copy_Tree (Pack));
+            begin
+               --  Attempt to load the unit mentioned in the use clause
+
+               Unum := Load_Unit
+                         (Load_Name  => Get_Unit_Name (With_Clause),
+                          Required   => False,
+                          Subunit    => False,
+                          Error_Node => Clause,
+                          With_Node  => With_Clause);
+
+               --  Either we can't file the unit or the use clause is a
+               --  reference to a nested package - in that case just handle
+               --  the use clause normally.
+
+               if Unum /= No_Unit then
+
+                  Set_Library_Unit (With_Clause, Cunit (Unum));
+                  Set_Is_Implicit_With (With_Clause);
+
+                  Analyze (With_Clause);
+                  Expand_With_Clause
+                   (With_Clause, Name (With_Clause),
+                     Enclosing_Comp_Unit_Node (Clause));
+               end if;
+            end;
+         end if;
+
          Analyze (Pack);
 
          --  Verify that the package standard is not directly named in a
@@ -5371,7 +5444,15 @@ package body Sem_Ch8 is
          elsif In_Open_Scopes (Scope (Base_Type (T))) then
             null;
 
-         elsif not Redundant_Use (Id) then
+         --  Turn off the use_type_clause on the type unless the clause is
+         --  redundant, or there's a previous use_type_clause. (The case where
+         --  a use_type_clause without "all" is followed by one with "all" in
+         --  a more nested scope is not considered redundant, necessitating
+         --  the test for a previous clause. One might expect the latter test
+         --  to suffice, but it turns out there are cases where Redundant_Use
+         --  is set, but Prev_Use_Clause is not set. ???)
+
+         elsif not Redundant_Use (Id) and then No (Prev_Use_Clause (N)) then
             Set_In_Use (T, False);
             Set_In_Use (Base_Type (T), False);
             Set_Current_Use_Clause (T, Empty);
@@ -8365,7 +8446,8 @@ package body Sem_Ch8 is
 
             if Is_Overloaded (P) then
 
-               --  The prefix must resolve to a unique enclosing construct
+               --  The prefix must resolve to a unique enclosing construct, per
+               --  the last sentence of RM 4.1.3 (13).
 
                declare
                   Found : Boolean := False;
@@ -8379,6 +8461,7 @@ package body Sem_Ch8 is
                         if Found then
                            Error_Msg_N (
                               "prefix must be unique enclosing scope", N);
+                           Change_Selected_Component_To_Expanded_Name (N);
                            Set_Entity (N, Any_Id);
                            Set_Etype  (N, Any_Type);
                            return;
@@ -9314,11 +9397,12 @@ package body Sem_Ch8 is
 
             --  If the new type is a renaming of the old one, as is the case
             --  for actuals in instances, retain its name, to simplify later
-            --  disambiguation.
+            --  disambiguation. Beware of Natural and Positive, see Cstand.
 
             if Nkind (Parent (New_T)) = N_Subtype_Declaration
               and then Is_Entity_Name (Subtype_Indication (Parent (New_T)))
               and then Entity (Subtype_Indication (Parent (New_T))) = Old_T
+              and then Scope (New_T) /= Standard_Standard
             then
                null;
             else
@@ -9503,6 +9587,11 @@ package body Sem_Ch8 is
            and then Present (Scope (Entity (E)))
          then
             Mark_Use_Package (Scope (Entity (E)));
+
+            --  Additionally mark the types of the formals and the return
+            --  types as used when dealing with an overloaded operator.
+
+            Mark_Parameters (Entity (E));
          end if;
 
          Curr := Current_Use_Clause (Base);
@@ -9877,28 +9966,8 @@ package body Sem_Ch8 is
 
    procedure Premature_Usage (N : Node_Id) is
       Kind : constant Node_Kind := Nkind (Parent (Entity (N)));
-      E    : Entity_Id := Entity (N);
 
    begin
-      --  Within an instance, the analysis of the actual for a formal object
-      --  does not see the name of the object itself. This is significant only
-      --  if the object is an aggregate, where its analysis does not do any
-      --  name resolution on component associations. (see 4717-008). In such a
-      --  case, look for the visible homonym on the chain.
-
-      if In_Instance and then Present (Homonym (E)) then
-         E := Homonym (E);
-         while Present (E) and then not In_Open_Scopes (Scope (E)) loop
-            E := Homonym (E);
-         end loop;
-
-         if Present (E) then
-            Set_Entity (N, E);
-            Set_Etype (N, Etype (E));
-            return;
-         end if;
-      end if;
-
       case Kind is
          when N_Component_Declaration =>
             Error_Msg_N

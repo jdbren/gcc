@@ -77,7 +77,6 @@ begin -- Gen_IL.Gen.Gen_Entities
         Sm (Has_Delayed_Aspects, Flag),
         Sm (Has_Delayed_Freeze, Flag),
         Sm (Has_Delayed_Rep_Aspects, Flag),
-        Sm (Has_Exit, Flag),
         Sm (Has_Forward_Instantiation, Flag),
         Sm (Has_Fully_Qualified_Name, Flag),
         Sm (Has_Gigi_Rep_Item, Flag),
@@ -114,6 +113,7 @@ begin -- Gen_IL.Gen.Gen_Entities
         Sm (Has_Xref_Entry, Flag),
         Sm (Has_Yield_Aspect, Flag),
         Sm (Homonym, Node_Id),
+        Sm (Incomplete_View, Node_Id),
         Sm (In_Package_Body, Flag),
         Sm (In_Private_Part, Flag),
         Sm (In_Use, Flag),
@@ -212,10 +212,8 @@ begin -- Gen_IL.Gen.Gen_Entities
         Sm (Low_Bound_Tested, Flag),
         Sm (Materialize_Entity, Flag),
         Sm (May_Inherit_Delayed_Rep_Aspects, Flag),
-        Sm (Needs_Activation_Record, Flag),
         Sm (Needs_Debug_Info, Flag),
         Sm (Never_Set_In_Source, Flag),
-        Sm (Overlays_Constant, Flag),
         Sm (Prev_Entity, Node_Id),
         Sm (Referenced, Flag),
         Sm (Referenced_As_LHS, Flag),
@@ -288,7 +286,6 @@ begin -- Gen_IL.Gen.Gen_Entities
         Sm (Extra_Formal, Node_Id),
         Sm (Generic_Homonym, Node_Id),
         Sm (Generic_Renamings, Elist_Id),
-        Sm (Handler_Records, List_Id),
         Sm (Has_Static_Discriminants, Flag),
         Sm (Inner_Instances, Elist_Id),
         Sm (Interface_Name, Node_Id),
@@ -354,10 +351,10 @@ begin -- Gen_IL.Gen.Gen_Entities
         Sm (Last_Aggregate_Assignment, Node_Id),
         Sm (Optimize_Alignment_Space, Flag),
         Sm (Optimize_Alignment_Time, Flag),
+        Sm (Overlays_Constant, Flag),
         Sm (Prival_Link, Node_Id),
         Sm (Related_Type, Node_Id),
         Sm (Return_Statement, Node_Id),
-        Sm (Size_Check_Code, Node_Id),
         Sm (SPARK_Pragma, Node_Id),
         Sm (SPARK_Pragma_Inherited, Flag)));
 
@@ -399,7 +396,6 @@ begin -- Gen_IL.Gen.Gen_Entities
        (Sm (Activation_Record_Component, Node_Id),
         Sm (Actual_Subtype, Node_Id),
         Sm (Alignment, Unat),
-        Sm (Default_Expr_Function, Node_Id),
         Sm (Default_Value, Node_Id),
         Sm (Entry_Component, Node_Id),
         Sm (Extra_Accessibility, Node_Id),
@@ -429,9 +425,8 @@ begin -- Gen_IL.Gen.Gen_Entities
         Sm (Discriminant_Default_Value, Node_Id),
         Sm (Is_Activation_Record, Flag)));
 
-   Ab (Formal_Object_Kind, Object_Kind,
-       --  Generic formal objects are also objects
-       (Sm (Entry_Component, Node_Id)));
+   Ab (Formal_Object_Kind, Object_Kind);
+   --  Generic formal objects are also objects
 
    Cc (E_Generic_In_Out_Parameter, Formal_Object_Kind,
        --  A generic in out parameter, created by the use of a generic in out
@@ -458,6 +453,8 @@ begin -- Gen_IL.Gen.Gen_Entities
             Pre => "Ekind (Base_Type (N)) in Access_Subprogram_Kind"),
         Sm (Class_Wide_Equivalent_Type, Node_Id),
         Sm (Class_Wide_Type, Node_Id),
+        Sm (Constructor_List, Elist_Id),
+        Sm (Constructor_Name, Node_Id),
         Sm (Contract, Node_Id),
         Sm (Current_Use_Clause, Node_Id),
         Sm (Derived_Type_Link, Node_Id),
@@ -470,6 +467,7 @@ begin -- Gen_IL.Gen.Gen_Entities
         Sm (Full_View, Node_Id),
         Sm (Has_Completion_In_Body, Flag),
         Sm (Has_Constrained_Partial_View, Flag, Base_Type_Only),
+        Sm (Has_Destructor, Flag, Base_Type_Only),
         Sm (Has_Discriminants, Flag),
         Sm (Has_Dispatch_Table, Flag,
             Pre => "Is_Tagged_Type (N)"),
@@ -505,6 +503,7 @@ begin -- Gen_IL.Gen.Gen_Entities
         Sm (Is_Fixed_Lower_Bound_Array_Subtype, Flag),
         Sm (Is_Fixed_Lower_Bound_Index_Subtype, Flag),
         Sm (Is_Generic_Actual_Type, Flag),
+        Sm (Is_Implicit_Full_View, Flag),
         Sm (Is_Mutably_Tagged_Type, Flag),
         Sm (Is_Non_Static_Subtype, Flag),
         Sm (Is_Private_Composite, Flag),
@@ -516,6 +515,7 @@ begin -- Gen_IL.Gen.Gen_Entities
         Sm (Linker_Section_Pragma, Node_Id),
         Sm (Must_Be_On_Byte_Boundary, Flag),
         Sm (Must_Have_Preelab_Init, Flag),
+        Sm (Needs_Construction, Flag),
         Sm (No_Tagged_Streams_Pragma, Node_Id,
             Pre => "Is_Tagged_Type (N)"),
         Sm (Non_Binary_Modulus, Flag, Base_Type_Only),
@@ -576,7 +576,7 @@ begin -- Gen_IL.Gen.Gen_Entities
        --  created for the base type, and this is the first named subtype).
 
    Ab (Modular_Integer_Kind, Integer_Kind,
-       (Sm (Modulus, Uint, Base_Type_Only),
+       (Sm (Modulus, Uint, Impl_Base_Type_Only),
         Sm (Original_Array_Type, Node_Id)));
 
    Cc (E_Modular_Integer_Type, Modular_Integer_Kind);
@@ -781,7 +781,8 @@ begin -- Gen_IL.Gen.Gen_Entities
         Sm (No_Reordering, Flag, Impl_Base_Type_Only),
         Sm (Parent_Subtype, Node_Id, Base_Type_Only),
         Sm (Reverse_Bit_Order, Flag, Base_Type_Only),
-        Sm (Underlying_Record_View, Node_Id)));
+        Sm (Underlying_Record_View, Node_Id),
+        Sm (Is_Large_Unconstrained_Definite, Flag, Impl_Base_Type_Only)));
 
    Cc (E_Record_Subtype, Aggregate_Kind,
        --  A record subtype, created by a record subtype declaration
@@ -936,11 +937,13 @@ begin -- Gen_IL.Gen.Gen_Entities
        (Sm (Access_Subprogram_Wrapper, Node_Id),
         Sm (Extra_Accessibility_Of_Result, Node_Id),
         Sm (Extra_Formals, Node_Id),
+        Sm (Extra_Formals_Known, Flag),
         Sm (Needs_No_Actuals, Flag)));
 
    Ab (Overloadable_Kind, Entity_Kind,
        (Sm (Renamed_Or_Alias, Node_Id),
         Sm (Extra_Formals, Node_Id),
+        Sm (Extra_Formals_Known, Flag),
         Sm (Is_Abstract_Subprogram, Flag),
         Sm (Is_Primitive, Flag),
         Sm (Needs_No_Actuals, Flag),
@@ -954,6 +957,7 @@ begin -- Gen_IL.Gen.Gen_Entities
         Sm (Enumeration_Rep_Expr, Node_Id),
         Sm (Esize, Uint),
         Sm (Alignment, Unat),
+        Sm (Overridden_Inherited_Operation, Node_Id),
         Sm (Interface_Name, Node_Id)));
 
    Ab (Subprogram_Kind, Overloadable_Kind,
@@ -982,6 +986,7 @@ begin -- Gen_IL.Gen.Gen_Entities
         Sm (Is_Machine_Code_Subprogram, Flag),
         Sm (Last_Entity, Node_Id),
         Sm (Linker_Section_Pragma, Node_Id),
+        Sm (Overridden_Inherited_Operation, Node_Id),
         Sm (Overridden_Operation, Node_Id),
         Sm (Protected_Body_Subprogram, Node_Id),
         Sm (No_Raise, Flag),
@@ -1004,7 +1009,6 @@ begin -- Gen_IL.Gen.Gen_Entities
         Sm (DTC_Entity, Node_Id),
         Sm (Extra_Accessibility_Of_Result, Node_Id),
         Sm (Generic_Renamings, Elist_Id),
-        Sm (Handler_Records, List_Id),
         Sm (Has_Missing_Return, Flag),
         Sm (Inner_Instances, Elist_Id),
         Sm (Is_Called, Flag),
@@ -1048,11 +1052,11 @@ begin -- Gen_IL.Gen.Gen_Entities
         Sm (DTC_Entity, Node_Id),
         Sm (Entry_Parameters_Type, Node_Id),
         Sm (Generic_Renamings, Elist_Id),
-        Sm (Handler_Records, List_Id),
         Sm (Inner_Instances, Elist_Id),
         Sm (Is_Asynchronous, Flag),
         Sm (Is_Called, Flag),
         Sm (Is_CUDA_Kernel, Flag),
+        Sm (Is_Destructor, Flag),
         Sm (Is_DIC_Procedure, Flag),
         Sm (Is_Generic_Actual_Subprogram, Flag),
         Sm (Is_Initial_Condition_Procedure, Flag),
@@ -1128,6 +1132,7 @@ begin -- Gen_IL.Gen.Gen_Entities
         Sm (Entry_Accepted, Flag),
         Sm (Entry_Parameters_Type, Node_Id),
         Sm (Extra_Formals, Node_Id),
+        Sm (Extra_Formals_Known, Flag),
         Sm (First_Entity, Node_Id),
         Sm (Has_Out_Or_In_Out_Parameter, Flag),
         Sm (Ignore_SPARK_Mode_Pragmas, Flag),
@@ -1167,7 +1172,6 @@ begin -- Gen_IL.Gen.Gen_Entities
        (Sm (Alignment, Unat),
         Sm (Interface_Name, Node_Id),
         Sm (Is_Raised, Flag),
-        Sm (Register_Exception_Call, Node_Id),
         Sm (Renamed_Or_Alias, Node_Id)));
 
    Ab (Generic_Unit_Kind, Entity_Kind,
@@ -1227,8 +1231,10 @@ begin -- Gen_IL.Gen.Gen_Entities
    Cc (E_Loop, Entity_Kind,
        --  A loop identifier, created by an explicit or implicit label on a
        --  loop statement.
-       (Sm (First_Entity, Node_Id),
+       (Sm (Continue_Mark, Node_Id),
+        Sm (First_Entity, Node_Id),
         Sm (First_Exit_Statement, Node_Id),
+        Sm (Has_Exit, Flag),
         Sm (Has_Loop_Entry_Attributes, Flag),
         Sm (Last_Entity, Node_Id),
         Sm (Renamed_Or_Alias, Node_Id),
@@ -1256,8 +1262,6 @@ begin -- Gen_IL.Gen.Gen_Entities
         Sm (Body_Needed_For_SAL, Flag),
         Sm (Contract, Node_Id),
         Sm (Current_Use_Clause, Node_Id),
-        Sm (Dependent_Instances, Elist_Id,
-            Pre => "Is_Generic_Instance (N)"),
         Sm (Elaborate_Body_Desirable, Flag),
         Sm (Elaboration_Entity, Node_Id),
         Sm (Elaboration_Entity_Required, Flag),
@@ -1265,7 +1269,6 @@ begin -- Gen_IL.Gen.Gen_Entities
         Sm (First_Entity, Node_Id),
         Sm (First_Private_Entity, Node_Id),
         Sm (Generic_Renamings, Elist_Id),
-        Sm (Handler_Records, List_Id),
         Sm (Has_RACW, Flag),
         Sm (Hidden_In_Formal_Instance, Elist_Id),
         Sm (Ignore_SPARK_Mode_Pragmas, Flag),
@@ -1297,7 +1300,6 @@ begin -- Gen_IL.Gen.Gen_Entities
        (Sm (Contract, Node_Id),
         Sm (Finalizer, Node_Id),
         Sm (First_Entity, Node_Id),
-        Sm (Handler_Records, List_Id),
         Sm (Ignore_SPARK_Mode_Pragmas, Flag),
         Sm (Last_Entity, Node_Id),
         Sm (Related_Instance, Node_Id),
@@ -1332,6 +1334,7 @@ begin -- Gen_IL.Gen.Gen_Entities
        (Sm (Anonymous_Collections, Elist_Id),
         Sm (Contract, Node_Id),
         Sm (Extra_Formals, Node_Id),
+        Sm (Extra_Formals_Known, Flag),
         Sm (First_Entity, Node_Id),
         Sm (Ignore_SPARK_Mode_Pragmas, Flag),
         Sm (Interface_Name, Node_Id),

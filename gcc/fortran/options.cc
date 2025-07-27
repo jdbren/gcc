@@ -406,7 +406,8 @@ gfc_post_options (const char **pfilename)
       if (warn_line_truncation && !OPTION_SET_P (warnings_are_errors)
 	  && option_unspecified_p (OPT_Wline_truncation))
 	diagnostic_classify_diagnostic (global_dc, OPT_Wline_truncation,
-					DK_ERROR, UNKNOWN_LOCATION);
+					diagnostics::kind::error,
+					UNKNOWN_LOCATION);
     }
   else
     {
@@ -883,6 +884,10 @@ gfc_handle_option (size_t scode, const char *arg, HOST_WIDE_INT value,
 	return false;  /* Not supported. */
       if (!strcmp ("omp_is_initial_device", arg))
 	gfc_option.disable_omp_is_initial_device = true;
+      else if (!strcmp ("omp_get_initial_device", arg))
+	gfc_option.disable_omp_get_initial_device = true;
+      else if (!strcmp ("omp_get_num_devices", arg))
+	gfc_option.disable_omp_get_num_devices = true;
       else if (!strcmp ("acc_on_device", arg))
 	gfc_option.disable_acc_on_device = true;
       else

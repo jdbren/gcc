@@ -304,6 +304,24 @@
   (and (match_code "const_int")
        (match_test "(unsigned HOST_WIDE_INT) ival <= 7")))
 
+(define_constraint "Uc0"
+  "@internal
+  A constraint that matches the integers 0...63."
+  (and (match_code "const_int")
+       (match_test "IN_RANGE (ival, 0, 63)")))
+
+(define_constraint "Uc1"
+  "@internal
+  A constraint that matches the integers 1...64."
+  (and (match_code "const_int")
+       (match_test "IN_RANGE (ival, 1, 64)")))
+
+(define_constraint "Uc2"
+  "@internal
+  A constraint that matches the integers -1...62."
+  (and (match_code "const_int")
+       (match_test "IN_RANGE (ival, -1, 62)")))
+
 (define_constraint "Up3"
   "@internal
   A constraint that matches the integers 2^(0...4)."
@@ -465,6 +483,13 @@
    A constraint that matches vector of immediates for orr."
  (and (match_code "const_vector")
       (match_test "aarch64_simd_valid_orr_imm (op)")))
+
+(define_constraint "Df"
+  "@internal
+   A constraint that matches a vector of immediates for and which can be
+   optimized as fmov."
+ (and (match_code "const_vector")
+      (match_test "aarch64_simd_valid_and_imm_fmov (op)")))
 
 (define_constraint "Db"
   "@internal

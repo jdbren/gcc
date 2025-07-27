@@ -271,7 +271,7 @@ gnat_post_options (const char **pfilename ATTRIBUTE_UNUSED)
 
   /* No caret by default for Ada.  */
   if (!OPTION_SET_P (flag_diagnostics_show_caret))
-    global_dc->m_source_printing.enabled = false;
+    global_dc->get_source_printing_options ().enabled = false;
 
   /* Copy global settings to local versions.  */
   gnat_encodings = global_options.x_gnat_encodings;
@@ -292,7 +292,7 @@ gnat_post_options (const char **pfilename ATTRIBUTE_UNUSED)
 /* Here is the function to handle the compiler error processing in GCC.  */
 
 static void
-internal_error_function (diagnostic_context *context, const char *msgid,
+internal_error_function (diagnostics::context *context, const char *msgid,
 			 va_list *ap)
 {
   char *buffer, *p, *loc;
@@ -377,7 +377,7 @@ gnat_init (void)
   line_table->default_range_bits = 0;
 
   /* Register our internal error function.  */
-  global_dc->m_internal_error = &internal_error_function;
+  global_dc->set_internal_error_callback (&internal_error_function);
 
   return true;
 }

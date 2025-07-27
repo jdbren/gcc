@@ -315,6 +315,8 @@ _GLIBCXX_BEGIN_NAMESPACE_VERSION
     inline void
     _Sp_counted_base<_S_atomic>::_M_release() noexcept
     {
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wc++17-extensions" // if constexpr
       _GLIBCXX_SYNCHRONIZATION_HAPPENS_BEFORE(&_M_use_count);
 #if ! _GLIBCXX_TSAN
       constexpr bool __lock_free
@@ -325,7 +327,7 @@ _GLIBCXX_BEGIN_NAMESPACE_VERSION
       // The ref-count members follow the vptr, so are aligned to
       // alignof(void*).
       constexpr bool __aligned = __alignof(long long) <= alignof(void*);
-      if _GLIBCXX17_CONSTEXPR (__lock_free && __double_word && __aligned)
+      if constexpr (__lock_free && __double_word && __aligned)
 	{
 	  constexpr int __wordbits = __CHAR_BIT__ * sizeof(_Atomic_word);
 	  constexpr int __shiftbits = __double_word ? __wordbits : 0;
@@ -359,6 +361,7 @@ _GLIBCXX_BEGIN_NAMESPACE_VERSION
 	{
 	  _M_release_last_use();
 	}
+#pragma GCC diagnostic pop
     }
 
   template<>
@@ -1119,6 +1122,12 @@ _GLIBCXX_BEGIN_NAMESPACE_VERSION
       _M_less(const __weak_count<_Lp>& __rhs) const noexcept
       { return std::less<_Sp_counted_base<_Lp>*>()(this->_M_pi, __rhs._M_pi); }
 
+#ifdef __glibcxx_smart_ptr_owner_equality // >= C++26
+      size_t
+      _M_owner_hash() const noexcept
+      { return std::hash<_Sp_counted_base<_Lp>*>()(this->_M_pi); }
+#endif
+
       // Friend function injected into enclosing namespace and found by ADL
       friend inline bool
       operator==(const __shared_count& __a, const __shared_count& __b) noexcept
@@ -1221,6 +1230,12 @@ _GLIBCXX_BEGIN_NAMESPACE_VERSION
       bool
       _M_less(const __shared_count<_Lp>& __rhs) const noexcept
       { return std::less<_Sp_counted_base<_Lp>*>()(this->_M_pi, __rhs._M_pi); }
+
+#ifdef __glibcxx_smart_ptr_owner_equality // >= C++26
+      size_t
+      _M_owner_hash() const noexcept
+      { return std::hash<_Sp_counted_base<_Lp>*>()(this->_M_pi); }
+#endif
 
       // Friend function injected into enclosing namespace and found by ADL
       friend inline bool
@@ -1712,6 +1727,20 @@ _GLIBCXX_BEGIN_NAMESPACE_VERSION
 	{ return _M_refcount._M_less(__rhs._M_refcount); }
       /// @}
 
+#ifdef __glibcxx_smart_ptr_owner_equality // >= C++26
+      size_t owner_hash() const noexcept { return _M_refcount._M_owner_hash(); }
+
+      template<typename _Tp1>
+	bool
+	owner_equal(__shared_ptr<_Tp1, _Lp> const& __rhs) const noexcept
+	{ return _M_refcount == __rhs._M_refcount; }
+
+      template<typename _Tp1>
+	bool
+	owner_equal(__weak_ptr<_Tp1, _Lp> const& __rhs) const noexcept
+	{ return _M_refcount == __rhs._M_refcount; }
+#endif
+
     protected:
       // This constructor is non-standard, it is used by allocate_shared.
       template<typename _Alloc, typename... _Args>
@@ -2094,6 +2123,20 @@ _GLIBCXX_BEGIN_NAMESPACE_VERSION
 	bool
 	owner_before(const __weak_ptr<_Tp1, _Lp>& __rhs) const noexcept
 	{ return _M_refcount._M_less(__rhs._M_refcount); }
+
+#ifdef __glibcxx_smart_ptr_owner_equality // >= C++26
+      size_t owner_hash() const noexcept { return _M_refcount._M_owner_hash(); }
+
+      template<typename _Tp1>
+      bool
+      owner_equal(const __shared_ptr<_Tp1, _Lp> & __rhs) const noexcept
+      { return _M_refcount == __rhs._M_refcount; }
+
+      template<typename _Tp1>
+      bool
+      owner_equal(const __weak_ptr<_Tp1, _Lp> & __rhs) const noexcept
+      { return _M_refcount == __rhs._M_refcount; }
+#endif
 
       void
       reset() noexcept

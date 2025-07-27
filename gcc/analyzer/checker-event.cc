@@ -1,4 +1,4 @@
-/* Subclasses of diagnostic_event for analyzer diagnostics.
+/* Subclasses of diagnostics::paths::event for analyzer diagnostics.
    Copyright (C) 2019-2025 Free Software Foundation, Inc.
    Contributed by David Malcolm <dmalcolm@redhat.com>.
 
@@ -18,45 +18,32 @@ You should have received a copy of the GNU General Public License
 along with GCC; see the file COPYING3.  If not see
 <http://www.gnu.org/licenses/>.  */
 
-#include "config.h"
-#define INCLUDE_VECTOR
-#include "system.h"
-#include "coretypes.h"
-#include "tree.h"
-#include "function.h"
-#include "basic-block.h"
-#include "gimple.h"
-#include "diagnostic-core.h"
+#include "analyzer/common.h"
+
 #include "gimple-pretty-print.h"
+#include "sbitmap.h"
+#include "ordered-hash-map.h"
 #include "fold-const.h"
-#include "diagnostic-path.h"
-#include "options.h"
-#include "cgraph.h"
-#include "cfg.h"
-#include "digraph.h"
-#include "diagnostic-event-id.h"
-#include "analyzer/analyzer.h"
+#include "gimple-iterator.h"
+#include "inlining-iterator.h"
+#include "tree-logical-location.h"
+#include "diagnostics/sarif-sink.h"
+#include "diagnostics/state-graphs.h"
+
 #include "analyzer/analyzer-logging.h"
 #include "analyzer/sm.h"
-#include "sbitmap.h"
-#include "bitmap.h"
-#include "ordered-hash-map.h"
 #include "analyzer/call-string.h"
 #include "analyzer/program-point.h"
 #include "analyzer/store.h"
 #include "analyzer/region-model.h"
 #include "analyzer/program-state.h"
 #include "analyzer/checker-path.h"
-#include "gimple-iterator.h"
-#include "inlining-iterator.h"
 #include "analyzer/supergraph.h"
 #include "analyzer/pending-diagnostic.h"
 #include "analyzer/diagnostic-manager.h"
 #include "analyzer/constraint-manager.h"
 #include "analyzer/checker-event.h"
 #include "analyzer/exploded-graph.h"
-#include "diagnostic-format-sarif.h"
-#include "tree-logical-location.h"
 
 #if ENABLE_ANALYZER
 
@@ -71,56 +58,64 @@ event_kind_to_string (enum event_kind ek)
     {
     default:
       gcc_unreachable ();
-    case EK_DEBUG:
-      return "EK_DEBUG";
-    case EK_CUSTOM:
-      return "EK_CUSTOM";
-    case EK_STMT:
-      return "EK_STMT";
-    case EK_REGION_CREATION:
-      return "EK_REGION_CREATION";
-    case EK_FUNCTION_ENTRY:
-      return "EK_FUNCTION_ENTRY";
-    case EK_STATE_CHANGE:
-      return "EK_STATE_CHANGE";
-    case EK_START_CFG_EDGE:
-      return "EK_START_CFG_EDGE";
-    case EK_END_CFG_EDGE:
-      return "EK_END_CFG_EDGE";
-    case EK_CALL_EDGE:
-      return "EK_CALL_EDGE";
-    case EK_RETURN_EDGE:
-      return "EK_RETURN_EDGE";
-    case EK_START_CONSOLIDATED_CFG_EDGES:
-      return "EK_START_CONSOLIDATED_CFG_EDGES";
-    case EK_END_CONSOLIDATED_CFG_EDGES:
-      return "EK_END_CONSOLIDATED_CFG_EDGES";
-    case EK_INLINED_CALL:
-      return "EK_INLINED_CALL";
-    case EK_SETJMP:
-      return "EK_SETJMP";
-    case EK_REWIND_FROM_LONGJMP:
-      return "EK_REWIND_FROM_LONGJMP";
-    case EK_REWIND_TO_SETJMP:
-      return "EK_REWIND_TO_SETJMP";
-    case EK_WARNING:
-      return "EK_WARNING";
+    case event_kind::debug:
+      return "debug";
+    case event_kind::custom:
+      return "custom";
+    case event_kind::stmt:
+      return "stmt";
+    case event_kind::region_creation:
+      return "region_creation";
+    case event_kind::function_entry:
+      return "function_entry";
+    case event_kind::state_change:
+      return "state_change";
+    case event_kind::start_cfg_edge:
+      return "start_cfg_edge";
+    case event_kind::end_cfg_edge:
+      return "end_cfg_edge";
+    case event_kind::catch_:
+      return "catch";
+    case event_kind::call_edge:
+      return "call_edge";
+    case event_kind::return_edge:
+      return "return_edge";
+    case event_kind::start_consolidated_cfg_edges:
+      return "start_consolidated_cfg_edges";
+    case event_kind::end_consolidated_cfg_edges:
+      return "end_consolidated_cfg_edges";
+    case event_kind::inlined_call:
+      return "inlined_call";
+    case event_kind::setjmp_:
+      return "setjmp";
+    case event_kind::rewind_from_longjmp:
+      return "rewind_from_longjmp";
+    case event_kind::rewind_to_setjmp:
+      return "rewind_to_setjmp";
+    case event_kind::throw_:
+      return "throw";
+    case event_kind::unwind:
+      return "unwind";
+    case event_kind::warning:
+      return "warning";
     }
 }
 
-/* class checker_event : public diagnostic_event.  */
+/* class checker_event : public diagnostics::paths::event.  */
 
 /* checker_event's ctor.  */
 
 checker_event::checker_event (enum event_kind kind,
 			      const event_loc_info &loc_info)
-: m_kind (kind), m_loc (loc_info.m_loc),
+: m_path (nullptr),
+  m_kind (kind), m_loc (loc_info.m_loc),
   m_original_fndecl (loc_info.m_fndecl),
   m_effective_fndecl (loc_info.m_fndecl),
   m_original_depth (loc_info.m_depth),
   m_effective_depth (loc_info.m_depth),
-  m_pending_diagnostic (NULL), m_emission_id (),
-  m_logical_loc (loc_info.m_fndecl)
+  m_pending_diagnostic (nullptr), m_emission_id (),
+  m_logical_loc
+    (tree_logical_location_manager::key_from_tree (loc_info.m_fndecl))
 {
   /* Update effective fndecl and depth if inlining has been recorded.  */
   if (flag_analyzer_undo_inlining)
@@ -130,40 +125,41 @@ checker_event::checker_event (enum event_kind kind,
 	{
 	  m_effective_fndecl = info.get_inner_fndecl ();
 	  m_effective_depth += info.get_extra_frames ();
-	  m_logical_loc = tree_logical_location (m_effective_fndecl);
+	  m_logical_loc
+	    = tree_logical_location_manager::key_from_tree (m_effective_fndecl);
 	}
     }
 }
 
-/* No-op implementation of diagnostic_event::get_meaning vfunc for
+/* No-op implementation of diagnostics::paths::event::get_meaning vfunc for
    checker_event: checker events have no meaning by default.  */
 
-diagnostic_event::meaning
+diagnostics::paths::event::meaning
 checker_event::get_meaning () const
 {
-  return meaning ();
+  return diagnostics::paths::event::meaning ();
 }
 
-/* Implementation of diagnostic_event::maybe_add_sarif_properties
+/* Implementation of diagnostics::paths::event::maybe_add_sarif_properties
    for checker_event.  */
 
 void
 checker_event::
-maybe_add_sarif_properties (sarif_object &thread_flow_loc_obj) const
+maybe_add_sarif_properties (diagnostics::sarif_builder &builder,
+			    diagnostics::sarif_object &thread_flow_loc_obj) const
 {
-  sarif_property_bag &props = thread_flow_loc_obj.get_or_create_properties ();
+  auto &props = thread_flow_loc_obj.get_or_create_properties ();
 #define PROPERTY_PREFIX "gcc/analyzer/checker_event/"
   props.set (PROPERTY_PREFIX "emission_id",
 	     diagnostic_event_id_to_json  (m_emission_id));
   props.set_string (PROPERTY_PREFIX "kind", event_kind_to_string (m_kind));
 
   if (m_original_fndecl != m_effective_fndecl)
-    {
-      tree_logical_location logical_loc (m_original_fndecl);
-      props.set<sarif_logical_location>
-	(PROPERTY_PREFIX "original_fndecl",
-	 make_sarif_logical_location_object (logical_loc));
-    }
+    props.set_logical_location
+      (PROPERTY_PREFIX "original_fndecl",
+       builder,
+       tree_logical_location_manager::key_from_tree (m_original_fndecl));
+
   if (m_original_depth != m_effective_depth)
     props.set_integer (PROPERTY_PREFIX "original_depth", m_original_depth);
 #undef PROPERTY_PREFIX
@@ -217,10 +213,11 @@ checker_event::debug () const
    pertinent data within the sm-state).  */
 
 void
-checker_event::prepare_for_emission (checker_path *,
+checker_event::prepare_for_emission (checker_path *path,
 				     pending_diagnostic *pd,
-				     diagnostic_event_id_t emission_id)
+				     diagnostics::paths::event_id_t emission_id)
 {
+  m_path = path;
   m_pending_diagnostic = pd;
   m_emission_id = emission_id;
 
@@ -228,9 +225,34 @@ checker_event::prepare_for_emission (checker_path *,
   print_desc (*pp.get ());
 }
 
+std::unique_ptr<diagnostics::digraphs::digraph>
+checker_event::maybe_make_diagnostic_state_graph (bool debug) const
+{
+  const program_state *state = get_program_state ();
+  if (!state)
+    return nullptr;
+
+  gcc_assert (m_path);
+  const extrinsic_state &ext_state = m_path->get_ext_state ();
+
+  auto result = state->make_diagnostic_state_graph (ext_state);
+
+  if (debug)
+    {
+      pretty_printer pp;
+      text_art::theme *theme = global_dc->get_diagram_theme ();
+      text_art::dump_to_pp (*state, theme, &pp);
+      result->set_attr (STATE_GRAPH_PREFIX,
+			"analyzer/program_state/",
+			pp_formatted_text (&pp));
+    }
+
+  return result;
+}
+
 /* class debug_event : public checker_event.  */
 
-/* Implementation of diagnostic_event::print_desc vfunc for
+/* Implementation of diagnostics::paths::event::print_desc vfunc for
    debug_event.
    Use the saved string as the event's description.  */
 
@@ -242,7 +264,7 @@ debug_event::print_desc (pretty_printer &pp) const
 
 /* class precanned_custom_event : public custom_event.  */
 
-/* Implementation of diagnostic_event::print_desc vfunc for
+/* Implementation of diagnostics::paths::event::print_desc vfunc for
    precanned_custom_event.
    Use the saved string as the event's description.  */
 
@@ -258,14 +280,14 @@ precanned_custom_event::print_desc (pretty_printer &pp) const
 
 statement_event::statement_event (const gimple *stmt, tree fndecl, int depth,
 				  const program_state &dst_state)
-: checker_event (EK_STMT,
+: checker_event (event_kind::stmt,
 		 event_loc_info (gimple_location (stmt), fndecl, depth)),
   m_stmt (stmt),
   m_dst_state (dst_state)
 {
 }
 
-/* Implementation of diagnostic_event::print_desc vfunc for
+/* Implementation of diagnostics::paths::event::print_desc vfunc for
    statement_event.
    Use the statement's dump form as the event's description.  */
 
@@ -279,7 +301,7 @@ statement_event::print_desc (pretty_printer &pp) const
 /* class region_creation_event : public checker_event.  */
 
 region_creation_event::region_creation_event (const event_loc_info &loc_info)
-: checker_event (EK_REGION_CREATION, loc_info)
+: checker_event (event_kind::region_creation, loc_info)
 {
 }
 
@@ -350,16 +372,18 @@ region_creation_event_debug::print_desc (pretty_printer &pp) const
 
 /* class function_entry_event : public checker_event.  */
 
-function_entry_event::function_entry_event (const program_point &dst_point)
-: checker_event (EK_FUNCTION_ENTRY,
+function_entry_event::function_entry_event (const program_point &dst_point,
+					    const program_state &state)
+: checker_event (event_kind::function_entry,
 		 event_loc_info (dst_point.get_supernode
 				   ()->get_start_location (),
 				 dst_point.get_fndecl (),
-				 dst_point.get_stack_depth ()))
+				 dst_point.get_stack_depth ())),
+  m_state (state)
 {
 }
 
-/* Implementation of diagnostic_event::print_desc vfunc for
+/* Implementation of diagnostics::paths::event::print_desc vfunc for
    function_entry_event.
 
    Use a string such as "entry to 'foo'" as the event's description.  */
@@ -370,13 +394,13 @@ function_entry_event::print_desc (pretty_printer &pp) const
   pp_printf (&pp, "entry to %qE", m_effective_fndecl);
 }
 
-/* Implementation of diagnostic_event::get_meaning vfunc for
+/* Implementation of diagnostics::paths::event::get_meaning vfunc for
    function entry.  */
 
-diagnostic_event::meaning
+diagnostics::paths::event::meaning
 function_entry_event::get_meaning () const
 {
-  return meaning (VERB_enter, NOUN_function);
+  return meaning (verb::enter, noun::function);
 }
 
 /* class state_change_event : public checker_event.  */
@@ -393,7 +417,7 @@ state_change_event::state_change_event (const supernode *node,
 					const svalue *origin,
 					const program_state &dst_state,
 					const exploded_node *enode)
-: checker_event (EK_STATE_CHANGE,
+: checker_event (event_kind::state_change,
 		 event_loc_info (stmt->location,
 				 node->m_fun->decl,
 				 stack_depth)),
@@ -405,7 +429,7 @@ state_change_event::state_change_event (const supernode *node,
 {
 }
 
-/* Implementation of diagnostic_event::print_desc vfunc for
+/* Implementation of diagnostics::paths::event::print_desc vfunc for
    state_change_event.
 
    Attempt to generate a nicer human-readable description.
@@ -447,7 +471,7 @@ state_change_event::print_desc (pretty_printer &pp) const
 		pp_string (&pp, "NULL origin");
 
 	      /* Get any "meaning" of event.  */
-	      diagnostic_event::meaning meaning = get_meaning ();
+	      diagnostics::paths::event::meaning meaning = get_meaning ();
 	      pp_string (&pp, ", meaning: ");
 	      meaning.dump_to_pp (&pp);
 	      pp_string (&pp, ")");
@@ -476,7 +500,7 @@ state_change_event::print_desc (pretty_printer &pp) const
     }
   else
     {
-      gcc_assert (m_origin == NULL);
+      gcc_assert (m_origin == nullptr);
       pp_printf (&pp,
 		 "global state: %qs -> %qs",
 		 m_from->get_name (),
@@ -484,11 +508,11 @@ state_change_event::print_desc (pretty_printer &pp) const
     }
 }
 
-/* Implementation of diagnostic_event::get_meaning vfunc for
+/* Implementation of diagnostics::paths::event::get_meaning vfunc for
    state change events: delegate to the pending_diagnostic to
    get any meaning.  */
 
-diagnostic_event::meaning
+diagnostics::paths::event::meaning
 state_change_event::get_meaning () const
 {
   if (m_pending_diagnostic)
@@ -506,15 +530,17 @@ state_change_event::get_meaning () const
 
 /* class superedge_event : public checker_event.  */
 
-/* Implementation of diagnostic_event::maybe_add_sarif_properties
+/* Implementation of diagnostics::paths::event::maybe_add_sarif_properties
    for superedge_event.  */
 
 void
-superedge_event::maybe_add_sarif_properties (sarif_object &thread_flow_loc_obj)
+superedge_event::
+maybe_add_sarif_properties (diagnostics::sarif_builder &builder,
+			    diagnostics::sarif_object &thread_flow_loc_obj)
   const
 {
-  checker_event::maybe_add_sarif_properties (thread_flow_loc_obj);
-  sarif_property_bag &props = thread_flow_loc_obj.get_or_create_properties ();
+  checker_event::maybe_add_sarif_properties (builder, thread_flow_loc_obj);
+  auto &props = thread_flow_loc_obj.get_or_create_properties ();
 #define PROPERTY_PREFIX "gcc/analyzer/superedge_event/"
   if (m_sedge)
     props.set (PROPERTY_PREFIX "superedge", m_sedge->to_json ());
@@ -562,6 +588,12 @@ superedge_event::should_filter_p (int verbosity) const
   return false;
 }
 
+const program_state *
+superedge_event::get_program_state () const
+{
+  return &m_eedge.m_dest->get_state ();
+}
+
 /* superedge_event's ctor.  */
 
 superedge_event::superedge_event (enum event_kind kind,
@@ -595,24 +627,24 @@ cfg_edge_event::cfg_edge_event (enum event_kind kind,
   gcc_assert (eedge.m_sedge->m_kind == SUPEREDGE_CFG_EDGE);
 }
 
-/* Implementation of diagnostic_event::get_meaning vfunc for
+/* Implementation of diagnostics::paths::event::get_meaning vfunc for
    CFG edge events.  */
 
-diagnostic_event::meaning
+diagnostics::paths::event::meaning
 cfg_edge_event::get_meaning () const
 {
   const cfg_superedge& cfg_sedge = get_cfg_superedge ();
   if (cfg_sedge.true_value_p ())
-    return meaning (VERB_branch, PROPERTY_true);
+    return meaning (verb::branch, property::true_);
   else if (cfg_sedge.false_value_p ())
-    return meaning (VERB_branch, PROPERTY_false);
+    return meaning (verb::branch, property::false_);
   else
     return meaning ();
 }
 
 /* class start_cfg_edge_event : public cfg_edge_event.  */
 
-/* Implementation of diagnostic_event::print_desc vfunc for
+/* Implementation of diagnostics::paths::event::print_desc vfunc for
    start_cfg_edge_event.
 
    If -fanalyzer-verbose-edges, then generate low-level descriptions, such
@@ -715,7 +747,7 @@ start_cfg_edge_event::maybe_describe_condition (bool can_colorize) const
 					   lhs, op, rhs);
 	}
     }
-  return label_text::borrow (NULL);
+  return label_text::borrow (nullptr);
 }
 
 /* Subroutine of maybe_describe_condition above.
@@ -741,7 +773,7 @@ start_cfg_edge_event::maybe_describe_condition (bool can_colorize,
       && zerop (rhs))
     {
       if (gcall *call = dyn_cast <gcall *> (SSA_NAME_DEF_STMT (lhs)))
-	if (is_special_named_call_p (call, "strcmp", 2))
+	if (is_special_named_call_p (*call, "strcmp", 2))
 	  {
 	    if (op == EQ_EXPR)
 	      return label_text::borrow ("when the strings are equal");
@@ -752,9 +784,9 @@ start_cfg_edge_event::maybe_describe_condition (bool can_colorize,
 
   /* Only attempt to generate text for sufficiently simple expressions.  */
   if (!should_print_expr_p (lhs))
-    return label_text::borrow (NULL);
+    return label_text::borrow (nullptr);
   if (!should_print_expr_p (rhs))
-    return label_text::borrow (NULL);
+    return label_text::borrow (nullptr);
 
   /* Special cases for pointer comparisons against NULL.  */
   if (POINTER_TYPE_P (TREE_TYPE (lhs))
@@ -804,7 +836,7 @@ start_cfg_edge_event::should_print_expr_p (tree expr)
 
 call_event::call_event (const exploded_edge &eedge,
 			const event_loc_info &loc_info)
-: superedge_event (EK_CALL_EDGE, eedge, loc_info)
+: superedge_event (event_kind::call_edge, eedge, loc_info)
 {
   if (eedge.m_sedge)
     gcc_assert (eedge.m_sedge->m_kind == SUPEREDGE_CALL);
@@ -813,7 +845,7 @@ call_event::call_event (const exploded_edge &eedge,
    m_dest_snode = eedge.m_dest->get_supernode ();
 }
 
-/* Implementation of diagnostic_event::print_desc vfunc for
+/* Implementation of diagnostics::paths::event::print_desc vfunc for
    call_event.
 
    If this call event passes critical state for an sm-based warning,
@@ -845,13 +877,13 @@ call_event::print_desc (pretty_printer &pp) const
 	     get_caller_fndecl ());
 }
 
-/* Implementation of diagnostic_event::get_meaning vfunc for
+/* Implementation of diagnostics::paths::event::get_meaning vfunc for
    function call events.  */
 
-diagnostic_event::meaning
+diagnostics::paths::event::meaning
 call_event::get_meaning () const
 {
-  return meaning (VERB_call, NOUN_function);
+  return meaning (verb::call, noun::function);
 }
 
 /* Override of checker_event::is_call_p for calls.  */
@@ -874,13 +906,21 @@ call_event::get_callee_fndecl () const
   return m_dest_snode->m_fun->decl;
 }
 
+const program_state *
+call_event::get_program_state () const
+{
+  /* Use the state at the source (at the caller),
+     rather than the one at the dest, which has a frame for the callee.  */
+  return &m_eedge.m_src->get_state ();
+}
+
 /* class return_event : public superedge_event.  */
 
 /* return_event's ctor.  */
 
 return_event::return_event (const exploded_edge &eedge,
 			    const event_loc_info &loc_info)
-: superedge_event (EK_RETURN_EDGE, eedge, loc_info)
+: superedge_event (event_kind::return_edge, eedge, loc_info)
 {
   if (eedge.m_sedge)
     gcc_assert (eedge.m_sedge->m_kind == SUPEREDGE_RETURN);
@@ -889,7 +929,7 @@ return_event::return_event (const exploded_edge &eedge,
   m_dest_snode = eedge.m_dest->get_supernode ();
 }
 
-/* Implementation of diagnostic_event::print_desc vfunc for
+/* Implementation of diagnostics::paths::event::print_desc vfunc for
    return_event.
 
    If this return event returns critical state for an sm-based warning,
@@ -921,13 +961,13 @@ return_event::print_desc (pretty_printer &pp) const
 	     m_src_snode->m_fun->decl);
 }
 
-/* Implementation of diagnostic_event::get_meaning vfunc for
+/* Implementation of diagnostics::paths::event::get_meaning vfunc for
    function return events.  */
 
-diagnostic_event::meaning
+diagnostics::paths::event::meaning
 return_event::get_meaning () const
 {
-  return meaning (VERB_return, NOUN_function);
+  return meaning (verb::return_, noun::function);
 }
 
 /* Override of checker_event::is_return_p for returns.  */
@@ -948,14 +988,14 @@ start_consolidated_cfg_edges_event::print_desc (pretty_printer &pp) const
 	     m_edge_sense ? "true" : "false");
 }
 
-/* Implementation of diagnostic_event::get_meaning vfunc for
+/* Implementation of diagnostics::paths::event::get_meaning vfunc for
    start_consolidated_cfg_edges_event.  */
 
-diagnostic_event::meaning
+diagnostics::paths::event::meaning
 start_consolidated_cfg_edges_event::get_meaning () const
 {
-  return meaning (VERB_branch,
-		  (m_edge_sense ? PROPERTY_true : PROPERTY_false));
+  return meaning (verb::branch,
+		  (m_edge_sense ? property::true_ : property::false_));
 }
 
 /* class inlined_call_event : public checker_event.  */
@@ -969,18 +1009,18 @@ inlined_call_event::print_desc (pretty_printer &pp) const
 	     m_apparent_caller_fndecl);
 }
 
-/* Implementation of diagnostic_event::get_meaning vfunc for
+/* Implementation of diagnostics::paths::event::get_meaning vfunc for
    reconstructed inlined function calls.  */
 
-diagnostic_event::meaning
+diagnostics::paths::event::meaning
 inlined_call_event::get_meaning () const
 {
-  return meaning (VERB_call, NOUN_function);
+  return meaning (verb::call, noun::function);
 }
 
 /* class setjmp_event : public checker_event.  */
 
-/* Implementation of diagnostic_event::print_desc vfunc for
+/* Implementation of diagnostics::paths::event::print_desc vfunc for
    setjmp_event.  */
 
 void
@@ -999,7 +1039,7 @@ setjmp_event::print_desc (pretty_printer &pp) const
 void
 setjmp_event::prepare_for_emission (checker_path *path,
 				    pending_diagnostic *pd,
-				    diagnostic_event_id_t emission_id)
+				    diagnostics::paths::event_id_t emission_id)
 {
   checker_event::prepare_for_emission (path, pd, emission_id);
   path->record_setjmp_event (m_enode, emission_id);
@@ -1038,7 +1078,7 @@ rewind_event::rewind_event (const exploded_edge *eedge,
 
 /* class rewind_from_longjmp_event : public rewind_event.  */
 
-/* Implementation of diagnostic_event::print_desc vfunc for
+/* Implementation of diagnostics::paths::event::print_desc vfunc for
    rewind_from_longjmp_event.  */
 
 void
@@ -1062,7 +1102,7 @@ rewind_from_longjmp_event::print_desc (pretty_printer &pp) const
 
 /* class rewind_to_setjmp_event : public rewind_event.  */
 
-/* Implementation of diagnostic_event::print_desc vfunc for
+/* Implementation of diagnostics::paths::event::print_desc vfunc for
    rewind_to_setjmp_event.  */
 
 void
@@ -1111,16 +1151,60 @@ rewind_to_setjmp_event::print_desc (pretty_printer &pp) const
 void
 rewind_to_setjmp_event::prepare_for_emission (checker_path *path,
 					      pending_diagnostic *pd,
-					      diagnostic_event_id_t emission_id)
+					      diagnostics::paths::event_id_t emission_id)
 {
   checker_event::prepare_for_emission (path, pd, emission_id);
   path->get_setjmp_event (m_rewind_info->get_enode_origin (),
 			  &m_original_setjmp_event_id);
 }
 
+/* class throw_event : public checker_event.  */
+
+/* class explicit_throw_event : public throw_event.  */
+void
+explicit_throw_event::print_desc (pretty_printer &pp) const
+{
+  if (m_is_rethrow)
+    {
+      if (m_type)
+	pp_printf (&pp, "rethrowing exception of type %qT here...", m_type);
+      else
+	pp_printf (&pp, "rethrowing exception here...");
+    }
+  else
+    {
+      if (m_type)
+	pp_printf (&pp, "throwing exception of type %qT here...", m_type);
+      else
+	pp_printf (&pp, "throwing exception here...");
+    }
+}
+
+/* class throw_from_call_to_external_fn_event : public throw_event.  */
+
+void
+throw_from_call_to_external_fn_event::print_desc (pretty_printer &pp) const
+{
+  if (m_fndecl)
+    pp_printf (&pp, "if %qD throws an exception...", m_fndecl);
+  else
+    pp_printf (&pp, "if the called function throws an exception...");
+}
+
+// class unwind_event : public checker_event
+
+void
+unwind_event::print_desc (pretty_printer &pp) const
+{
+  if (m_num_frames > 1)
+    pp_printf (&pp, "unwinding %i stack frames", m_num_frames);
+  else
+    pp_printf (&pp, "unwinding stack frame");
+}
+
 /* class warning_event : public checker_event.  */
 
-/* Implementation of diagnostic_event::print_desc vfunc for
+/* Implementation of diagnostics::paths::event::print_desc vfunc for
    warning_event.
 
    If the pending diagnostic implements describe_final_event, use it,
@@ -1165,13 +1249,22 @@ warning_event::print_desc (pretty_printer &pp) const
     pp_string (&pp, "here");
 }
 
-/* Implementation of diagnostic_event::get_meaning vfunc for
+/* Implementation of diagnostics::paths::event::get_meaning vfunc for
    warning_event.  */
 
-diagnostic_event::meaning
+diagnostics::paths::event::meaning
 warning_event::get_meaning () const
 {
-  return meaning (VERB_danger, NOUN_unknown);
+  return meaning (verb::danger, noun::unknown);
+}
+
+const program_state *
+warning_event::get_program_state () const
+{
+  if (m_program_state)
+    return m_program_state.get ();
+  else
+    return &m_enode->get_state ();
 }
 
 } // namespace ana

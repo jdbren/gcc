@@ -488,7 +488,7 @@ set_bitmask (tree name, const wide_int &value, const wide_int &mask)
 {
   gcc_assert (!POINTER_TYPE_P (TREE_TYPE (name)));
 
-  int_range<2> r (TREE_TYPE (name));
+  int_range_max r (TREE_TYPE (name));
   r.update_bitmask (irange_bitmask (value, mask));
   set_range_info (name, r);
 }
@@ -508,6 +508,14 @@ get_nonzero_bits_1 (const_tree name)
   /* Use element_precision instead of TYPE_PRECISION so complex and
      vector types get a non-zero precision.  */
   unsigned int precision = element_precision (TREE_TYPE (name));
+
+  if (VECTOR_TYPE_P (TREE_TYPE (name)))
+    {
+      tree elem = uniform_vector_p (name);
+      if (elem)
+	return get_nonzero_bits_1 (elem);
+    }
+
   if (TREE_CODE (name) != SSA_NAME)
     return wi::shwi (-1, precision);
 
@@ -576,7 +584,7 @@ get_known_nonzero_bits_1 (const_tree name)
   if (tmp.undefined_p ())
     return wi::shwi (0, precision);
   irange_bitmask bm = tmp.get_bitmask ();
-  return bm.value () & ~bm.mask ();
+  return wi::bit_and_not (bm.value (), bm.mask ());
 }
 
 /* Return a wide_int with known non-zero bits in SSA_NAME
