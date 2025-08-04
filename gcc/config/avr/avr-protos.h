@@ -168,6 +168,8 @@ regmask (machine_mode mode, unsigned regno)
 
 extern void avr_fix_inputs (rtx*, unsigned, unsigned);
 extern bool avr_emit3_fix_outputs (rtx (*)(rtx,rtx,rtx), rtx*, unsigned, unsigned);
+extern rtx avr_add_ccclobber (rtx_insn *);
+#define DONE_ADD_CCC emit (avr_add_ccclobber (curr_insn)); DONE;
 
 extern rtx lpm_reg_rtx;
 extern rtx lpm_addr_reg_rtx;
@@ -208,6 +210,7 @@ extern rtl_opt_pass *make_avr_pass_casesi (gcc::context *);
 extern rtl_opt_pass *make_avr_pass_ifelse (gcc::context *);
 extern rtl_opt_pass *make_avr_pass_split_nzb (gcc::context *);
 extern rtl_opt_pass *make_avr_pass_split_after_peephole2 (gcc::context *);
+extern rtl_opt_pass *make_avr_pass_2moves (gcc::context *);
 #ifdef RTX_CODE
 extern bool avr_casei_sequence_check_operands (rtx *xop);
 extern bool avr_split_fake_addressing_move (rtx_insn *insn, rtx *operands);

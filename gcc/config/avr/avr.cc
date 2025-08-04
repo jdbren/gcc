@@ -411,6 +411,29 @@ avr_to_int_mode (rtx x)
 }
 
 
+/* Return the pattern of INSN, but with added (clobber (reg:CC REG_CC)).
+   The pattern of INSN must be a PARALLEL or a SET.  INSN is unchanged.  */
+
+rtx
+avr_add_ccclobber (rtx_insn *insn)
+{
+  rtx pat = PATTERN (insn);
+  gcc_assert (GET_CODE (pat) == SET || GET_CODE (pat) == PARALLEL);
+
+  int newlen = GET_CODE (pat) == SET ? 2 : 1 + XVECLEN (pat, 0);
+  rtx newpat = gen_rtx_PARALLEL (VOIDmode, rtvec_alloc (newlen));
+  rtx elt0 = GET_CODE (pat) == SET ? pat : XVECEXP (pat, 0, 0);
+
+  XVECEXP (newpat, 0, 0) = copy_rtx (elt0);
+  XVECEXP (newpat, 0, newlen - 1) = gen_rtx_CLOBBER (VOIDmode, cc_reg_rtx);
+
+  for (int i = 1; i < newlen - 1; ++i)
+    XVECEXP (newpat, 0, i) = copy_rtx (XVECEXP (pat, 0, i));
+
+  return newpat;
+}
+
+
 /* Return true if hard register REG supports the ADIW and SBIW instructions.  */
 
 bool
@@ -14418,6 +14441,13 @@ avr_output_addr_vec (rtx_insn *labl, rtx table)
   // Output the label that precedes the table.
 
   ASM_OUTPUT_ALIGN (stream, 1);
+
+  char s_labl[40];
+  targetm.asm_out.generate_internal_label (s_labl, "L",
+					   CODE_LABEL_NUMBER (labl));
+  ASM_OUTPUT_TYPE_DIRECTIVE (stream, s_labl,
+			     AVR_HAVE_JMP_CALL ? "object" : "function");
+
   targetm.asm_out.internal_label (stream, "L", CODE_LABEL_NUMBER (labl));
 
   // Output the table's content.
@@ -14984,10 +15014,11 @@ avr_addr_space_convert (rtx src, tree type_old, tree type_new)
 
       /* Linearize memory: RAM has bit 23 set.  When as_new = __flashx then
 	 this is basically UB since __flashx mistreats RAM addresses, but there
-	 is no way to bail out.  (Though -Waddr-space-convert will tell.)  */
+	 is no way to bail out.  (Though -Waddr-space-convert will tell.)
+	 ...but PR121277 is confusing, in particular when NULL is coming in. */
 
       int msb = ADDR_SPACE_GENERIC_P (as_old)
-	? 0x80
+	? as_new == ADDR_SPACE_MEMX ? 0x80 : 0x00
 	: avr_addrspace[as_old].segment;
 
       src = force_reg (Pmode, src);
@@ -15085,10 +15116,16 @@ avr_convert_to_type (tree type, tree expr)
 	  const char *name_old = avr_addrspace[as_old].name;
 	  const char *name_new = avr_addrspace[as_new].name;
 
-	  warning (OPT_Waddr_space_convert,
-		   "conversion from address space %qs to address space %qs",
-		   ADDR_SPACE_GENERIC_P (as_old) ? "generic" : name_old,
-		   ADDR_SPACE_GENERIC_P (as_new) ? "generic" : name_new);
+	  // Be relaxed when NULL is used, and when 0x0 stands for
+	  // address 0x0.
+	  bool nowarn = (expr == null_pointer_node
+			 && (as_new == ADDR_SPACE_FLASHX
+			     || as_new == ADDR_SPACE_FLASH));
+	  if (!nowarn)
+	    warning (OPT_Waddr_space_convert,
+		     "conversion from address space %qs to address space %qs",
+		     ADDR_SPACE_GENERIC_P (as_old) ? "generic" : name_old,
+		     ADDR_SPACE_GENERIC_P (as_new) ? "generic" : name_new);
 
 	  return fold_build1_loc (loc, ADDR_SPACE_CONVERT_EXPR, type, expr);
 	}

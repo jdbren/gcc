@@ -915,7 +915,7 @@ Objective-C and Objective-C++ Dialects}.
 @emph{AVR Options} (@ref{AVR Options})
 @gccoptlist{-mmcu=@var{mcu}  -mabsdata  -maccumulate-args  -mcvt
 -mbranch-cost=@var{cost}  -mfuse-add=@var{level}  -mfuse-move=@var{level}
--mcall-prologues  -mgas-isr-prologues  -mint8  -mflmap
+-mfuse-move2  -mcall-prologues  -mgas-isr-prologues  -mint8  -mflmap
 -mdouble=@var{bits}  -mlong-double=@var{bits}  -mno-call-main
 -mn_flash=@var{size}  -mfract-convert-truncate  -mno-interrupts
 -mmain-is-OS_task  -mrelax  -mrmw  -mstrict-X  -mtiny-stack
@@ -20612,18 +20612,22 @@ LTO output files.
 @opindex fdump-rtl-@var{pass}
 @item -d@var{letters}
 @itemx -fdump-rtl-@var{pass}
-@itemx -fdump-rtl-@var{pass}=@var{filename}
+@itemx -fdump-rtl-@var{pass}-@var{options}
+@itemx -fdump-rtl-@var{pass}-@var{options}=@var{filename}
 Says to make debugging dumps during compilation at times specified by
-@var{letters}.  This is used for debugging the RTL-based passes of the
+@var{letters} when using @option{-d} or by @var{pass} when using
+@option{-fdump-rtl}.  This is used for debugging the RTL-based passes of the
 compiler.
 
 Some @option{-d@var{letters}} switches have different meaning when
 @option{-E} is used for preprocessing.  @xref{Preprocessor Options},
 for information about preprocessor-specific dump options.
 
-Debug dumps can be enabled with a @option{-fdump-rtl} switch or some
-@option{-d} option @var{letters}.  Here are the possible
-letters for use in @var{pass} and @var{letters}, and their meanings:
+The @samp{-@var{options}} form allows greater control over the details of the
+dump. See @option{-fdump-tree}.
+
+Here are actual instances of command-line options following these patterns and
+their meanings:
 
 @table @gcctabopt
 
@@ -21150,8 +21154,7 @@ GraphViz to @file{@var{file}.@var{passid}.@var{pass}.dot}.  Each function in
 the file is pretty-printed as a subgraph, so that GraphViz can render them
 all in a single plot.
 
-This option currently only works for RTL dumps, and the RTL is always
-dumped in slim form.
+RTL is always dumped in slim form.
 @item vops
 Enable showing virtual operands for every statement.
 @item lineno
@@ -25109,6 +25112,10 @@ and @code{@var{level}=23} for higher optimizations.
 Valid values for @var{level} are in the range @code{0} @dots{} @code{23}
 which is a 3:2:2:2 mixed radix value.  Each digit controls some
 aspect of the optimization.
+
+@opindex mfuse-move2
+@item -mfuse-move2
+Run a post combine optimization pass that tries to fuse move instructions.
 
 @opindex mstrict-X
 @item -mstrict-X
@@ -31370,31 +31377,14 @@ When the RISC-V specifications define an extension as depending on other
 extensions, GCC will implicitly add the dependent extensions to the enabled
 extension set if they weren't added explicitly.
 
-@opindex mcpu
-@item -mcpu=@var{processor-string}
-Use architecture of and optimize the output for the given processor, specified
-by particular CPU name.
-Permissible values for this option are: @samp{mips-p8700}, @samp{sifive-e20},
-@samp{sifive-e21}, @samp{sifive-e24}, @samp{sifive-e31}, @samp{sifive-e34},
-@samp{sifive-e76}, @samp{sifive-s21}, @samp{sifive-s51}, @samp{sifive-s54},
-@samp{sifive-s76}, @samp{sifive-u54}, @samp{sifive-u74}, @samp{sifive-x280},
-@samp{sifive-xp450}, @samp{sifive-x670}, @samp{thead-c906}, @samp{tt-ascalon-d8},
-@samp{xiangshan-nanhu}, @samp{xiangshan-kunminghu}, @samp{xt-c908}, @samp{xt-c908v},
-@samp{xt-c910}, @samp{xt-c910v2}, @samp{xt-c920}, @samp{xt-c920v2}.
+@include riscv-mcpu.texi
 
 Note that @option{-mcpu} does not override @option{-march} or @option{-mtune}.
 
-@opindex mtune
-@item -mtune=@var{processor-string}
-Optimize the output for the given processor, specified by microarchitecture or
-particular CPU name.  Permissible values for this option are:
-@samp{generic-ooo}, @samp{mips-p8700}, @samp{rocket}, @samp{sifive-3-series},
-@samp{sifive-5-series}, @samp{sifive-7-series}, @samp{size},
-@samp{sifive-p400-series}, @samp{sifive-p600-series}, and all valid options for
-@option{-mcpu=}.
+@include riscv-mtune.texi
 
 When @option{-mtune=} is not specified, use the setting from @option{-mcpu},
-the default is @samp{rocket} if both are not specified.
+the default is @samp{generic} if both are not specified.
 
 The @samp{size} choice is not intended for use by end-users.  This is used
 when @option{-Os} is specified.  It overrides the instruction cost info

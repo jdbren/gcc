@@ -1424,10 +1424,10 @@ the smaller of @var{computed} and @code{BIGGEST_ALIGNMENT}
 
 @defmac MAX_FIXED_MODE_SIZE
 An integer expression for the size in bits of the largest integer
-machine mode that should actually be used.  All integer machine modes of
-this size or smaller can be used for structures and unions with the
-appropriate sizes.  If this macro is undefined, @code{GET_MODE_BITSIZE
-(DImode)} is assumed.
+machine mode that should actually be used by GCC internally.
+All integer machine modes of this size or smaller can be used for
+structures and unions with the appropriate sizes.  If this macro is
+undefined, @code{MAX (BITS_PER_WORD * 2, 64)} is assumed.
 @end defmac
 
 @defmac STACK_SAVEAREA_MODE (@var{save_level})
@@ -6511,6 +6511,15 @@ is the vector type of the store and @var{index_type} is scalar type of
 the index, scaled by @var{scale}.
 The default is @code{NULL_TREE} which means to not vectorize scatter
 stores.
+@end deftypefn
+
+@deftypefn {Target Hook} bool TARGET_VECTORIZE_PREFER_GATHER_SCATTER (machine_mode @var{mode}, int @var{scale}, unsigned int @var{group_size})
+This hook returns TRUE if gather loads or scatter stores are cheaper on
+this target than a sequence of elementwise loads or stores.  The @var{mode}
+and @var{scale} correspond to the @code{gather_load} and
+@code{scatter_store} instruction patterns.  The @var{group_size} is the
+number of scalar elements in each scalar loop iteration that are to be
+combined into the vector.
 @end deftypefn
 
 @deftypefn {Target Hook} int TARGET_SIMD_CLONE_COMPUTE_VECSIZE_AND_SIMDLEN (struct cgraph_node *@var{}, struct cgraph_simd_clone *@var{}, @var{tree}, @var{int}, @var{bool})
