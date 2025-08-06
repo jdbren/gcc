@@ -1,3 +1,4 @@
 MULTILIB_OPTIONS += mno-red-zone mcmodel=kernel
 MULTILIB_DIRNAMES += no-red-zone kernel
 # HOST_LIBGCC2_CFLAGS += -fno-pic -fno-PIE
+MULTILIB_REQUIRED = mno-red-zone/mcmodel=kernel
