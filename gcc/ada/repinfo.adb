@@ -119,7 +119,7 @@ package body Repinfo is
    function Entity_Hash (Id : Entity_Id) return Entity_Header_Num;
    --  Simple hash function for Entity_Ids
 
-   package Relevant_Entities is new GNAT.Htable.Simple_HTable
+   package Relevant_Entities is new GNAT.HTable.Simple_HTable
      (Header_Num => Entity_Header_Num,
       Element    => Boolean,
       No_Element => False,
@@ -455,7 +455,7 @@ package body Repinfo is
 
       if Present (Ent)
         and then Nkind (Declaration_Node (Ent)) not in N_Renaming_Declaration
-        and then not Is_Ignored_Ghost_Entity (Ent)
+        and then not Sem_Util.Is_Ignored_Ghost_Entity_In_Codegen (Ent)
       then
          --  If entity is a subprogram and we are listing mechanisms,
          --  then we need to list mechanisms for this entity. We skip this

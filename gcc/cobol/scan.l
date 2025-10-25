@@ -104,7 +104,9 @@ NP        P+|(P{COUNT})
 UNSIGNED  [[:space:]]+UNSIGNED
 SIGNED    [[:space:]]+SIGNED
 
-ALNUM     [AX9]+
+PREFIX 	  G|N|U|Z
+
+ALNUM     [AX9]+|N+|U+
 
 AX       [AX]{COUNT}?
 B0       [B0/]{COUNT}?
@@ -452,16 +454,26 @@ COPY		{
                   myless(0);
                 }
 
-EXTEND		{ return EXTEND;}
-INITIALIZE	{ return INITIALIZE; }
-INSPECT		{ return INSPECT; }
-INVOKE		{ return INVOKE; }
-INTRINSIC	{ return INTRINSIC; }
-MERGE		{ return MERGE; }
-UNSTRING	{ return UNSTRING; }
-XML		{ return XML; }
-XMLGENERATE	{ return XMLGENERATE; }
-XMLPARSE	{ return XMLPARSE; }
+ATTRIBUTES		{ return ATTRIBUTES; }
+ELEMENT			{ return ELEMENT; }
+ENCODING		{ return ENCODING; }
+EXTEND			{ return EXTEND;}
+INITIALIZE		{ return INITIALIZE; }
+INSPECT			{ return INSPECT; }
+INTRINSIC		{ return INTRINSIC; }
+INVOKE			{ return INVOKE; }
+MERGE			{ return MERGE; }
+NAMESPACE		{ return NAMESPACE; }
+NAMESPACE-PREFIX	{ return NAMESPACE_PREFIX; }
+NONNUMERIC		{ return NONNUMERIC; }
+PROCESSING		{ return PROCESSING; }
+UNSTRING		{ return UNSTRING; }
+VALIDATING		{ return VALIDATING; }
+
+XML{SPC}GENERATE	{ return XMLGENERATE; }
+XML{SPC}PARSE		{ return XMLPARSE; }
+XML-DECLARATION		{ return XML_DECLARATION; }
+END-XML			{ return END_XML; }
 
 ZEROE?S?	{ return ZERO; }
 
@@ -505,7 +517,6 @@ THAN		{ return THAN; }
 TEST		{ return TEST; }
 TERMINATE	{ return TERMINATE; }
 TALLYING	{ return TALLYING; }
-TALLY		{ return TALLY; }
 SYSPUNCH	{ return SYSPUNCH; }
 SYSOUT		{ return SYSOUT; }
 SYSIN		{ return SYSIN; }
@@ -802,7 +813,11 @@ DEPENDING	{ return DEPENDING; }
 
 DELIMITER	{ return DELIMITER; }
 DELETE		{ return DELETE; }
-DEFAULT		{ return DEFAULT; }
+
+DEFAULT		{ yylval.number = 'D'; return DEFAULT; }
+SYSTEM-DEFAULT	{ yylval.number = 'S'; return DEFAULT; }
+USER-DEFAULT	{ yylval.number = 'U'; return DEFAULT; }
+
 DECLARATIVES	{ return DECLARATIVES; }
 DECIMAL-POINT	{ return DECIMAL_POINT; }
 DEBUGGING	{ return DEBUGGING; }
@@ -981,12 +996,12 @@ USE({SPC}FOR)?		{ return USE; }
   COMP(UTATIONAL)?-X		{ return ucomputable(FldNumericBin5, 0xFF); }
   COMP(UTATIONAL)?-6		{ return ucomputable(FldPacked, 0); }
   COMP(UTATIONAL)?-5		{ return ucomputable(FldNumericBin5, 0); }
-  COMP(UTATIONAL)?-4		{ return scomputable(FldNumericBinary, 0); }
+  COMP(UTATIONAL)?-4		{ return ucomputable(FldNumericBinary, 0); }
   COMP(UTATIONAL)?-3		{ return PACKED_DECIMAL; }
   COMP(UTATIONAL)?-2		{ return ucomputable(FldFloat, 8); }
   COMP(UTATIONAL)?-1		{ return ucomputable(FldFloat, 4); }
   COMP(UTATIONAL)?		{ return ucomputable(FldNumericBinary, 0); }
-  BINARY            		{ return scomputable(FldNumericBinary, 0); }
+  BINARY            		{ return ucomputable(FldNumericBinary, 0); }
 
   BINARY-CHAR	   		{ return bcomputable(FldNumericBin5, 1); }
   BINARY-SHORT	  		{ return bcomputable(FldNumericBin5, 2); }
@@ -1142,9 +1157,9 @@ USE({SPC}FOR)?		{ return USE; }
 			  return token == NAME88? NAME : token;
  			}
 
-  Z?['']                { yylval.literal.set_prefix(yytext, yyleng-1);
+  {PREFIX}?['']                { yylval.literal.set_prefix(yytext, yyleng-1);
 			  yy_push_state(quoted1); }
-  Z?[""]                { yylval.literal.set_prefix(yytext, yyleng-1);
+  {PREFIX}?[""]                { yylval.literal.set_prefix(yytext, yyleng-1);
 			  yy_push_state(quoted2); }
   N?X/{hexseq}		{ yylval.literal.set_prefix(yytext, yyleng);
 	    		  yy_push_state(hex_state); }
@@ -1289,12 +1304,12 @@ USE({SPC}FOR)?		{ return USE; }
 		}
 
   /* CDF REPLACING needs quotes to distinquish strings from identifiers. */
-  Z?['']{STRING1}['']   { auto *s = xstrdup(yytext);
+  {PREFIX}?['']{STRING1}['']   { auto *s = xstrdup(yytext);
 			  std::replace(s, s + strlen(s), '\'', '"');
 			  ydflval.string = s;
 			  update_location_col(s);
 			  return LITERAL; }
-  Z?[""]{STRING}[""]    { ydflval.string = xstrdup(yytext);
+  {PREFIX}?[""]{STRING}[""]    { ydflval.string = xstrdup(yytext);
 			  update_location_col(yytext);
 			  return LITERAL; }
   [=]{4}                { static char nullstring[] = "";
@@ -1403,9 +1418,9 @@ USE({SPC}FOR)?		{ return USE; }
 			  yylval.string = xstrdup(yytext);
 			  return NAME; 
 			}
-  Z?['']                { yylval.literal.set_prefix(yytext, yyleng-1);
+  {PREFIX}?['']                { yylval.literal.set_prefix(yytext, yyleng-1);
 			  BEGIN(quoted1); }
-  Z?[""]                { yylval.literal.set_prefix(yytext, yyleng-1);
+  {PREFIX}?[""]                { yylval.literal.set_prefix(yytext, yyleng-1);
 			  BEGIN(quoted2); }
 
   .             	{ myless(0); yy_pop_state();
@@ -1445,11 +1460,11 @@ USE({SPC}FOR)?		{ return USE; }
   BX/{hexseq}			{ yylval.numstr.radix = hexadecimal_e;
 			  	  yy_push_state(numstr_state); }
 
-  Z?['']                   { yylval.literal.set_prefix(yytext, yyleng-1);
+  {PREFIX}?['']                   { yylval.literal.set_prefix(yytext, yyleng-1);
 			     yy_push_state(quoted1); }
-  Z?[""]                   { yylval.literal.set_prefix(yytext, yyleng-1);
+  {PREFIX}?[""]                   { yylval.literal.set_prefix(yytext, yyleng-1);
 			     yy_push_state(quoted2); }
-  Z?[""]/{STRING}[""]      { yylval.literal.set_prefix(yytext, yyleng-1);
+  {PREFIX}?[""]/{STRING}[""]      { yylval.literal.set_prefix(yytext, yyleng-1);
 			     yy_push_state(quoted2); }
 
   {INTEGERZ}/[[:punct:]][[:space:]]{BLANK_OEOL} { return numstr_of(yytext); }
@@ -2246,7 +2261,7 @@ BASIS		{ yy_push_state(basis); return BASIS; }
   DE		{ return DE; }
   DECIMAL-POINT	{ return DECIMAL_POINT; }
   DECLARATIVES	{ return DECLARATIVES; }
-  DEFAULT	{ return DEFAULT; }
+  DEFAULT	{ yylval.number = 'D'; return DEFAULT; }
   DELETE	{ return DELETE; }
   DELIMITED	{ return DELIMITED; }
   DELIMITER	{ return DELIMITER; }

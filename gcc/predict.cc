@@ -852,7 +852,7 @@ unlikely_executed_stmt_p (gimple *stmt)
      heuristics.  */
   if (gimple_bb (stmt)->count.reliable_p ()
       && gimple_bb (stmt)->count.nonzero_p ())
-    return gimple_bb (stmt)->count == profile_count::zero ();
+    return false;
   /* NORETURN attribute alone is not strong enough: exit() may be quite
      likely executed once during program run.  */
   if (gimple_call_fntype (stmt)
@@ -3849,7 +3849,7 @@ update_max_bb_count (void)
   basic_block bb;
 
   FOR_BB_BETWEEN (bb, ENTRY_BLOCK_PTR_FOR_FN (cfun), NULL, next_bb)
-    true_count_max = true_count_max.max (bb->count);
+    true_count_max = profile_count::max_prefer_initialized (true_count_max, bb->count);
 
   cfun->cfg->count_max = true_count_max;
 
@@ -4162,7 +4162,9 @@ estimate_bb_frequencies ()
 	 executed, then preserve this info.  */
       if (!(bb->count == profile_count::zero ()))
 	bb->count = count.guessed_local ().combine_with_ipa_count (ipa_count);
-      cfun->cfg->count_max = cfun->cfg->count_max.max (bb->count);
+      cfun->cfg->count_max
+	= profile_count::max_prefer_initialized (cfun->cfg->count_max,
+						 bb->count);
     }
 
   free_aux_for_blocks ();
@@ -4473,7 +4475,9 @@ rebuild_frequencies (void)
   cfun->cfg->count_max = profile_count::uninitialized ();
   FOR_BB_BETWEEN (bb, ENTRY_BLOCK_PTR_FOR_FN (cfun), NULL, next_bb)
     {
-      cfun->cfg->count_max = cfun->cfg->count_max.max (bb->count);
+      cfun->cfg->count_max
+	      = profile_count::max_prefer_initialized (cfun->cfg->count_max,
+						       bb->count);
       if (bb->count.nonzero_p () && bb->count.quality () >= AFDO)
 	feedback_found = true;
       /* Uninitialized count may be result of inlining or an omision in an
@@ -4521,6 +4525,9 @@ rebuild_frequencies (void)
       && (!uninitialized_count_found || uninitialized_probablity_found)
       && !cfun->cfg->count_max.very_large_p ())
     {
+      /* Propagating zero counts should be safe and may
+	 help hot/cold splitting.  */
+      determine_unlikely_bbs ();
       if (dump_file)
 	fprintf (dump_file, "Profile is consistent\n");
       return;
@@ -4545,6 +4552,9 @@ rebuild_frequencies (void)
      for a given run, we would only propagate the error further.  */
   if (feedback_found && !uninitialized_count_found)
     {
+      /* Propagating zero counts should be safe and may
+	 help hot/cold splitting.  */
+      determine_unlikely_bbs ();
       if (dump_file)
 	fprintf (dump_file,
 	    "Profile is inconsistent but read from profile feedback;"

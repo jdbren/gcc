@@ -1190,7 +1190,7 @@ constant_pointer_difference (tree p1, tree p2)
 /* Helper function for optimize_aggr_zeroprop.
    Props the zeroing (memset, VAL) that was done in DEST+OFFSET:LEN
    (DEFSTMT) into the STMT.  Returns true if the STMT was updated.  */
-static bool
+static void
 optimize_aggr_zeroprop_1 (gimple *defstmt, gimple *stmt,
 			  tree dest, poly_int64 offset, tree val,
 			  poly_offset_int len)
@@ -1214,29 +1214,29 @@ optimize_aggr_zeroprop_1 (gimple *defstmt, gimple *stmt,
 		: TYPE_SIZE_UNIT (TREE_TYPE (src2)));
 	/* Can only handle zero memsets. */
 	if (!integer_zerop (val))
-	  return false;
+	  return;
      }
    else
-     return false;
+     return;
 
   if (len2 == NULL_TREE
       || !poly_int_tree_p (len2))
-    return false;
+    return;
 
   src2 = get_addr_base_and_unit_offset (src2, &offset2);
   if (src2 == NULL_TREE
       || maybe_lt (offset2, offset))
-    return false;
+    return;
 
   if (!operand_equal_p (dest, src2, 0))
-    return false;
+    return;
 
   /* [ dest + offset, dest + offset + len - 1 ] is set to val.
      Make sure that
      [ dest + offset2, dest + offset2 + len2 - 1 ] is a subset of that.  */
   if (maybe_gt (wi::to_poly_offset (len2) + (offset2 - offset),
 		len))
-    return false;
+    return;
 
   if (dump_file && (dump_flags & TDF_DETAILS))
     {
@@ -1282,8 +1282,6 @@ optimize_aggr_zeroprop_1 (gimple *defstmt, gimple *stmt,
   /* Mark the bb for eh cleanup if needed.  */
   if (maybe_clean_or_replace_eh_stmt (orig_stmt, stmt))
     bitmap_set_bit (to_purge, gimple_bb (stmt)->index);
-
-  return true;
 }
 
 /* Optimize
@@ -1295,19 +1293,17 @@ optimize_aggr_zeroprop_1 (gimple *defstmt, gimple *stmt,
    Similarly for memset (&a, ..., sizeof (a)); instead of a = {};
    and/or memcpy (&b, &a, sizeof (a)); instead of b = a;  */
 
-static bool
-optimize_aggr_zeroprop (gimple_stmt_iterator *gsip, bool full_walk)
+static void
+optimize_aggr_zeroprop (gimple *stmt, bool full_walk)
 {
   ao_ref read;
-  gimple *stmt = gsi_stmt (*gsip);
   if (gimple_has_volatile_ops (stmt))
-    return false;
+    return;
 
   tree dest = NULL_TREE;
   tree val = integer_zero_node;
   tree len = NULL_TREE;
   bool can_use_tbba = true;
-  bool changed = false;
 
   if (gimple_call_builtin_p (stmt, BUILT_IN_MEMSET)
       && TREE_CODE (gimple_call_arg (stmt, 0)) == ADDR_EXPR
@@ -1362,7 +1358,7 @@ optimize_aggr_zeroprop (gimple_stmt_iterator *gsip, bool full_walk)
     }
 
   if (dest == NULL_TREE)
-    return false;
+    return;
 
   if (len == NULL_TREE)
     len = (TREE_CODE (dest) == COMPONENT_REF
@@ -1370,13 +1366,13 @@ optimize_aggr_zeroprop (gimple_stmt_iterator *gsip, bool full_walk)
 	   : TYPE_SIZE_UNIT (TREE_TYPE (dest)));
   if (len == NULL_TREE
       || !poly_int_tree_p (len))
-    return false;
+    return;
 
   /* This store needs to be on the byte boundary and pointing to an object.  */
   poly_int64 offset;
   tree dest_base = get_addr_base_and_unit_offset (dest, &offset);
   if (dest_base == NULL_TREE)
-    return false;
+    return;
 
   /* Setup the worklist.  */
   auto_vec<std::pair<tree, unsigned>> worklist;
@@ -1409,33 +1405,202 @@ optimize_aggr_zeroprop (gimple_stmt_iterator *gsip, bool full_walk)
 						    new_limit));
 	      }
 
-	  if (optimize_aggr_zeroprop_1 (stmt, use_stmt, dest_base, offset,
-					 val, wi::to_poly_offset (len)))
-	   changed = true;
+	   optimize_aggr_zeroprop_1 (stmt, use_stmt, dest_base, offset,
+				     val, wi::to_poly_offset (len));
 	}
     }
 
-  return changed;
+}
+
+/* Returns the pointer to the base of the object of the
+   reference EXPR and extracts the information about
+   the offset of the access, storing it to PBYTESIZE,
+   PBYTEPOS and PREVERSEP.
+   If the access is not a byte sized or position is not
+   on the byte, return NULL.  */
+static tree
+split_core_and_offset_size (tree expr,
+			    poly_int64 *pbytesize, poly_int64 *pbytepos,
+			    tree *poffset, int *preversep)
+{
+  tree core;
+  machine_mode mode;
+  int unsignedp, volatilep;
+  poly_int64 bitsize;
+  poly_int64 bitpos;
+  location_t loc = EXPR_LOCATION (expr);
+
+  core = get_inner_reference (expr, &bitsize, &bitpos,
+			      poffset, &mode, &unsignedp, preversep,
+			      &volatilep);
+  if (!multiple_p (bitsize, BITS_PER_UNIT, pbytesize))
+    return NULL_TREE;
+  if (!multiple_p (bitpos, BITS_PER_UNIT, pbytepos))
+    return NULL_TREE;
+  /* If we are left with MEM[a + CST] strip that and add it to the
+     pbytepos and return a. */
+  if (TREE_CODE (core) == MEM_REF)
+    {
+      poly_offset_int tem;
+      tem = wi::to_poly_offset (TREE_OPERAND (core, 1));
+      tem += *pbytepos;
+      if (tem.to_shwi (pbytepos))
+	return TREE_OPERAND (core, 0);
+    }
+  core = build_fold_addr_expr_loc (loc, core);
+  STRIP_NOPS (core);
+  return core;
+}
+
+/* Returns a new src based on the
+   copy `DEST = SRC` and for the old SRC2.
+   Returns null if SRC2 is not related to DEST.  */
+
+static tree
+new_src_based_on_copy (tree src2, tree dest, tree src)
+{
+  /* If the second src is not exactly the same as dest,
+     try to handle it seperately; see it is address/size equivalent.
+     Handles `a` and `a.b` and `MEM<char[N]>(&a)` which all have
+     the same size and offsets as address/size equivalent.
+     This allows copying over a memcpy and also one for copying
+     where one field is the same size as the whole struct.  */
+  if (operand_equal_p (dest, src2))
+    return src;
+  /* if both dest and src2 are decls, then we know these 2
+     accesses can't be the same.  */
+  if (DECL_P (dest) && DECL_P (src2))
+    return NULL_TREE;
+  /* A VCE can't be used with imag/real or BFR so reject them early. */
+  if (TREE_CODE (src) == IMAGPART_EXPR
+      || TREE_CODE (src) == REALPART_EXPR
+      || TREE_CODE (src) == BIT_FIELD_REF)
+    return NULL_TREE;
+  tree core1, core2;
+  poly_int64 bytepos1, bytepos2;
+  poly_int64 bytesize1, bytesize2;
+  tree toffset1, toffset2;
+  int reversep1 = 0;
+  int reversep2 = 0;
+  poly_int64 diff = 0;
+  core1 = split_core_and_offset_size (dest, &bytesize1, &bytepos1,
+					  &toffset1, &reversep1);
+  core2 = split_core_and_offset_size (src2, &bytesize2, &bytepos2,
+					  &toffset2, &reversep2);
+  if (!core1 || !core2)
+    return NULL_TREE;
+  if (reversep1 != reversep2)
+    return NULL_TREE;
+  /* The sizes of the 2 accesses need to be the same. */
+  if (!known_eq (bytesize1, bytesize2))
+    return NULL_TREE;
+  if (!operand_equal_p (core1, core2, 0))
+    return NULL_TREE;
+
+  if (toffset1 && toffset2)
+    {
+      tree type = TREE_TYPE (toffset1);
+      if (type != TREE_TYPE (toffset2))
+	toffset2 = fold_convert (type, toffset2);
+
+      tree tdiff = fold_build2 (MINUS_EXPR, type, toffset1, toffset2);
+      if (!cst_and_fits_in_hwi (tdiff))
+	return NULL_TREE;
+
+      diff = int_cst_value (tdiff);
+    }
+  else if (toffset1 || toffset2)
+    {
+      /* If only one of the offsets is non-constant, the difference cannot
+	 be a constant.  */
+      return NULL_TREE;
+    }
+  diff += bytepos1 - bytepos2;
+  /* The offset between the 2 need to be 0. */
+  if (!known_eq (diff, 0))
+    return NULL_TREE;
+  return fold_build1 (VIEW_CONVERT_EXPR,TREE_TYPE (src2), src);
+}
+
+/* Returns true if SRC and DEST are the same address such that
+   `SRC == DEST;` is considered a nop. This is more than an
+   operand_equal_p check as it needs to be similar to
+   new_src_based_on_copy.  */
+
+static bool
+same_for_assignment (tree src, tree dest)
+{
+  if (operand_equal_p (dest, src, 0))
+    return true;
+  /* if both dest and src2 are decls, then we know these 2
+     accesses can't be the same.  */
+  if (DECL_P (dest) && DECL_P (src))
+    return false;
+
+  tree core1, core2;
+  poly_int64 bytepos1, bytepos2;
+  poly_int64 bytesize1, bytesize2;
+  tree toffset1, toffset2;
+  int reversep1 = 0;
+  int reversep2 = 0;
+  poly_int64 diff = 0;
+  core1 = split_core_and_offset_size (dest, &bytesize1, &bytepos1,
+				      &toffset1, &reversep1);
+  core2 = split_core_and_offset_size (src, &bytesize2, &bytepos2,
+				      &toffset2, &reversep2);
+  if (!core1 || !core2)
+    return false;
+  if (reversep1 != reversep2)
+    return false;
+  /* The sizes of the 2 accesses need to be the same. */
+  if (!known_eq (bytesize1, bytesize2))
+    return false;
+  if (!operand_equal_p (core1, core2, 0))
+    return false;
+  if (toffset1 && toffset2)
+    {
+      tree type = TREE_TYPE (toffset1);
+      if (type != TREE_TYPE (toffset2))
+	toffset2 = fold_convert (type, toffset2);
+
+      tree tdiff = fold_build2 (MINUS_EXPR, type, toffset1, toffset2);
+      if (!cst_and_fits_in_hwi (tdiff))
+	return false;
+
+      diff = int_cst_value (tdiff);
+    }
+  else if (toffset1 || toffset2)
+    {
+      /* If only one of the offsets is non-constant, the difference cannot
+	 be a constant.  */
+      return false;
+    }
+  diff += bytepos1 - bytepos2;
+  /* The offset between the 2 need to be 0. */
+  if (!known_eq (diff, 0))
+    return false;
+  return true;
 }
 
 /* Helper function for optimize_agr_copyprop.
    For aggregate copies in USE_STMT, see if DEST
    is on the lhs of USE_STMT and replace it with SRC. */
-static bool
+static void
 optimize_agr_copyprop_1 (gimple *stmt, gimple *use_stmt,
 			 tree dest, tree src)
 {
   gcc_assert (gimple_assign_load_p (use_stmt)
 	      && gimple_store_p (use_stmt));
   if (gimple_has_volatile_ops (use_stmt))
-    return false;
+    return;
   tree dest2 = gimple_assign_lhs (use_stmt);
   tree src2 = gimple_assign_rhs1 (use_stmt);
   /* If the new store is `src2 = src2;` skip over it. */
-  if (operand_equal_p (src2, dest2, 0))
-    return false;
-  if (!operand_equal_p (dest, src2, 0))
-    return false;
+  if (same_for_assignment (src2, dest2))
+    return;
+  src = new_src_based_on_copy (src2, dest, src);
+  if (!src)
+    return;
   /* For 2 memory refences and using a temporary to do the copy,
      don't remove the temporary as the 2 memory references might overlap.
      Note t does not need to be decl as it could be field.
@@ -1455,7 +1620,48 @@ optimize_agr_copyprop_1 (gimple *stmt, gimple *use_stmt,
      */
   if (!operand_equal_p (dest2, src, 0)
       && !DECL_P (dest2) && !DECL_P (src))
-    return false;
+    {
+      /* If *a and *b have the same base see if
+	 the offset between the two is greater than
+	 or equal to the size of the type. */
+      poly_int64 offset1, offset2;
+      tree len = TYPE_SIZE_UNIT (TREE_TYPE (src));
+      if (len == NULL_TREE
+	  || !tree_fits_poly_int64_p (len))
+	return;
+      tree base1 = get_addr_base_and_unit_offset (dest2, &offset1);
+      tree base2 = get_addr_base_and_unit_offset (src, &offset2);
+      poly_int64 size = tree_to_poly_int64 (len);
+      /* If the bases are 2 different decls,
+	 then there can be no overlapping.  */
+      if (base1 && base2
+	  && DECL_P (base1) && DECL_P (base2)
+	  && base1 != base2)
+	;
+      /* If we can't figure out the base or the bases are
+	 not equal then fall back to an alignment check.  */
+      else if (!base1
+	       || !base2
+	       || !operand_equal_p (base1, base2))
+	{
+	  unsigned int align1 = get_object_alignment (src);
+	  unsigned int align2 = get_object_alignment (dest2);
+	  align1 /= BITS_PER_UNIT;
+	  align2 /= BITS_PER_UNIT;
+	  /* If the alignment of either object is less
+	     than the size then there is a possibility
+	     of overlapping.  */
+	  if (maybe_lt (align1, size)
+	      || maybe_lt (align2, size))
+	    return;
+	}
+      /* Make sure [offset1, offset1 + len - 1] does
+	 not overlap with [offset2, offset2 + len - 1],
+	 it is ok if they are at the same location though.  */
+      else if (ranges_maybe_overlap_p (offset1, size, offset2, size)
+	  && !known_eq (offset2, offset1))
+	return;
+    }
 
   if (dump_file && (dump_flags & TDF_DETAILS))
     {
@@ -1477,13 +1683,12 @@ optimize_agr_copyprop_1 (gimple *stmt, gimple *use_stmt,
   if (maybe_clean_or_replace_eh_stmt (orig_stmt, use_stmt))
     bitmap_set_bit (to_purge, gimple_bb (stmt)->index);
   statistics_counter_event (cfun, "copy prop for aggregate", 1);
-  return true;
 }
 
 /* Helper function for optimize_agr_copyprop_1, propagate aggregates
    into the arguments of USE_STMT if the argument matches with DEST;
    replacing it with SRC.  */
-static bool
+static void
 optimize_agr_copyprop_arg (gimple *defstmt, gcall *call,
 			   tree dest, tree src)
 {
@@ -1495,8 +1700,10 @@ optimize_agr_copyprop_arg (gimple *defstmt, gcall *call,
 	  || is_gimple_min_invariant (*argptr)
 	  || TYPE_VOLATILE (TREE_TYPE (*argptr)))
 	continue;
-      if (!operand_equal_p (*argptr, dest, 0))
+      tree newsrc = new_src_based_on_copy (*argptr, dest, src);
+      if (!newsrc)
 	continue;
+
       if (dump_file && (dump_flags & TDF_DETAILS))
 	{
 	  fprintf (dump_file, "Simplified\n  ");
@@ -1504,7 +1711,7 @@ optimize_agr_copyprop_arg (gimple *defstmt, gcall *call,
 	  fprintf (dump_file, "after previous\n  ");
 	  print_gimple_stmt (dump_file, defstmt, 0, dump_flags);
 	}
-      *argptr = unshare_expr (src);
+      *argptr = unshare_expr (newsrc);
       changed = true;
       if (dump_file && (dump_flags & TDF_DETAILS))
 	{
@@ -1514,7 +1721,6 @@ optimize_agr_copyprop_arg (gimple *defstmt, gcall *call,
     }
   if (changed)
     update_stmt (call);
-  return changed;
 }
 
 /* Optimizes
@@ -1523,7 +1729,7 @@ optimize_agr_copyprop_arg (gimple *defstmt, gcall *call,
    into
    DEST = SRC;
    DEST2 = SRC;
-   GSIP is the first statement and SRC is the common
+   STMT is the first statement and SRC is the common
    between the statements.
 
    Also optimizes:
@@ -1534,39 +1740,135 @@ optimize_agr_copyprop_arg (gimple *defstmt, gcall *call,
    call_func(..., SRC, ...);
 
 */
-static bool
-optimize_agr_copyprop (gimple_stmt_iterator *gsip)
+static void
+optimize_agr_copyprop (gimple *stmt)
 {
-  gimple *stmt = gsi_stmt (*gsip);
   if (gimple_has_volatile_ops (stmt))
-    return false;
+    return;
 
   /* Can't prop if the statement could throw.  */
   if (stmt_could_throw_p (cfun, stmt))
-    return false;
+    return;
 
   tree dest = gimple_assign_lhs (stmt);
   tree src = gimple_assign_rhs1 (stmt);
   /* If the statement is `src = src;` then ignore it. */
-  if (operand_equal_p (dest, src, 0))
-    return false;
+  if (same_for_assignment (dest, src))
+    return;
 
   tree vdef = gimple_vdef (stmt);
   imm_use_iterator iter;
   gimple *use_stmt;
-  bool changed = false;
   FOR_EACH_IMM_USE_STMT (use_stmt, iter, vdef)
     {
       if (gimple_assign_load_p (use_stmt)
-	  && gimple_store_p (use_stmt)
-	  && optimize_agr_copyprop_1 (stmt, use_stmt, dest, src))
-	changed = true;
-      else if (is_gimple_call (use_stmt)
-	       && optimize_agr_copyprop_arg (stmt, as_a<gcall*>(use_stmt),
-					     dest, src))
-	changed = true;
+	  && gimple_store_p (use_stmt))
+	optimize_agr_copyprop_1 (stmt, use_stmt, dest, src);
+      else if (is_gimple_call (use_stmt))
+	optimize_agr_copyprop_arg (stmt, as_a<gcall*>(use_stmt), dest, src);
     }
-  return changed;
+}
+
+/* Simple DSE of the lhs from a clobber STMT.
+   This is used mostly to clean up from optimize_agr_copyprop and
+   to remove (exactly one) extra copy that might later on confuse SRA.
+   An example is:
+   ;; write to a and such.
+   b = a; // This statement is to be removed
+   b = {CLOBBER};
+   SRA will totally scalarize b (which means also a) here for the extra copy
+   which is not something welcomed. So removing the copy will
+   allow SRA to move the scalarization of a further down or not at all.
+   */
+static void
+do_simple_agr_dse (gassign *stmt, bool full_walk)
+{
+  /* Don't do this while in -Og as we want to keep around the copy
+     for debuggability.  */
+  if (optimize_debug)
+    return;
+  ao_ref read;
+  basic_block bb = gimple_bb (stmt);
+  tree lhs = gimple_assign_lhs (stmt);
+  /* Only handle clobbers of a full decl.  */
+  if (!DECL_P (lhs))
+    return;
+  ao_ref_init (&read, lhs);
+  tree vuse = gimple_vuse (stmt);
+  unsigned limit = full_walk ? param_sccvn_max_alias_queries_per_access : 4;
+  while (limit)
+    {
+      gimple *ostmt = SSA_NAME_DEF_STMT (vuse);
+      /* Don't handle phis, just declare to be done. */
+      if (is_a<gphi*>(ostmt) || gimple_nop_p (ostmt))
+	break;
+      basic_block obb = gimple_bb (ostmt);
+      /* If the clobber is not fully dominating the statement define,
+	 then it is not "simple" to detect if the define is fully clobbered.  */
+      if (obb != bb && !dominated_by_p (CDI_DOMINATORS, bb, obb))
+	return;
+      gimple *use_stmt;
+      imm_use_iterator iter;
+      FOR_EACH_IMM_USE_STMT (use_stmt, iter, gimple_vdef (ostmt))
+	{
+	  basic_block ubb = gimple_bb (use_stmt);
+	  if (stmt == use_stmt)
+	    continue;
+	  /* The use needs to be dominating the clobber. */
+	  if ((ubb != bb && !dominated_by_p (CDI_DOMINATORS, bb, ubb))
+	      || ref_maybe_used_by_stmt_p (use_stmt, &read, false))
+	    return;
+	  /* Count the above alias lookup towards the limit. */
+	  limit--;
+	  if (limit == 0)
+	    return;
+	}
+      vuse = gimple_vuse (ostmt);
+
+      /* This an assignment store to the clobbered decl,
+	 then maybe remove it. A call is not handled here as
+	 the rhs will not make a difference for SRA. */
+      if (is_a <gassign*>(ostmt)
+	  && gimple_store_p (ostmt)
+	  && !gimple_clobber_p (ostmt)
+	  && lhs == gimple_assign_lhs (ostmt))
+	{
+	  /* Don't remove stores/statements that are needed for non-call
+	      eh to work.  */
+	  if (stmt_unremovable_because_of_non_call_eh_p (cfun, ostmt))
+	    return;
+	  /* If we delete a stmt that could throw, mark the block
+	     in to_purge to cleanup afterwards.  */
+	  if (stmt_could_throw_p (cfun, ostmt))
+	    bitmap_set_bit (to_purge, obb->index);
+	  gimple_stmt_iterator gsi = gsi_for_stmt (ostmt);
+	  if (dump_file && (dump_flags & TDF_DETAILS))
+	    {
+	      fprintf (dump_file, "Removing dead store stmt ");
+	      print_gimple_stmt (dump_file, ostmt, 0);
+	      fprintf (dump_file, "\n");
+	    }
+	  unlink_stmt_vdef (ostmt);
+	  release_defs (ostmt);
+	  gsi_remove (&gsi, true);
+	  statistics_counter_event (cfun, "delete dead store", 1);
+	  /* Only remove the first store previous statement. */
+	  return;
+	}
+      /* If the statement uses or maybe writes to the decl,
+	 then nothing is to be removed. Don't know if the write
+	 to the decl is partial write or a full one so the need
+	 to stop.
+	 e.g.
+	 b.c = a;
+	   Easier to stop here rather than do a full partial
+	   dse of this statement.
+	 b = {CLOBBER}; */
+      if (stmt_may_clobber_ref_p_1 (ostmt, &read, false)
+	  || ref_maybe_used_by_stmt_p (ostmt, &read, false))
+	return;
+      limit--;
+    }
 }
 
 /* Optimizes builtin memcmps for small constant sizes.
@@ -1618,8 +1920,16 @@ simplify_builtin_memcmp (gimple_stmt_iterator *gsi_p, gcall *stmt)
 	  tree ptrtype = build_pointer_type_for_mode (char_type_node,
 						      ptr_mode, true);
 	  off = build_int_cst (ptrtype, 0);
-	  arg1 = build2_loc (loc, MEM_REF, type, arg1, off);
-	  arg2 = build2_loc (loc, MEM_REF, type, arg2, off);
+
+	  /* Create unaligned types if needed. */
+	  tree type1 = type, type2 = type;
+	  if (TYPE_ALIGN (type1) > align1)
+	    type1 = build_aligned_type (type1, align1);
+	  if (TYPE_ALIGN (type2) > align2)
+	    type2 = build_aligned_type (type2, align2);
+
+	  arg1 = build2_loc (loc, MEM_REF, type1, arg1, off);
+	  arg2 = build2_loc (loc, MEM_REF, type2, arg2, off);
 	  tree tem1 = fold_const_aggregate_ref (arg1);
 	  if (tem1)
 	    arg1 = tem1;
@@ -1634,7 +1944,404 @@ simplify_builtin_memcmp (gimple_stmt_iterator *gsi_p, gcall *stmt)
 	  return true;
 	}
     }
-  return false;
+
+  /* Replace memcmp with memcmp_eq if the above fails. */
+  if (DECL_FUNCTION_CODE (gimple_call_fndecl (stmt)) == BUILT_IN_MEMCMP_EQ)
+    return false;
+  if (!fold_before_rtl_expansion_p ())
+    return false;
+  gimple_call_set_fndecl (stmt, builtin_decl_explicit (BUILT_IN_MEMCMP_EQ));
+  update_stmt (stmt);
+  return true;
+}
+
+/* Optimizes builtin memchrs for small constant sizes with a const string.
+   GSI_P is the GSI for the call. STMT is the call itself.
+   */
+
+static bool
+simplify_builtin_memchr (gimple_stmt_iterator *gsi_p, gcall *stmt)
+{
+  if (CHAR_BIT != 8 || BITS_PER_UNIT != 8)
+    return false;
+
+  if (gimple_call_num_args (stmt) != 3)
+    return false;
+
+  tree res = gimple_call_lhs (stmt);
+  if (!res || !use_in_zero_equality (res))
+    return false;
+
+  tree ptr = gimple_call_arg (stmt, 0);
+  if (TREE_CODE (ptr) != ADDR_EXPR
+      || TREE_CODE (TREE_OPERAND (ptr, 0)) != STRING_CST)
+    return false;
+
+  unsigned HOST_WIDE_INT slen
+    = TREE_STRING_LENGTH (TREE_OPERAND (ptr, 0));
+  /* It must be a non-empty string constant.  */
+  if (slen < 2)
+    return false;
+
+  /* For -Os, only simplify strings with a single character.  */
+  if (!optimize_bb_for_speed_p (gimple_bb (stmt))
+      && slen > 2)
+    return false;
+
+  tree size = gimple_call_arg (stmt, 2);
+  /* Size must be a constant which is <= UNITS_PER_WORD and
+     <= the string length.  */
+  if (!tree_fits_uhwi_p (size))
+    return false;
+
+  unsigned HOST_WIDE_INT sz = tree_to_uhwi (size);
+  if (sz == 0 || sz > UNITS_PER_WORD || sz >= slen)
+    return false;
+
+  tree ch = gimple_call_arg (stmt, 1);
+  location_t loc = gimple_location (stmt);
+  if (!useless_type_conversion_p (char_type_node,
+				  TREE_TYPE (ch)))
+    ch = fold_convert_loc (loc, char_type_node, ch);
+  const char *p = TREE_STRING_POINTER (TREE_OPERAND (ptr, 0));
+  unsigned int isize = sz;
+  tree *op = XALLOCAVEC (tree, isize);
+  for (unsigned int i = 0; i < isize; i++)
+    {
+      op[i] = build_int_cst (char_type_node, p[i]);
+      op[i] = fold_build2_loc (loc, EQ_EXPR, boolean_type_node,
+			       op[i], ch);
+    }
+  for (unsigned int i = isize - 1; i >= 1; i--)
+    op[i - 1] = fold_convert_loc (loc, boolean_type_node,
+				  fold_build2_loc (loc,
+						   BIT_IOR_EXPR,
+						   boolean_type_node,
+						   op[i - 1],
+						   op[i]));
+  res = fold_convert_loc (loc, TREE_TYPE (res), op[0]);
+  gimplify_and_update_call_from_tree (gsi_p, res);
+  return true;
+}
+
+/* *GSI_P is a GIMPLE_CALL to a builtin function.
+   Optimize
+   memcpy (p, "abcd", 4); // STMT1
+   memset (p + 4, ' ', 3); // STMT2
+   into
+   memcpy (p, "abcd   ", 7);
+   call if the latter can be stored by pieces during expansion.
+*/
+
+static bool
+simplify_builtin_memcpy_memset (gimple_stmt_iterator *gsi_p, gcall *stmt2)
+{
+  if (gimple_call_num_args (stmt2) != 3
+      || gimple_call_lhs (stmt2)
+      || CHAR_BIT != 8
+      || BITS_PER_UNIT != 8)
+    return false;
+
+  tree vuse = gimple_vuse (stmt2);
+  if (vuse == NULL)
+    return false;
+  gimple *stmt1 = SSA_NAME_DEF_STMT (vuse);
+
+  tree callee1;
+  tree ptr1, src1, str1, off1, len1, lhs1;
+  tree ptr2 = gimple_call_arg (stmt2, 0);
+  tree val2 = gimple_call_arg (stmt2, 1);
+  tree len2 = gimple_call_arg (stmt2, 2);
+  tree diff, vdef, new_str_cst;
+  gimple *use_stmt;
+  unsigned int ptr1_align;
+  unsigned HOST_WIDE_INT src_len;
+  char *src_buf;
+  use_operand_p use_p;
+
+  if (!tree_fits_shwi_p (val2)
+      || !tree_fits_uhwi_p (len2)
+      || compare_tree_int (len2, 1024) == 1)
+    return false;
+
+  if (is_gimple_call (stmt1))
+    {
+      /* If first stmt is a call, it needs to be memcpy
+	 or mempcpy, with string literal as second argument and
+	 constant length.  */
+      callee1 = gimple_call_fndecl (stmt1);
+      if (callee1 == NULL_TREE
+	  || !fndecl_built_in_p (callee1, BUILT_IN_NORMAL)
+	  || gimple_call_num_args (stmt1) != 3)
+	return false;
+      if (DECL_FUNCTION_CODE (callee1) != BUILT_IN_MEMCPY
+	  && DECL_FUNCTION_CODE (callee1) != BUILT_IN_MEMPCPY)
+	return false;
+      ptr1 = gimple_call_arg (stmt1, 0);
+      src1 = gimple_call_arg (stmt1, 1);
+      len1 = gimple_call_arg (stmt1, 2);
+      lhs1 = gimple_call_lhs (stmt1);
+      if (!tree_fits_uhwi_p (len1))
+	return false;
+      str1 = string_constant (src1, &off1, NULL, NULL);
+      if (str1 == NULL_TREE)
+	return false;
+      if (!tree_fits_uhwi_p (off1)
+	  || compare_tree_int (off1, TREE_STRING_LENGTH (str1) - 1) > 0
+	  || compare_tree_int (len1, TREE_STRING_LENGTH (str1)
+				     - tree_to_uhwi (off1)) > 0
+	  || TREE_CODE (TREE_TYPE (str1)) != ARRAY_TYPE
+	  || TYPE_MODE (TREE_TYPE (TREE_TYPE (str1)))
+	     != TYPE_MODE (char_type_node))
+	return false;
+    }
+  else if (gimple_assign_single_p (stmt1))
+    {
+      /* Otherwise look for length 1 memcpy optimized into
+	 assignment.  */
+      ptr1 = gimple_assign_lhs (stmt1);
+      src1 = gimple_assign_rhs1 (stmt1);
+      if (TREE_CODE (ptr1) != MEM_REF
+	  || TYPE_MODE (TREE_TYPE (ptr1)) != TYPE_MODE (char_type_node)
+	  || !tree_fits_shwi_p (src1))
+	return false;
+      ptr1 = build_fold_addr_expr (ptr1);
+      STRIP_USELESS_TYPE_CONVERSION (ptr1);
+      callee1 = NULL_TREE;
+      len1 = size_one_node;
+      lhs1 = NULL_TREE;
+      off1 = size_zero_node;
+      str1 = NULL_TREE;
+    }
+  else
+    return false;
+
+  diff = constant_pointer_difference (ptr1, ptr2);
+  if (diff == NULL && lhs1 != NULL)
+    {
+      diff = constant_pointer_difference (lhs1, ptr2);
+      if (DECL_FUNCTION_CODE (callee1) == BUILT_IN_MEMPCPY
+	  && diff != NULL)
+	diff = size_binop (PLUS_EXPR, diff,
+			   fold_convert (sizetype, len1));
+    }
+  /* If the difference between the second and first destination pointer
+     is not constant, or is bigger than memcpy length, bail out.  */
+  if (diff == NULL
+      || !tree_fits_uhwi_p (diff)
+      || tree_int_cst_lt (len1, diff)
+      || compare_tree_int (diff, 1024) == 1)
+    return false;
+
+  /* Use maximum of difference plus memset length and memcpy length
+     as the new memcpy length, if it is too big, bail out.  */
+  src_len = tree_to_uhwi (diff);
+  src_len += tree_to_uhwi (len2);
+  if (src_len < tree_to_uhwi (len1))
+    src_len = tree_to_uhwi (len1);
+  if (src_len > 1024)
+    return false;
+
+  /* If mempcpy value is used elsewhere, bail out, as mempcpy
+     with bigger length will return different result.  */
+  if (lhs1 != NULL_TREE
+      && DECL_FUNCTION_CODE (callee1) == BUILT_IN_MEMPCPY
+      && (TREE_CODE (lhs1) != SSA_NAME
+	  || !single_imm_use (lhs1, &use_p, &use_stmt)
+	  || use_stmt != stmt2))
+    return false;
+
+  /* If anything reads memory in between memcpy and memset
+     call, the modified memcpy call might change it.  */
+  vdef = gimple_vdef (stmt1);
+  if (vdef != NULL
+      && (!single_imm_use (vdef, &use_p, &use_stmt)
+	  || use_stmt != stmt2))
+    return false;
+
+  ptr1_align = get_pointer_alignment (ptr1);
+  /* Construct the new source string literal.  */
+  src_buf = XALLOCAVEC (char, src_len + 1);
+  if (callee1)
+    memcpy (src_buf,
+	    TREE_STRING_POINTER (str1) + tree_to_uhwi (off1),
+	    tree_to_uhwi (len1));
+  else
+    src_buf[0] = tree_to_shwi (src1);
+  memset (src_buf + tree_to_uhwi (diff),
+	  tree_to_shwi (val2), tree_to_uhwi (len2));
+  src_buf[src_len] = '\0';
+  /* Neither builtin_strncpy_read_str nor builtin_memcpy_read_str
+     handle embedded '\0's.  */
+  if (strlen (src_buf) != src_len)
+    return false;
+  rtl_profile_for_bb (gimple_bb (stmt2));
+  /* If the new memcpy wouldn't be emitted by storing the literal
+     by pieces, this optimization might enlarge .rodata too much,
+     as commonly used string literals couldn't be shared any
+     longer.  */
+  if (!can_store_by_pieces (src_len,
+			    builtin_strncpy_read_str,
+			    src_buf, ptr1_align, false))
+    return false;
+
+  new_str_cst = build_string_literal (src_len, src_buf);
+  if (callee1)
+    {
+      /* If STMT1 is a mem{,p}cpy call, adjust it and remove
+	 memset call.  */
+      if (lhs1 && DECL_FUNCTION_CODE (callee1) == BUILT_IN_MEMPCPY)
+	gimple_call_set_lhs (stmt1, NULL_TREE);
+      gimple_call_set_arg (stmt1, 1, new_str_cst);
+      gimple_call_set_arg (stmt1, 2,
+			   build_int_cst (TREE_TYPE (len1), src_len));
+      update_stmt (stmt1);
+      unlink_stmt_vdef (stmt2);
+      gsi_replace (gsi_p, gimple_build_nop (), false);
+      fwprop_invalidate_lattice (gimple_get_lhs (stmt2));
+      release_defs (stmt2);
+      if (lhs1 && DECL_FUNCTION_CODE (callee1) == BUILT_IN_MEMPCPY)
+	{
+	  fwprop_invalidate_lattice (lhs1);
+	  release_ssa_name (lhs1);
+	}
+      return true;
+    }
+  else
+    {
+      /* Otherwise, if STMT1 is length 1 memcpy optimized into
+	 assignment, remove STMT1 and change memset call into
+	 memcpy call.  */
+      gimple_stmt_iterator gsi = gsi_for_stmt (stmt1);
+
+      if (!is_gimple_val (ptr1))
+	ptr1 = force_gimple_operand_gsi (gsi_p, ptr1, true, NULL_TREE,
+					 true, GSI_SAME_STMT);
+      tree fndecl = builtin_decl_explicit (BUILT_IN_MEMCPY);
+      gimple_call_set_fndecl (stmt2, fndecl);
+      gimple_call_set_fntype (stmt2,
+			      TREE_TYPE (fndecl));
+      gimple_call_set_arg (stmt2, 0, ptr1);
+      gimple_call_set_arg (stmt2, 1, new_str_cst);
+      gimple_call_set_arg (stmt2, 2,
+			   build_int_cst (TREE_TYPE (len2), src_len));
+      unlink_stmt_vdef (stmt1);
+      gsi_remove (&gsi, true);
+      fwprop_invalidate_lattice (gimple_get_lhs (stmt1));
+      release_defs (stmt1);
+      update_stmt (stmt2);
+      return false;
+    }
+}
+
+
+/* Try to optimize out __builtin_stack_restore.  Optimize it out
+   if there is another __builtin_stack_restore in the same basic
+   block and no calls or ASM_EXPRs are in between, or if this block's
+   only outgoing edge is to EXIT_BLOCK and there are no calls or
+   ASM_EXPRs after this __builtin_stack_restore.
+   Note restore right before a noreturn function is not needed.
+   And skip some cheap calls that will most likely become an instruction.
+   Restoring the stack before a call is important to be able to keep
+   stack usage down so that call does not run out of stack.  */
+
+
+static bool
+optimize_stack_restore (gimple_stmt_iterator *gsi, gimple *call)
+{
+  if (!fold_before_rtl_expansion_p ())
+    return false;
+  tree callee;
+  gimple *stmt;
+
+  basic_block bb = gsi_bb (*gsi);
+
+  if (gimple_call_num_args (call) != 1
+      || TREE_CODE (gimple_call_arg (call, 0)) != SSA_NAME
+      || !POINTER_TYPE_P (TREE_TYPE (gimple_call_arg (call, 0))))
+    return false;
+
+  gimple_stmt_iterator i = *gsi;
+  for (gsi_next (&i); !gsi_end_p (i); gsi_next (&i))
+    {
+      stmt = gsi_stmt (i);
+      if (is_a<gasm*> (stmt))
+	return false;
+      gcall *call = dyn_cast<gcall*>(stmt);
+      if (!call)
+	continue;
+
+      /* We can remove the restore in front of noreturn
+	 calls.  Since the restore will happen either
+	 via an unwind/longjmp or not at all. */
+      if (gimple_call_noreturn_p (call))
+	break;
+
+      /* Internal calls are ok, to bypass
+	 check first since fndecl will be null. */
+      if (gimple_call_internal_p (call))
+	continue;
+
+      callee = gimple_call_fndecl (call);
+      /* Non-builtin calls are not ok. */
+      if (!callee
+	  || !fndecl_built_in_p (callee))
+	return false;
+
+      /* Do not remove stack updates before strub leave.  */
+      if (fndecl_built_in_p (callee, BUILT_IN___STRUB_LEAVE)
+	  /* Alloca calls are not ok either. */
+	  || fndecl_builtin_alloc_p (callee))
+	return false;
+
+      if (fndecl_built_in_p (callee, BUILT_IN_STACK_RESTORE))
+	goto second_stack_restore;
+
+      /* If not a simple or inexpensive builtin, then it is not ok either. */
+      if (!is_simple_builtin (callee)
+	  && !is_inexpensive_builtin (callee))
+	return false;
+    }
+
+  /* Allow one successor of the exit block, or zero successors.  */
+  switch (EDGE_COUNT (bb->succs))
+    {
+    case 0:
+      break;
+    case 1:
+      if (single_succ_edge (bb)->dest != EXIT_BLOCK_PTR_FOR_FN (cfun))
+	return false;
+      break;
+    default:
+      return false;
+    }
+ second_stack_restore:
+
+  /* If there's exactly one use, then zap the call to __builtin_stack_save.
+     If there are multiple uses, then the last one should remove the call.
+     In any case, whether the call to __builtin_stack_save can be removed
+     or not is irrelevant to removing the call to __builtin_stack_restore.  */
+  if (has_single_use (gimple_call_arg (call, 0)))
+    {
+      gimple *stack_save = SSA_NAME_DEF_STMT (gimple_call_arg (call, 0));
+      if (is_gimple_call (stack_save))
+	{
+	  callee = gimple_call_fndecl (stack_save);
+	  if (callee && fndecl_built_in_p (callee, BUILT_IN_STACK_SAVE))
+	    {
+	      gimple_stmt_iterator stack_save_gsi;
+	      tree rhs;
+
+	      stack_save_gsi = gsi_for_stmt (stack_save);
+	      rhs = build_int_cst (TREE_TYPE (gimple_call_arg (call, 0)), 0);
+	      replace_call_with_value (&stack_save_gsi, rhs);
+	    }
+	}
+    }
+
+  /* No effect, so the statement will be deleted.  */
+  replace_call_with_value (gsi, NULL_TREE);
+  return true;
 }
 
 /* *GSI_P is a GIMPLE_CALL to a builtin function.
@@ -1662,282 +2369,28 @@ simplify_builtin_memcmp (gimple_stmt_iterator *gsi_p, gcall *stmt)
 static bool
 simplify_builtin_call (gimple_stmt_iterator *gsi_p, tree callee2, bool full_walk)
 {
-  gimple *stmt1, *stmt2 = gsi_stmt (*gsi_p);
+  gimple *stmt2 = gsi_stmt (*gsi_p);
   enum built_in_function other_atomic = END_BUILTINS;
   enum tree_code atomic_op = ERROR_MARK;
-  tree vuse = gimple_vuse (stmt2);
-  if (vuse == NULL)
-    return false;
-  stmt1 = SSA_NAME_DEF_STMT (vuse);
-
-  tree res;
 
   switch (DECL_FUNCTION_CODE (callee2))
     {
+    case BUILT_IN_STACK_RESTORE:
+      return optimize_stack_restore (gsi_p, as_a<gcall*>(stmt2));
     case BUILT_IN_MEMCMP:
     case BUILT_IN_MEMCMP_EQ:
       return simplify_builtin_memcmp (gsi_p, as_a<gcall*>(stmt2));
     case BUILT_IN_MEMCHR:
-      if (gimple_call_num_args (stmt2) == 3
-	  && (res = gimple_call_lhs (stmt2)) != nullptr
-	  && use_in_zero_equality (res) != nullptr
-	  && CHAR_BIT == 8
-	  && BITS_PER_UNIT == 8)
-	{
-	  tree ptr = gimple_call_arg (stmt2, 0);
-	  if (TREE_CODE (ptr) != ADDR_EXPR
-	      || TREE_CODE (TREE_OPERAND (ptr, 0)) != STRING_CST)
-	    break;
-	  unsigned HOST_WIDE_INT slen
-	    = TREE_STRING_LENGTH (TREE_OPERAND (ptr, 0));
-	  /* It must be a non-empty string constant.  */
-	  if (slen < 2)
-	    break;
-	  /* For -Os, only simplify strings with a single character.  */
-	  if (!optimize_bb_for_speed_p (gimple_bb (stmt2))
-	      && slen > 2)
-	    break;
-	  tree size = gimple_call_arg (stmt2, 2);
-	  /* Size must be a constant which is <= UNITS_PER_WORD and
-	     <= the string length.  */
-	  if (TREE_CODE (size) != INTEGER_CST)
-	    break;
-
-	  if (!tree_fits_uhwi_p (size))
-	    break;
-
-	  unsigned HOST_WIDE_INT sz = tree_to_uhwi (size);
-	  if (sz == 0 || sz > UNITS_PER_WORD || sz >= slen)
-	    break;
-
-	  tree ch = gimple_call_arg (stmt2, 1);
-	  location_t loc = gimple_location (stmt2);
-	  if (!useless_type_conversion_p (char_type_node,
-					  TREE_TYPE (ch)))
-	    ch = fold_convert_loc (loc, char_type_node, ch);
-	  const char *p = TREE_STRING_POINTER (TREE_OPERAND (ptr, 0));
-	  unsigned int isize = sz;
-	  tree *op = XALLOCAVEC (tree, isize);
-	  for (unsigned int i = 0; i < isize; i++)
-	    {
-	      op[i] = build_int_cst (char_type_node, p[i]);
-	      op[i] = fold_build2_loc (loc, EQ_EXPR, boolean_type_node,
-				       op[i], ch);
-	    }
-	  for (unsigned int i = isize - 1; i >= 1; i--)
-	    op[i - 1] = fold_convert_loc (loc, boolean_type_node,
-					  fold_build2_loc (loc,
-							   BIT_IOR_EXPR,
-							   boolean_type_node,
-							   op[i - 1],
-							   op[i]));
-	  res = fold_convert_loc (loc, TREE_TYPE (res), op[0]);
-	  gimplify_and_update_call_from_tree (gsi_p, res);
-	  return true;
-	}
-      break;
+      return simplify_builtin_memchr (gsi_p, as_a<gcall*>(stmt2));
 
     case BUILT_IN_MEMSET:
       if (gimple_call_num_args (stmt2) == 3)
 	{
 	  /* Try to prop the zeroing/value of the memset to memcpy
 	     if the dest is an address and the value is a constant. */
-	  if (optimize_aggr_zeroprop (gsi_p, full_walk))
-	    return true;
+	  optimize_aggr_zeroprop (stmt2, full_walk);
 	}
-      if (gimple_call_num_args (stmt2) != 3
-	  || gimple_call_lhs (stmt2)
-	  || CHAR_BIT != 8
-	  || BITS_PER_UNIT != 8)
-	break;
-      else
-	{
-	  tree callee1;
-	  tree ptr1, src1, str1, off1, len1, lhs1;
-	  tree ptr2 = gimple_call_arg (stmt2, 0);
-	  tree val2 = gimple_call_arg (stmt2, 1);
-	  tree len2 = gimple_call_arg (stmt2, 2);
-	  tree diff, vdef, new_str_cst;
-	  gimple *use_stmt;
-	  unsigned int ptr1_align;
-	  unsigned HOST_WIDE_INT src_len;
-	  char *src_buf;
-	  use_operand_p use_p;
-
-	  if (!tree_fits_shwi_p (val2)
-	      || !tree_fits_uhwi_p (len2)
-	      || compare_tree_int (len2, 1024) == 1)
-	    break;
-	  if (is_gimple_call (stmt1))
-	    {
-	      /* If first stmt is a call, it needs to be memcpy
-		 or mempcpy, with string literal as second argument and
-		 constant length.  */
-	      callee1 = gimple_call_fndecl (stmt1);
-	      if (callee1 == NULL_TREE
-		  || !fndecl_built_in_p (callee1, BUILT_IN_NORMAL)
-		  || gimple_call_num_args (stmt1) != 3)
-		break;
-	      if (DECL_FUNCTION_CODE (callee1) != BUILT_IN_MEMCPY
-		  && DECL_FUNCTION_CODE (callee1) != BUILT_IN_MEMPCPY)
-		break;
-	      ptr1 = gimple_call_arg (stmt1, 0);
-	      src1 = gimple_call_arg (stmt1, 1);
-	      len1 = gimple_call_arg (stmt1, 2);
-	      lhs1 = gimple_call_lhs (stmt1);
-	      if (!tree_fits_uhwi_p (len1))
-		break;
-	      str1 = string_constant (src1, &off1, NULL, NULL);
-	      if (str1 == NULL_TREE)
-		break;
-	      if (!tree_fits_uhwi_p (off1)
-		  || compare_tree_int (off1, TREE_STRING_LENGTH (str1) - 1) > 0
-		  || compare_tree_int (len1, TREE_STRING_LENGTH (str1)
-					     - tree_to_uhwi (off1)) > 0
-		  || TREE_CODE (TREE_TYPE (str1)) != ARRAY_TYPE
-		  || TYPE_MODE (TREE_TYPE (TREE_TYPE (str1)))
-		     != TYPE_MODE (char_type_node))
-		break;
-	    }
-	  else if (gimple_assign_single_p (stmt1))
-	    {
-	      /* Otherwise look for length 1 memcpy optimized into
-		 assignment.  */
-    	      ptr1 = gimple_assign_lhs (stmt1);
-	      src1 = gimple_assign_rhs1 (stmt1);
-	      if (TREE_CODE (ptr1) != MEM_REF
-		  || TYPE_MODE (TREE_TYPE (ptr1)) != TYPE_MODE (char_type_node)
-		  || !tree_fits_shwi_p (src1))
-		break;
-	      ptr1 = build_fold_addr_expr (ptr1);
-	      STRIP_USELESS_TYPE_CONVERSION (ptr1);
-	      callee1 = NULL_TREE;
-	      len1 = size_one_node;
-	      lhs1 = NULL_TREE;
-	      off1 = size_zero_node;
-	      str1 = NULL_TREE;
-	    }
-	  else
-	    break;
-
-	  diff = constant_pointer_difference (ptr1, ptr2);
-	  if (diff == NULL && lhs1 != NULL)
-	    {
-	      diff = constant_pointer_difference (lhs1, ptr2);
-	      if (DECL_FUNCTION_CODE (callee1) == BUILT_IN_MEMPCPY
-		  && diff != NULL)
-		diff = size_binop (PLUS_EXPR, diff,
-				   fold_convert (sizetype, len1));
-	    }
-	  /* If the difference between the second and first destination pointer
-	     is not constant, or is bigger than memcpy length, bail out.  */
-	  if (diff == NULL
-	      || !tree_fits_uhwi_p (diff)
-	      || tree_int_cst_lt (len1, diff)
-	      || compare_tree_int (diff, 1024) == 1)
-	    break;
-
-	  /* Use maximum of difference plus memset length and memcpy length
-	     as the new memcpy length, if it is too big, bail out.  */
-	  src_len = tree_to_uhwi (diff);
-	  src_len += tree_to_uhwi (len2);
-	  if (src_len < tree_to_uhwi (len1))
-	    src_len = tree_to_uhwi (len1);
-	  if (src_len > 1024)
-	    break;
-
-	  /* If mempcpy value is used elsewhere, bail out, as mempcpy
-	     with bigger length will return different result.  */
-	  if (lhs1 != NULL_TREE
-	      && DECL_FUNCTION_CODE (callee1) == BUILT_IN_MEMPCPY
-	      && (TREE_CODE (lhs1) != SSA_NAME
-		  || !single_imm_use (lhs1, &use_p, &use_stmt)
-		  || use_stmt != stmt2))
-	    break;
-
-	  /* If anything reads memory in between memcpy and memset
-	     call, the modified memcpy call might change it.  */
-	  vdef = gimple_vdef (stmt1);
-	  if (vdef != NULL
-	      && (!single_imm_use (vdef, &use_p, &use_stmt)
-		  || use_stmt != stmt2))
-	    break;
-
-	  ptr1_align = get_pointer_alignment (ptr1);
-	  /* Construct the new source string literal.  */
-	  src_buf = XALLOCAVEC (char, src_len + 1);
-	  if (callee1)
-	    memcpy (src_buf,
-		    TREE_STRING_POINTER (str1) + tree_to_uhwi (off1),
-		    tree_to_uhwi (len1));
-	  else
-	    src_buf[0] = tree_to_shwi (src1);
-	  memset (src_buf + tree_to_uhwi (diff),
-		  tree_to_shwi (val2), tree_to_uhwi (len2));
-	  src_buf[src_len] = '\0';
-	  /* Neither builtin_strncpy_read_str nor builtin_memcpy_read_str
-	     handle embedded '\0's.  */
-	  if (strlen (src_buf) != src_len)
-	    break;
-	  rtl_profile_for_bb (gimple_bb (stmt2));
-	  /* If the new memcpy wouldn't be emitted by storing the literal
-	     by pieces, this optimization might enlarge .rodata too much,
-	     as commonly used string literals couldn't be shared any
-	     longer.  */
-	  if (!can_store_by_pieces (src_len,
-				    builtin_strncpy_read_str,
-				    src_buf, ptr1_align, false))
-	    break;
-
-	  new_str_cst = build_string_literal (src_len, src_buf);
-	  if (callee1)
-	    {
-	      /* If STMT1 is a mem{,p}cpy call, adjust it and remove
-		 memset call.  */
-	      if (lhs1 && DECL_FUNCTION_CODE (callee1) == BUILT_IN_MEMPCPY)
-		gimple_call_set_lhs (stmt1, NULL_TREE);
-	      gimple_call_set_arg (stmt1, 1, new_str_cst);
-	      gimple_call_set_arg (stmt1, 2,
-				   build_int_cst (TREE_TYPE (len1), src_len));
-	      update_stmt (stmt1);
-	      unlink_stmt_vdef (stmt2);
-	      gsi_replace (gsi_p, gimple_build_nop (), false);
-	      fwprop_invalidate_lattice (gimple_get_lhs (stmt2));
-	      release_defs (stmt2);
-	      if (lhs1 && DECL_FUNCTION_CODE (callee1) == BUILT_IN_MEMPCPY)
-		{
-		  fwprop_invalidate_lattice (lhs1);
-		  release_ssa_name (lhs1);
-		}
-	      return true;
-	    }
-	  else
-	    {
-	      /* Otherwise, if STMT1 is length 1 memcpy optimized into
-		 assignment, remove STMT1 and change memset call into
-		 memcpy call.  */
-	      gimple_stmt_iterator gsi = gsi_for_stmt (stmt1);
-
-	      if (!is_gimple_val (ptr1))
-		ptr1 = force_gimple_operand_gsi (gsi_p, ptr1, true, NULL_TREE,
-						 true, GSI_SAME_STMT);
-	      tree fndecl = builtin_decl_explicit (BUILT_IN_MEMCPY);
-	      gimple_call_set_fndecl (stmt2, fndecl);
-	      gimple_call_set_fntype (as_a <gcall *> (stmt2),
-				      TREE_TYPE (fndecl));
-	      gimple_call_set_arg (stmt2, 0, ptr1);
-	      gimple_call_set_arg (stmt2, 1, new_str_cst);
-	      gimple_call_set_arg (stmt2, 2,
-				   build_int_cst (TREE_TYPE (len2), src_len));
-	      unlink_stmt_vdef (stmt1);
-	      gsi_remove (&gsi, true);
-	      fwprop_invalidate_lattice (gimple_get_lhs (stmt1));
-	      release_defs (stmt1);
-	      update_stmt (stmt2);
-	      return false;
-	    }
-	}
-      break;
+      return simplify_builtin_memcpy_memset (gsi_p, as_a<gcall*>(stmt2));
 
  #define CASE_ATOMIC(NAME, OTHER, OP) \
     case BUILT_IN_##NAME##_1:						\
@@ -2944,17 +3397,6 @@ simplify_count_zeroes (gimple_stmt_iterator *gsi)
   gimple_seq_add_stmt (&seq, call);
 
   tree prev_lhs = gimple_call_lhs (call);
-  if (fn == IFN_CLZ)
-    {
-      g = gimple_build_assign (make_ssa_name (integer_type_node),
-			       MINUS_EXPR,
-			       build_int_cst (integer_type_node,
-					      input_bits - 1),
-			       prev_lhs);
-      gimple_set_location (g, gimple_location (stmt));
-      gimple_seq_add_stmt (&seq, g);
-      prev_lhs = gimple_assign_lhs (g);
-    }
 
   if (zero_ok && zero_val == ctz_val)
     ;
@@ -2980,6 +3422,18 @@ simplify_count_zeroes (gimple_stmt_iterator *gsi)
       g = gimple_build_assign (make_ssa_name (integer_type_node),
 			       COND_EXPR, cond,
 			       build_int_cst (integer_type_node, zero_val),
+			       prev_lhs);
+      gimple_set_location (g, gimple_location (stmt));
+      gimple_seq_add_stmt (&seq, g);
+      prev_lhs = gimple_assign_lhs (g);
+    }
+
+  if (fn == IFN_CLZ)
+    {
+      g = gimple_build_assign (make_ssa_name (integer_type_node),
+			       MINUS_EXPR,
+			       build_int_cst (integer_type_node,
+					      input_bits - 1),
 			       prev_lhs);
       gimple_set_location (g, gimple_location (stmt));
       gimple_seq_add_stmt (&seq, g);
@@ -4555,6 +5009,49 @@ public:
   bool m_full_walk = false;
 }; // class pass_forwprop
 
+/* Attemp to make the BB block of __builtin_unreachable unreachable by changing
+   the incoming jumps.  Return true if at least one jump was changed.  */
+
+static bool
+optimize_unreachable (basic_block bb)
+{
+  gimple_stmt_iterator gsi;
+  gimple *stmt;
+  edge_iterator ei;
+  edge e;
+  bool ret;
+
+  ret = false;
+  FOR_EACH_EDGE (e, ei, bb->preds)
+    {
+      gsi = gsi_last_bb (e->src);
+      if (gsi_end_p (gsi))
+	continue;
+
+      stmt = gsi_stmt (gsi);
+      if (gcond *cond_stmt = dyn_cast <gcond *> (stmt))
+	{
+	  if (e->flags & EDGE_TRUE_VALUE)
+	    gimple_cond_make_false (cond_stmt);
+	  else if (e->flags & EDGE_FALSE_VALUE)
+	    gimple_cond_make_true (cond_stmt);
+	  else
+	    gcc_unreachable ();
+	  update_stmt (cond_stmt);
+	}
+      else
+	{
+	  /* Todo: handle other cases.  Note that unreachable switch case
+	     statements have already been removed.  */
+	  continue;
+	}
+
+      ret = true;
+    }
+
+  return ret;
+}
+
 unsigned int
 pass_forwprop::execute (function *fun)
 {
@@ -4621,6 +5118,21 @@ pass_forwprop::execute (function *fun)
 	}
       if (!any)
 	continue;
+
+      /* Remove conditions that go directly to unreachable when this is the last forwprop.  */
+      if (last_p
+	  && !(flag_sanitize & SANITIZE_UNREACHABLE))
+	{
+	  gimple_stmt_iterator gsi;
+	  gsi = gsi_start_nondebug_after_labels_bb (bb);
+	  if (!gsi_end_p (gsi)
+	      && gimple_call_builtin_p (*gsi, BUILT_IN_UNREACHABLE)
+	      && optimize_unreachable (bb))
+	    {
+	      cfg_changed = true;
+	      continue;
+	    }
+	}
 
       /* Record degenerate PHIs in the lattice.  */
       for (gphi_iterator si = gsi_start_phis (bb); !gsi_end_p (si);
@@ -5042,7 +5554,8 @@ pass_forwprop::execute (function *fun)
 	  do
 	    {
 	      gimple *orig_stmt = stmt = gsi_stmt (gsi);
-	      bool was_noreturn = (is_gimple_call (stmt)
+	      bool was_call = is_gimple_call (stmt);
+	      bool was_noreturn = (was_call
 				   && gimple_call_noreturn_p (stmt));
 	      changed = false;
 
@@ -5054,6 +5567,13 @@ pass_forwprop::execute (function *fun)
 	      if (fold_stmt (&gsi, fwprop_ssa_val, simple_dce_worklist))
 		{
 		  changed = true;
+		  /* There is no updating of the address
+		     taken after the last forwprop so update
+		     the addresses when a folding happened to a call.
+		     The va_* builtins can remove taking of the address so
+		     can the sincos->cexpi transformation.  See PR 39643 and PR 20983. */
+		  if (was_call && last_p)
+		    todoflags |= TODO_update_address_taken;
 		  stmt = gsi_stmt (gsi);
 		  /* Cleanup the CFG if we simplified a condition to
 		     true or false.  */
@@ -5077,19 +5597,15 @@ pass_forwprop::execute (function *fun)
 		  {
 		    tree rhs1 = gimple_assign_rhs1 (stmt);
 		    enum tree_code code = gimple_assign_rhs_code (stmt);
-		    if (gimple_store_p (stmt) && optimize_aggr_zeroprop (&gsi, full_walk))
+		    if (gimple_clobber_p (stmt))
+		      do_simple_agr_dse (as_a<gassign*>(stmt), full_walk);
+		    else if (gimple_store_p (stmt))
 		      {
-			changed = true;
-			break;
+			optimize_aggr_zeroprop (stmt, full_walk);
+			if (gimple_assign_load_p (stmt))
+			  optimize_agr_copyprop (stmt);
 		      }
-		    if (gimple_assign_load_p (stmt) && gimple_store_p (stmt)
-			&& optimize_agr_copyprop (&gsi))
-		      {
-			changed = true;
-			break;
-		      }
-
-		    if (TREE_CODE_CLASS (code) == tcc_comparison)
+		    else if (TREE_CODE_CLASS (code) == tcc_comparison)
 		      changed |= forward_propagate_into_comparison (&gsi);
 		    else if ((code == PLUS_EXPR
 			      || code == BIT_IOR_EXPR

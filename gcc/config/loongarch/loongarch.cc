@@ -1846,6 +1846,37 @@ loongarch_const_vector_shuffle_set_p (rtx op, machine_mode mode)
   return true;
 }
 
+/* Check if OP is a PARALLEL RTX with CONST_INT elements representing
+   the HIGH (high_p == TRUE) or LOW (high_p == FALSE) half of a vector
+   for mode MODE. Returns true if the pattern matches, false otherwise.  */
+
+bool
+loongarch_check_vect_par_cnst_half (rtx op, machine_mode mode, bool high_p)
+{
+  int nunits = XVECLEN (op, 0);
+  int nelts = GET_MODE_NUNITS (mode);
+
+  if (!known_eq (nelts, nunits * 2))
+    return false;
+
+  rtx first = XVECEXP (op, 0, 0);
+  if (!CONST_INT_P (first))
+    return false;
+
+  int base = high_p ? nelts / 2 : 0;
+  if (INTVAL (first) != base)
+    return false;
+
+  for (int i = 1; i < nunits; i++)
+    {
+      rtx elem = XVECEXP (op, 0, i);
+      if (!CONST_INT_P (elem) || INTVAL (elem) != INTVAL (first) + i)
+	return false;
+    }
+
+  return true;
+}
+
 rtx
 loongarch_const_vector_vrepli (rtx x, machine_mode mode)
 {
@@ -4141,6 +4172,19 @@ loongarch_rtx_costs (rtx x, machine_mode mode, int outer_code,
     default:
       return false;
     }
+}
+
+/* All CPUs prefer to avoid cross-lane operations so perform reductions
+   upper against lower halves up to LSX reg size.  */
+
+machine_mode
+loongarch_split_reduction (machine_mode mode)
+{
+  if (LSX_SUPPORTED_MODE_P (mode))
+    return mode;
+
+  return mode_for_vector (as_a <scalar_mode> (GET_MODE_INNER (mode)),
+			  GET_MODE_NUNITS (mode) / 2).require ();
 }
 
 /* Implement targetm.vectorize.builtin_vectorization_cost.  */
@@ -6495,8 +6539,7 @@ loongarch_print_operand (FILE *file, rtx op, int letter)
       break;
 
     case 't':
-      if (GET_MODE (op) != TImode
-	  || (op != CONST0_RTX (TImode) && code != REG))
+      if (!reg_or_0_operand (op, TImode))
 	{
 	  output_operand_lossage ("invalid use of '%%%c'", letter);
 	  break;
@@ -11059,7 +11102,6 @@ void loongarch_emit_swdivsf (rtx res, rtx a, rtx b, machine_mode mode)
 
 static bool
 loongarch_builtin_support_vector_misalignment (machine_mode mode,
-					       const_tree type,
 					       int misalignment,
 					       bool is_packed,
 					       bool is_gather_scatter)
@@ -11073,7 +11115,7 @@ loongarch_builtin_support_vector_misalignment (machine_mode mode,
       if (misalignment == -1)
 	return false;
     }
-  return default_builtin_support_vector_misalignment (mode, type, misalignment,
+  return default_builtin_support_vector_misalignment (mode, misalignment,
 						      is_packed,
 						      is_gather_scatter);
 }
@@ -11201,6 +11243,69 @@ loongarch_compute_pressure_classes (reg_class *classes)
   classes[i++] = FP_REGS;
   classes[i++] = FCC_REGS;
   return i;
+}
+
+/* Implement TARGET_CAN_INLINE_P.  Determine whether inlining the function
+   CALLER into the function CALLEE is safe.  Inlining should be rejected if
+   there is no always_inline attribute and the target options differ except
+   for differences in ISA extensions or performance tuning options like the
+   code model, TLS dialect, etc.  */
+
+static bool
+loongarch_can_inline_p (tree caller, tree callee)
+{
+  tree callee_tree = DECL_FUNCTION_SPECIFIC_TARGET (callee);
+  tree caller_tree = DECL_FUNCTION_SPECIFIC_TARGET (caller);
+
+  if (!callee_tree)
+    callee_tree = target_option_default_node;
+
+  if (!caller_tree)
+    caller_tree = target_option_default_node;
+
+  /* If both caller and callee have attributes, assume that if the
+     pointer is different, the two functions have different target
+     options since build_target_option_node uses a hash table for the
+     options.  */
+  if (callee_tree == caller_tree)
+    return true;
+
+  struct cl_target_option *callee_opts = TREE_TARGET_OPTION (callee_tree);
+  struct cl_target_option *caller_opts = TREE_TARGET_OPTION (caller_tree);
+
+  /* Callee and caller should have the same target options.  */
+  int callee_target_flags = callee_opts->x_target_flags;
+  int caller_target_flags = caller_opts->x_target_flags;
+
+  if (callee_target_flags != caller_target_flags)
+    return false;
+
+  /* If callee enables the isa extension that the caller does not enable,
+     inlining is disabled.  */
+  if (~caller_opts->x_la_isa_evolution
+      & callee_opts->x_la_isa_evolution)
+    return false;
+
+  /* If simd extensions are enabled for the callee but not for the caller,
+     inlining is disabled.  */
+  if ((caller_opts->x_la_opt_simd == ISA_EXT_NONE
+       && callee_opts->x_la_opt_simd != ISA_EXT_NONE)
+      || (caller_opts->x_la_opt_simd == ISA_EXT_SIMD_LSX
+	  && callee_opts->x_la_opt_simd == ISA_EXT_SIMD_LASX))
+    return false;
+
+  bool always_inline
+    = lookup_attribute ("always_inline", DECL_ATTRIBUTES (callee));
+
+  /* If the architectural features match up and the callee is always_inline
+     then the other attributes don't matter.  */
+  if (always_inline)
+    return true;
+
+  if (caller_opts->x_la_opt_cmodel != callee_opts->x_la_opt_cmodel)
+    return false;
+
+  return true;
 }
 
 /* Initialize the GCC target structure.  */
@@ -11335,6 +11440,10 @@ loongarch_compute_pressure_classes (reg_class *classes)
 #undef TARGET_VECTORIZE_AUTOVECTORIZE_VECTOR_MODES
 #define TARGET_VECTORIZE_AUTOVECTORIZE_VECTOR_MODES \
   loongarch_autovectorize_vector_modes
+
+#undef TARGET_VECTORIZE_SPLIT_REDUCTION
+#define TARGET_VECTORIZE_SPLIT_REDUCTION \
+  loongarch_split_reduction
 
 #undef TARGET_OPTAB_SUPPORTED_P
 #define TARGET_OPTAB_SUPPORTED_P loongarch_optab_supported_p
@@ -11482,6 +11591,9 @@ loongarch_compute_pressure_classes (reg_class *classes)
 
 #undef TARGET_COMPUTE_PRESSURE_CLASSES
 #define TARGET_COMPUTE_PRESSURE_CLASSES loongarch_compute_pressure_classes
+
+#undef TARGET_CAN_INLINE_P
+#define TARGET_CAN_INLINE_P loongarch_can_inline_p
 
 struct gcc_target targetm = TARGET_INITIALIZER;
 

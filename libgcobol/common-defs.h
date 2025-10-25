@@ -33,7 +33,13 @@
 #include <cassert>
 #include <cstdio>
 #include <cstdint>
+
+#include <algorithm>
 #include <list>
+#include <set>
+#include <vector>
+
+#include "encodings.h"
 
 #define COUNT_OF(X) (sizeof(X) / sizeof(X[0]))
 
@@ -79,26 +85,8 @@
     value is flagged negative by turning on the 0x10 bit, turning the 0xC0 to
     0xD0. */
 
-#define EBCDIC_MINUS (0x60)
-#define EBCDIC_PLUS  (0x4E)
-#define EBCDIC_ZERO  (0xF0)
-#define EBCDIC_NINE  (0xF9)
-
-#define PACKED_NYBBLE_PLUS     0x0C
-#define PACKED_NYBBLE_MINUS    0x0D
-#define PACKED_NYBBLE_UNSIGNED 0x0F
-
 #define NUMERIC_DISPLAY_SIGN_BIT_ASCII  0x40
-#define NUMERIC_DISPLAY_SIGN_BIT_EBCDIC 0x10
-
-#define NUMERIC_DISPLAY_SIGN_BIT (__gg__ebcdic_codeset_in_use ? \
-                                  NUMERIC_DISPLAY_SIGN_BIT_EBCDIC : \
-                                  NUMERIC_DISPLAY_SIGN_BIT_ASCII)
-
-#define SEPARATE_PLUS  (__gg__ebcdic_codeset_in_use ? EBCDIC_PLUS  : '+')
-#define SEPARATE_MINUS (__gg__ebcdic_codeset_in_use ? EBCDIC_MINUS : '-')
-#define ZONED_ZERO (__gg__ebcdic_codeset_in_use ? EBCDIC_ZERO : '0')
-#define ZONE_SIGNED_EBCDIC (0xC0)
+#define NUMERIC_DISPLAY_SIGN_BIT_EBCDIC 0x20
 
 #define LEVEL01 (1)
 #define LEVEL49 (49)
@@ -106,7 +94,6 @@
 
 // In the __gg__move_literala() call, we piggyback this bit onto the
 // cbl_round_t parameter, just to cut down on the number of parameters passed
-
 #define REFER_ALL_BIT 0x80
 
 // Other bits for handling MOVE ALL and so on.
@@ -142,6 +129,8 @@
  */
 typedef char cbl_name_t[64];
 
+typedef void (callback_t)();
+
 // Note that the field_type enum is duplicated in the source code for the
 // COBOL-aware GDB, and so any changes here (or there) have to be reflected
 // there (or here)
@@ -169,7 +158,6 @@ enum cbl_field_type_t {
   FldSwitch,
   FldDisplay,
   FldPointer,
-  FldBlob,
 };
 
 
@@ -211,7 +199,7 @@ enum cbl_field_attr_t : uint64_t {
   function_e        = 0x0000000100,
   quoted_e          = 0x0000000200,
   filler_e          = 0x0000000400,
-  _spare_e          = 0x0000000800, //
+  register_e        = 0x0000000800, // Data definition is found in constants.cc
   intermediate_e    = 0x0000001000, // Compiler-defined temporary variable
   embiggened_e      = 0x0000002000, // redefined numeric made 64-bit by USAGE POINTER
   all_alpha_e       = 0x0000004000, // FldAlphanumeric, but all A's
@@ -231,7 +219,7 @@ enum cbl_field_attr_t : uint64_t {
   leading_e         = 0x0004000000, // leading sign (signable_e alone means trailing)
   separate_e        = 0x0008000000, // separate sign
   envar_e           = 0x0010000000, // names an environment variable
-   dnu_1_e          = 0x0020000000, // unused: this attribute bit is available
+  encoded_e         = 0x0020000000, // data.initial matches codeset.encoding
   bool_encoded_e    = 0x0040000000, // data.initial is a boolean string
   hex_encoded_e     = 0x0080000000, // data.initial is a hex-encoded string
   depends_on_e      = 0x0100000000, // A group hierachy contains a DEPENDING_ON
@@ -263,7 +251,6 @@ enum cbl_figconst_t
     };
 #define FIGCONST_MASK (figconst_1_e|figconst_2_e|figconst_4_e)
 #define DATASECT_MASK (linkage_e | local_e)
-
 
 enum cbl_file_org_t {
   file_disorganized_e,
@@ -369,13 +356,6 @@ enum cbl_arith_format_t {
     not_expected_e,
     no_giving_e, giving_e,
     corresponding_e };
-
-enum cbl_encoding_t {
-  ASCII_e,   // STANDARD-1 (in caps to avoid conflict with ascii_e in libgcobol.cc)
-  iso646_e,  // STANDARD-2
-  EBCDIC_e,  // NATIVE or EBCDIC
-  custom_encoding_e,
-};
 
 enum cbl_truncation_mode {
     trunc_std_e,

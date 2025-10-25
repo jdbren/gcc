@@ -1,3 +1,15 @@
+2025-10-05  Sam James  <sam@gentoo.org>
+
+	* Makefile.in: Regenerate.
+	* aclocal.m4: Regenerate.
+	* configure: Regenerate.
+
+2025-09-02  Paul Thomas  <pault@gcc.gnu.org>
+
+	PR fortran/87669
+	* intrinsics/extends_type_of.c (is_extension_of): Use the vptr
+	rather than the hash value to identify the types.
+
 2025-08-06  Jerry DeLisle  <jvdelisle@gcc.gnu.org>
 
 	PR libfortran/121234

@@ -1537,6 +1537,19 @@ cp_build_qualified_type (tree type, int type_quals,
   return result;
 }
 
+/* Return a FUNCTION_TYPE for a function returning VALUE_TYPE
+   with ARG_TYPES arguments.  Wrapper around build_function_type
+   which ensures TYPE_NO_NAMED_ARGS_STDARG_P is set if ARG_TYPES
+   is NULL for C++26.  */
+
+tree
+cp_build_function_type (tree value_type, tree arg_types)
+{
+  return build_function_type (value_type, arg_types,
+			      cxx_dialect >= cxx26
+			      && arg_types == NULL_TREE);
+}
+
 /* Return TYPE with const and volatile removed.  */
 
 tree
@@ -1782,7 +1795,8 @@ strip_typedefs (tree t, bool *remove_attributes /* = NULL */,
 	  }
 	else
 	  {
-	    result = build_function_type (type, arg_types);
+	    result = build_function_type (type, arg_types,
+					  TYPE_NO_NAMED_ARGS_STDARG_P (t));
 	    result = apply_memfn_quals (result, type_memfn_quals (t));
 	  }
 
@@ -3730,7 +3744,9 @@ build_min_non_dep_op_overload (enum tree_code op,
 	     rebuild the <=>.  Note that both OVERLOAD and the provided arguments
 	     in this case already correspond to the selected operator<=>.  */
 
-	  tree spaceship_non_dep = CALL_EXPR_ARG (non_dep, reversed ? 1 : 0);
+	  tree spaceship_non_dep = (TREE_CODE (non_dep) == CALL_EXPR
+				    ? CALL_EXPR_ARG (non_dep, reversed ? 1 : 0)
+				    : TREE_OPERAND (non_dep, reversed ? 1 : 0));
 	  gcc_checking_assert (TREE_CODE (spaceship_non_dep) == CALL_EXPR);
 	  tree spaceship_op0 = va_arg (p, tree);
 	  tree spaceship_op1 = va_arg (p, tree);
@@ -3744,8 +3760,19 @@ build_min_non_dep_op_overload (enum tree_code op,
 						    TREE_VALUE (overload),
 						    spaceship_op0,
 						    spaceship_op1);
-	  tree op1 = CALL_EXPR_ARG (non_dep, reversed ? 0 : 1);
+	  tree op1 = (TREE_CODE (non_dep) == CALL_EXPR
+		      ? CALL_EXPR_ARG (non_dep, reversed ? 0 : 1)
+		      : TREE_OPERAND (non_dep, reversed ? 0 : 1));
 	  gcc_checking_assert (integer_zerop (op1));
+
+	  if (TREE_CODE (non_dep) != CALL_EXPR)
+	    {
+	      gcc_checking_assert (COMPARISON_CLASS_P (non_dep));
+	      if (reversed)
+		std::swap (op0, op1);
+	      return build_min_non_dep (TREE_CODE (non_dep), non_dep, op0, op1);
+	    }
+
 	  vec_safe_push (args, op0);
 	  vec_safe_push (args, op1);
 	  overload = CALL_EXPR_FN (non_dep);
@@ -5070,6 +5097,42 @@ replaceable_type_p (tree t)
   return true;
 }
 
+/* Returns 1 iff type T is an implicit-lifetime type, as defined in
+   [basic.types.general] and [class.prop].  */
+
+bool
+implicit_lifetime_type_p (tree t)
+{
+  if (SCALAR_TYPE_P (t)
+      || (TREE_CODE (t) == ARRAY_TYPE
+	  && !(TYPE_SIZE (t) && integer_zerop (TYPE_SIZE (t))))
+      /* GNU extension.  */
+      || TREE_CODE (t) == VECTOR_TYPE)
+    return true;
+  if (!CLASS_TYPE_P (t))
+    return false;
+  t = TYPE_MAIN_VARIANT (t);
+  if (CP_AGGREGATE_TYPE_P (t)
+      && (!CLASSTYPE_DESTRUCTOR (t)
+	  || !user_provided_p (CLASSTYPE_DESTRUCTOR (t))))
+    return true;
+  if (is_trivially_xible (BIT_NOT_EXPR, t, NULL_TREE))
+    {
+      if (is_trivially_xible (INIT_EXPR, t, make_tree_vec (0)))
+	return true;
+      tree arg = make_tree_vec (1);
+      tree ct
+	= cp_build_qualified_type (t, (cp_type_quals (t) | TYPE_QUAL_CONST));
+      TREE_VEC_ELT (arg, 0) = cp_build_reference_type (ct, /*rval=*/false);
+      if (is_trivially_xible (INIT_EXPR, t, arg))
+	return true;
+      TREE_VEC_ELT (arg, 0) = t;
+      if (is_trivially_xible (INIT_EXPR, t, arg))
+	return true;
+    }
+  return false;
+}
+
 /* Returns 1 iff type T is a POD type, as defined in [basic.types].  */
 
 bool
@@ -5578,6 +5641,23 @@ handle_maybe_unused_attribute (tree *node, tree name, tree args, int flags,
   return ret;
 }
 
+/* The C++26 [[indeterminate]] attribute.  */
+
+static tree
+handle_indeterminate_attribute (tree *node, tree name, tree, int,
+				bool *no_add_attrs)
+{
+  if (TREE_CODE (*node) != PARM_DECL
+      && (!VAR_P (*node) || is_global_var (*node)))
+    {
+      pedwarn (input_location, OPT_Wattributes,
+	       "%qE on declaration other than parameter or automatic variable",
+	       name);
+      *no_add_attrs = true;
+    }
+  return NULL_TREE;
+}
+
 /* Table of valid C++ attributes.  */
 static const attribute_spec cxx_gnu_attributes[] =
 {
@@ -5617,6 +5697,8 @@ static const attribute_spec std_attributes[] =
     handle_noreturn_attribute, attr_noreturn_exclusions },
   { "carries_dependency", 0, 0, true, false, false, false,
     handle_carries_dependency_attribute, NULL },
+  { "indeterminate", 0, 0, true, false, false, false,
+    handle_indeterminate_attribute, NULL },
   { "pre", 0, -1, false, false, false, false,
     handle_contract_attribute, NULL },
   { "post", 0, -1, false, false, false, false,

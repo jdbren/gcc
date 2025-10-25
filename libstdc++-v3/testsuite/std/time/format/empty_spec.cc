@@ -6,11 +6,10 @@
 #include <ranges>
 #include <sstream>
 #include <testsuite_hooks.h>
+#include "custom_rep.h"
 
 using namespace std::chrono;
 
-#define WIDEN_(C, S) ::std::__format::_Widen<C>(S, L##S)
-#define WIDEN(S) WIDEN_(CharT, S)
 
 template<typename CharT, typename T>
 void
@@ -76,92 +75,6 @@ test_padding()
   res = std::format(WIDEN("{:=^27}"), month(16));
   VERIFY( res == WIDEN("==16 is not a valid month==") );
 }
-
-template<typename Ret = void, typename Under = long>
-struct Rep
-{
-  using Return
-    = std::conditional_t<std::is_void_v<Ret>, Rep, Ret>;
-
-  Rep(Under v = 0) : val(v) {}
-
-  template<typename ORet, typename OUnder>
-  Rep(Rep<ORet, OUnder> o) : val(o.val) {}
-
-  operator Under() const
-  { return val; }
-
-  Return
-  operator+() const
-  { return val; }
-
-  Rep
-  operator-() const
-  { return -val; }
-
-  friend Rep
-  operator+(Rep lhs, Rep rhs)
-  { return lhs.val + rhs.val; }
-
-  friend Rep
-  operator-(Rep lhs, Rep rhs)
-  { return lhs.val - rhs.val; }
-
-  friend Rep
-  operator*(Rep lhs, Rep rhs)
-  { return lhs.val * rhs.val; }
-
-  friend Rep
-  operator/(Rep lhs, Rep rhs)
-  { return lhs.val / rhs.val; }
-
-  friend auto operator<=>(Rep, Rep) = default;
-
-  template<typename CharT>
-  friend std::basic_ostream<CharT>&
-  operator<<(std::basic_ostream<CharT>& os, const Rep& t)
-  { return os << t.val << WIDEN("[via <<]"); }
-
-  Under val;
-};
-
-template<typename Ret, typename Under1, typename Under2>
-struct std::common_type<Rep<Ret, Under1>, Rep<Ret, Under2>>
-{
-  using type = Rep<Ret, std::common_type_t<Under1, Under2>>;
-};
-
-template<typename Ret, typename Under, typename Other>
-  requires std::is_integral_v<Other>
-struct std::common_type<Rep<Ret, Under>, Other>
-{
-  using type = Rep<Ret, std::common_type_t<Under, Other>>;
-};
-
-template<typename Ret, typename Under, typename Other>
-  requires std::is_integral_v<Other>
-struct std::common_type<Other, Rep<Ret, Under>>
-  : std::common_type<Rep<Ret, Under>, Other>
-{ };
-
-template<typename Ret, typename Under>
-struct std::numeric_limits<Rep<Ret, Under>>
-  : std::numeric_limits<Under>
-{ };
-
-template<typename Ret, typename Under, typename CharT>
-struct std::formatter<Rep<Ret, Under>, CharT>
-  : std::formatter<Under, CharT>
-{
-  template<typename Out>
-  typename std::basic_format_context<Out, CharT>::iterator
-  format(const Rep<Ret>& t, std::basic_format_context<Out, CharT>& ctx) const
-  {
-    constexpr std::basic_string_view<CharT> suffix = WIDEN("[via format]");
-    auto out = std::formatter<Under, CharT>::format(t.val, ctx);
-    return std::ranges::copy(suffix, out).out;
-  }
-};
 
 using deciseconds = duration<seconds::rep, std::deci>;
 
@@ -653,15 +566,15 @@ wall_cast(const local_time<Dur2>& tp)
 using decadays = duration<days::rep, std::ratio_multiply<std::deca, days::period>>;
 using kilodays = duration<days::rep, std::ratio_multiply<std::kilo, days::period>>;
 
-template<typename CharT, typename Clock>
+template<typename CharT, typename Clock, bool CustomizedOstream>
 void
-test_time_point(bool daysAsTime)
+test_time_point()
 {
   std::basic_string<CharT> res;
 
   const auto lt = local_days(2024y/March/22) + 13h + 24min + 54s + 111222333ns;
-  auto strip_time = [daysAsTime](std::basic_string_view<CharT> sv)
-  { return daysAsTime ? sv : sv.substr(0, 10); };
+  auto strip_time = [](std::basic_string_view<CharT> sv)
+  { return CustomizedOstream ? sv.substr(0, 10) : sv; };
 
   verify( wall_cast<Clock, nanoseconds>(lt),
 	  WIDEN("2024-03-22 13:24:54.111222333") );
@@ -681,6 +594,19 @@ test_time_point(bool daysAsTime)
 	  strip_time(WIDEN("2024-03-18 00:00:00")) );
   verify( wall_cast<Clock, kilodays>(lt),
 	  strip_time(WIDEN("2022-01-08 00:00:00")) );
+
+  if constexpr (!CustomizedOstream)
+  {
+    verify( wall_cast<Clock, duration<double>>(lt),
+	    WIDEN("2024-03-22 13:24:54") );
+    verify( wall_cast<Clock, years>(lt),
+	    WIDEN("2024-01-01 02:16:48") );
+  }
+  else
+  {
+    test_no_empty_spec<CharT, time_point<Clock, duration<double>>>();
+    test_no_empty_spec<CharT, time_point<Clock, years>>();
+  }
 }
 
 template<typename CharT>
@@ -776,20 +702,18 @@ template<typename CharT>
 void
 test_time_points()
 {
-  test_time_point<CharT, local_t>(false);
-  test_time_point<CharT, system_clock>(false);
-  test_time_point<CharT, utc_clock>(true);
-  test_time_point<CharT, tai_clock>(true);
-  test_time_point<CharT, gps_clock>(true);
-  test_time_point<CharT, file_clock>(true);
+  test_time_point<CharT, local_t, true>();
+  test_time_point<CharT, system_clock, true>();
+  test_time_point<CharT, utc_clock, false>();
+  test_time_point<CharT, tai_clock, false>();
+  test_time_point<CharT, gps_clock, false>();
+  test_time_point<CharT, file_clock, false>();
   test_leap_second<CharT>();
 #if _GLIBCXX_USE_CXX11_ABI || !_GLIBCXX_USE_DUAL_ABI
   test_zoned_time<CharT>();
 #endif
   test_local_time_format<CharT>();
 
-  test_no_empty_spec<CharT, sys_time<years>>();
-  test_no_empty_spec<CharT, sys_time<duration<float>>>();
 }
 
 #if _GLIBCXX_USE_CXX11_ABI || !_GLIBCXX_USE_DUAL_ABI

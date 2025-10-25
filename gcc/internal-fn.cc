@@ -194,6 +194,7 @@ init_internal_fns ()
 #define mask_len_fold_left_direct { 1, 1, false }
 #define check_ptrs_direct { 0, 0, false }
 #define crc_direct { 1, -1, true }
+#define reduc_sbool_direct { 0, 0, true }
 
 const direct_internal_fn_info direct_internal_fn_array[IFN_LAST + 1] = {
 #define DEF_INTERNAL_FN(CODE, FLAGS, FNSPEC) not_direct,
@@ -4099,6 +4100,42 @@ expand_crc_optab_fn (internal_fn fn, gcall *stmt, convert_optab optab)
     }
 }
 
+/* Expand .REDUC_SBOOL_{AND,IOR,XOR}.  */
+
+static void
+expand_reduc_sbool_optab_fn (internal_fn fn, gcall *stmt, direct_optab optab)
+{
+  tree_pair types = direct_internal_fn_types (fn, stmt);
+  insn_code icode = direct_optab_handler (optab, TYPE_MODE (types.first));
+
+  /* Below copied from expand_fn_using_insn.  */
+
+  gcc_assert (icode != CODE_FOR_nothing);
+
+  expand_operand *ops = XALLOCAVEC (expand_operand, 3);
+  rtx lhs_rtx = NULL_RTX;
+  tree lhs = gimple_call_lhs (stmt);
+  if (lhs)
+    lhs_rtx = expand_expr (lhs, NULL_RTX, VOIDmode, EXPAND_WRITE);
+  create_call_lhs_operand (&ops[0], lhs_rtx,
+			   insn_data[icode].operand[0].mode);
+
+  tree rhs = gimple_call_arg (stmt, 0);
+  tree rhs_type = TREE_TYPE (rhs);
+  rtx rhs_rtx = expand_normal (rhs);
+  gcc_assert (VECTOR_BOOLEAN_TYPE_P (rhs_type));
+  create_input_operand (&ops[1], rhs_rtx, TYPE_MODE (rhs_type));
+  if (SCALAR_INT_MODE_P (TYPE_MODE (rhs_type)))
+    {
+      rtx nunits = GEN_INT (TYPE_VECTOR_SUBPARTS (rhs_type).to_constant ());
+      gcc_assert (insn_operand_matches (icode, 2, nunits));
+      create_input_operand (&ops[2], nunits, SImode);
+    }
+  expand_insn (icode, SCALAR_INT_MODE_P (TYPE_MODE (rhs_type)) ? 3 : 2, ops);
+  if (lhs_rtx)
+    assign_call_lhs (lhs, lhs_rtx, &ops[0]);
+}
+
 /* Expanders for optabs that can use expand_direct_optab_fn.  */
 
 #define expand_unary_optab_fn(FN, STMT, OPTAB) \
@@ -4261,6 +4298,7 @@ multi_vector_optab_supported_p (convert_optab optab, tree_pair types,
 #define direct_check_ptrs_optab_supported_p direct_optab_supported_p
 #define direct_vec_set_optab_supported_p direct_optab_supported_p
 #define direct_vec_extract_optab_supported_p convert_optab_supported_p
+#define direct_reduc_sbool_optab_supported_p direct_optab_supported_p
 
 /* Return the optab used by internal function FN.  */
 
@@ -5234,7 +5272,7 @@ get_supported_else_vals (enum insn_code icode, unsigned else_index,
 			 vec<int> &else_vals)
 {
   const struct insn_data_d *data = &insn_data[icode];
-  if ((char)else_index >= data->n_operands)
+  if ((int) else_index >= data->n_operands || (int) else_index == -1)
     return;
 
   machine_mode else_mode = data->operand[else_index].mode;
@@ -5305,6 +5343,26 @@ internal_gather_scatter_fn_supported_p (internal_fn ifn, tree vector_type,
   if (ok && elsvals)
     get_supported_else_vals
       (icode, internal_fn_else_index (IFN_MASK_GATHER_LOAD), *elsvals);
+
+  return ok;
+}
+
+/* Return true if the target supports a strided load/store function IFN
+   with VECTOR_TYPE.  If supported and ELSVALS is nonzero the supported else
+   values will be added to the vector ELSVALS points to.  */
+
+bool
+internal_strided_fn_supported_p (internal_fn ifn, tree vector_type,
+				 vec<int> *elsvals)
+{
+  machine_mode mode = TYPE_MODE (vector_type);
+  optab optab = direct_internal_fn_optab (ifn);
+  insn_code icode = direct_optab_handler (optab, mode);
+
+  bool ok = icode != CODE_FOR_nothing;
+
+  if (ok && elsvals)
+    get_supported_else_vals (icode, internal_fn_else_index (ifn), *elsvals);
 
   return ok;
 }

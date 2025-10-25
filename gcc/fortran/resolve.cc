@@ -2030,7 +2030,7 @@ static bool
 resolve_actual_arglist (gfc_actual_arglist *arg, procedure_type ptype,
 			bool no_formal_args)
 {
-  gfc_symbol *sym;
+  gfc_symbol *sym = NULL;
   gfc_symtree *parent_st;
   gfc_expr *e;
   gfc_component *comp;
@@ -2293,6 +2293,30 @@ resolve_actual_arglist (gfc_actual_arglist *arg, procedure_type ptype,
 	  gfc_error ("Coindexed actual argument at %L with ultimate pointer "
 		     "component", &e->where);
 	  goto cleanup;
+	}
+
+      if (e->expr_type == EXPR_VARIABLE
+	  && e->ts.type == BT_PROCEDURE
+	  && no_formal_args
+	  && sym->attr.flavor == FL_PROCEDURE
+	  && sym->attr.if_source == IFSRC_UNKNOWN
+	  && !sym->attr.external
+	  && !sym->attr.intrinsic
+	  && !sym->attr.artificial
+	  && !sym->ts.interface)
+	{
+	  /* Emit a warning for -std=legacy and an error otherwise. */
+	  if (gfc_option.warn_std == 0)
+	    gfc_warning (0, "Procedure %qs at %L used as actual argument but "
+			 "does neither have an explicit interface nor the "
+			 "EXTERNAL attribute", sym->name, &e->where);
+	  else
+	    {
+	      gfc_error ("Procedure %qs at %L used as actual argument but "
+			 "does neither have an explicit interface nor the "
+			 "EXTERNAL attribute", sym->name, &e->where);
+	      goto cleanup;
+	    }
 	}
 
       first_actual_arg = false;
@@ -4989,6 +5013,76 @@ simplify_op:
   return t;
 }
 
+static bool
+resolve_conditional (gfc_expr *expr)
+{
+  gfc_expr *condition, *true_expr, *false_expr;
+
+  condition = expr->value.conditional.condition;
+  true_expr = expr->value.conditional.true_expr;
+  false_expr = expr->value.conditional.false_expr;
+
+  if (!gfc_resolve_expr (condition) || !gfc_resolve_expr (true_expr)
+      || !gfc_resolve_expr (false_expr))
+    return false;
+
+  if (condition->ts.type != BT_LOGICAL || condition->rank != 0)
+    {
+      gfc_error (
+	"Condition in conditional expression must be a scalar logical at %L",
+	&condition->where);
+      return false;
+    }
+
+  if (true_expr->ts.type != false_expr->ts.type)
+    {
+      gfc_error ("expr at %L and expr at %L in conditional expression "
+		 "must have the same declared type",
+		 &true_expr->where, &false_expr->where);
+      return false;
+    }
+
+  if (true_expr->ts.kind != false_expr->ts.kind)
+    {
+      gfc_error ("expr at %L and expr at %L in conditional expression "
+		 "must have the same kind parameter",
+		 &true_expr->where, &false_expr->where);
+      return false;
+    }
+
+  if (true_expr->rank != false_expr->rank)
+    {
+      gfc_error ("expr at %L and expr at %L in conditional expression "
+		 "must have the same rank",
+		 &true_expr->where, &false_expr->where);
+      return false;
+    }
+
+  /* TODO: support more data types for conditional expressions  */
+  if (true_expr->ts.type != BT_INTEGER && true_expr->ts.type != BT_LOGICAL
+      && true_expr->ts.type != BT_REAL && true_expr->ts.type != BT_COMPLEX
+      && true_expr->ts.type != BT_CHARACTER)
+    {
+      gfc_error (
+	"Sorry, only integer, logical, real, complex and character types are "
+	"currently supported for conditional expressions at %L",
+	&expr->where);
+      return false;
+    }
+
+  /* TODO: support arrays in conditional expressions  */
+  if (true_expr->rank > 0)
+    {
+      gfc_error ("Sorry, array is currently unsupported for conditional "
+		 "expressions at %L",
+		 &expr->where);
+      return false;
+    }
+
+  expr->ts = true_expr->ts;
+  expr->rank = true_expr->rank;
+  return true;
+}
 
 /************** Array resolution subroutines **************/
 
@@ -5872,12 +5966,46 @@ gfc_resolve_substring_charlen (gfc_expr *e)
 }
 
 
+/* Convert an array reference to an array element so that PDT KIND and LEN
+   or inquiry references are always scalar.  */
+
+static void
+reset_array_ref_to_scalar (gfc_expr *expr, gfc_ref *array_ref)
+{
+  gfc_expr *unity = gfc_get_int_expr (gfc_default_integer_kind, NULL, 1);
+  int dim;
+
+  array_ref->u.ar.type = AR_ELEMENT;
+  expr->rank = 0;
+  /* Suppress the runtime bounds check.  */
+  expr->no_bounds_check = 1;
+  for (dim = 0; dim < array_ref->u.ar.dimen; dim++)
+    {
+      array_ref->u.ar.dimen_type[dim] = DIMEN_ELEMENT;
+      if (array_ref->u.ar.start[dim])
+	gfc_free_expr (array_ref->u.ar.start[dim]);
+
+      if (array_ref->u.ar.as && array_ref->u.ar.as->lower[dim])
+	array_ref->u.ar.start[dim]
+			= gfc_copy_expr (array_ref->u.ar.as->lower[dim]);
+      else
+	array_ref->u.ar.start[dim] = gfc_copy_expr (unity);
+
+      if (array_ref->u.ar.end[dim])
+	gfc_free_expr (array_ref->u.ar.end[dim]);
+      if (array_ref->u.ar.stride[dim])
+	gfc_free_expr (array_ref->u.ar.stride[dim]);
+    }
+  gfc_free_expr (unity);
+}
+
+
 /* Resolve subtype references.  */
 
 bool
 gfc_resolve_ref (gfc_expr *expr)
 {
-  int current_part_dimension, n_components, seen_part_dimension, dim;
+  int current_part_dimension, n_components, seen_part_dimension;
   gfc_ref *ref, **prev, *array_ref;
   bool equal_length;
   gfc_symbol *last_pdt = NULL;
@@ -6022,6 +6150,14 @@ gfc_resolve_ref (gfc_expr *expr)
 		last_pdt = NULL;
 	    }
 
+	  /* The F08 standard requires(See R425, R431, R435, and in particular
+	     Note 6.7) that a PDT parameter reference be a scalar even if 
+	     the designator is an array."  */
+	  if (array_ref && last_pdt && last_pdt->attr.pdt_type
+	      && (ref->u.c.component->attr.pdt_kind
+		  || ref->u.c.component->attr.pdt_len))
+	    reset_array_ref_to_scalar (expr, array_ref);
+
 	  n_components++;
 	  break;
 
@@ -6034,27 +6170,7 @@ gfc_resolve_ref (gfc_expr *expr)
 	  if (ref->u.i == INQUIRY_LEN && array_ref
 	      && ((expr->ts.type == BT_CHARACTER && !expr->ts.u.cl->length)
 		  || expr->ts.type == BT_INTEGER))
-	    {
-	      array_ref->u.ar.type = AR_ELEMENT;
-	      expr->rank = 0;
-	      /* INQUIRY_LEN is not evaluated from the rest of the expr
-		 but directly from the string length. This means that setting
-		 the array indices to one does not matter but might trigger
-		 a runtime bounds error. Suppress the check.  */
-	      expr->no_bounds_check = 1;
-	      for (dim = 0; dim < array_ref->u.ar.dimen; dim++)
-		{
-		  array_ref->u.ar.dimen_type[dim] = DIMEN_ELEMENT;
-		  if (array_ref->u.ar.start[dim])
-		    gfc_free_expr (array_ref->u.ar.start[dim]);
-		  array_ref->u.ar.start[dim]
-			= gfc_get_int_expr (gfc_default_integer_kind, NULL, 1);
-		  if (array_ref->u.ar.end[dim])
-		    gfc_free_expr (array_ref->u.ar.end[dim]);
-		  if (array_ref->u.ar.stride[dim])
-		    gfc_free_expr (array_ref->u.ar.stride[dim]);
-		}
-	    }
+	    reset_array_ref_to_scalar (expr, array_ref);
 	  break;
 	}
 
@@ -8016,6 +8132,10 @@ gfc_resolve_expr (gfc_expr *e)
     {
     case EXPR_OP:
       t = resolve_operator (e);
+      break;
+
+    case EXPR_CONDITIONAL:
+      t = resolve_conditional (e);
       break;
 
     case EXPR_FUNCTION:
@@ -14520,6 +14640,13 @@ build_init_assign (gfc_symbol *sym, gfc_expr *init)
   gfc_code *init_st;
   gfc_namespace *ns = sym->ns;
 
+  if (sym->attr.function && sym->result == sym
+      && sym->ts.type == BT_DERIVED && sym->ts.u.derived->attr.pdt_type)
+    {
+      gfc_free_expr (init);
+      return;
+    }
+
   /* Search for the function namespace if this is a contained
      function without an explicit result.  */
   if (sym->attr.function && sym == sym->result
@@ -16563,6 +16690,26 @@ resolve_component (gfc_component *c, gfc_symbol *sym)
       return false;
     }
 
+  if (c->ts.type == BT_DERIVED && c->ts.u.derived->attr.pdt_template
+      && !sym->attr.pdt_type && !sym->attr.pdt_template
+      && !(gfc_get_derived_super_type (sym)
+	   && (gfc_get_derived_super_type (sym)->attr.pdt_type
+	       ||  gfc_get_derived_super_type (sym)->attr.pdt_template)))
+    {
+      gfc_actual_arglist *type_spec_list;
+      if (gfc_get_pdt_instance (c->param_list, &c->ts.u.derived,
+				&type_spec_list)
+	  != MATCH_YES)
+	return false;
+      gfc_free_actual_arglist (c->param_list);
+      c->param_list = type_spec_list;
+      if (!sym->attr.pdt_type)
+	sym->attr.pdt_comp = 1;
+    }
+  else if (c->ts.type == BT_DERIVED && c->ts.u.derived->attr.pdt_type
+	   && !sym->attr.pdt_type)
+    sym->attr.pdt_comp = 1;
+
   if (c->attr.proc_pointer && c->ts.interface)
     {
       gfc_symbol *ifc = c->ts.interface;
@@ -16757,27 +16904,30 @@ resolve_component (gfc_component *c, gfc_symbol *sym)
       && gfc_find_typebound_proc (super_type, NULL, c->name, true, NULL))
     {
       gfc_error ("Component %qs of %qs at %L has the same name as an"
-                 " inherited type-bound procedure",
-                 c->name, sym->name, &c->loc);
+		 " inherited type-bound procedure",
+		 c->name, sym->name, &c->loc);
       return false;
     }
 
   if (c->ts.type == BT_CHARACTER && !c->attr.proc_pointer
-        && !c->ts.deferred)
+      && !c->ts.deferred)
     {
-     if (c->ts.u.cl->length == NULL
-         || (!resolve_charlen(c->ts.u.cl))
-         || !gfc_is_constant_expr (c->ts.u.cl->length))
-       {
-         gfc_error ("Character length of component %qs needs to "
-                    "be a constant specification expression at %L",
-                    c->name,
-                    c->ts.u.cl->length ? &c->ts.u.cl->length->where : &c->loc);
-         return false;
-       }
+      if (sym->attr.pdt_template || c->attr.pdt_string)
+	gfc_correct_parm_expr (sym, &c->ts.u.cl->length);
+
+      if (c->ts.u.cl->length == NULL
+	  || !resolve_charlen(c->ts.u.cl)
+	  || !gfc_is_constant_expr (c->ts.u.cl->length))
+	{
+	  gfc_error ("Character length of component %qs needs to "
+		     "be a constant specification expression at %L",
+		     c->name,
+		     c->ts.u.cl->length ? &c->ts.u.cl->length->where : &c->loc);
+	  return false;
+	}
 
      if (c->ts.u.cl->length && c->ts.u.cl->length->ts.type != BT_INTEGER)
-       {
+	{
 	 if (!c->ts.u.cl->length->error)
 	   {
 	     gfc_error ("Character length expression of component %qs at %L "
@@ -16794,8 +16944,8 @@ resolve_component (gfc_component *c, gfc_symbol *sym)
       && !c->attr.pointer && !c->attr.allocatable)
     {
       gfc_error ("Character component %qs of %qs at %L with deferred "
-                 "length must be a POINTER or ALLOCATABLE",
-                 c->name, sym->name, &c->loc);
+		 "length must be a POINTER or ALLOCATABLE",
+		 c->name, sym->name, &c->loc);
       return false;
     }
 
@@ -16810,14 +16960,14 @@ resolve_component (gfc_component *c, gfc_symbol *sym)
       sprintf (name, "_%s_length", c->name);
       strlen = gfc_find_component (sym, name, true, true, NULL);
       if (strlen == NULL)
-        {
-          if (!gfc_add_component (sym, name, &strlen))
-            return false;
-          strlen->ts.type = BT_INTEGER;
-          strlen->ts.kind = gfc_charlen_int_kind;
-          strlen->attr.access = ACCESS_PRIVATE;
-          strlen->attr.artificial = 1;
-        }
+	{
+	  if (!gfc_add_component (sym, name, &strlen))
+	    return false;
+	  strlen->ts.type = BT_INTEGER;
+	  strlen->ts.kind = gfc_charlen_int_kind;
+	  strlen->attr.access = ACCESS_PRIVATE;
+	  strlen->attr.artificial = 1;
+	}
     }
 
   if (c->ts.type == BT_DERIVED
@@ -16827,27 +16977,27 @@ resolve_component (gfc_component *c, gfc_symbol *sym)
       && !c->ts.u.derived->attr.use_assoc
       && !gfc_check_symbol_access (c->ts.u.derived)
       && !gfc_notify_std (GFC_STD_F2003, "the component %qs is a "
-                          "PRIVATE type and cannot be a component of "
-                          "%qs, which is PUBLIC at %L", c->name,
-                          sym->name, &sym->declared_at))
+			  "PRIVATE type and cannot be a component of "
+			  "%qs, which is PUBLIC at %L", c->name,
+			  sym->name, &sym->declared_at))
     return false;
 
   if ((sym->attr.sequence || sym->attr.is_bind_c) && c->ts.type == BT_CLASS)
     {
       gfc_error ("Polymorphic component %s at %L in SEQUENCE or BIND(C) "
-                 "type %s", c->name, &c->loc, sym->name);
+		 "type %s", c->name, &c->loc, sym->name);
       return false;
     }
 
   if (sym->attr.sequence)
     {
       if (c->ts.type == BT_DERIVED && c->ts.u.derived->attr.sequence == 0)
-        {
+	{
           gfc_error ("Component %s of SEQUENCE type declared at %L does "
-                     "not have the SEQUENCE attribute",
-                     c->ts.u.derived->name, &sym->declared_at);
-          return false;
-        }
+		     "not have the SEQUENCE attribute",
+		     c->ts.u.derived->name, &sym->declared_at);
+	  return false;
+	}
     }
 
   if (c->ts.type == BT_DERIVED && c->ts.u.derived->attr.generic)
@@ -16855,7 +17005,7 @@ resolve_component (gfc_component *c, gfc_symbol *sym)
   else if (c->ts.type == BT_CLASS && c->attr.class_ok
            && CLASS_DATA (c)->ts.u.derived->attr.generic)
     CLASS_DATA (c)->ts.u.derived
-                    = gfc_find_dt_in_generic (CLASS_DATA (c)->ts.u.derived);
+		= gfc_find_dt_in_generic (CLASS_DATA (c)->ts.u.derived);
 
   /* If an allocatable component derived type is of the same type as
      the enclosing derived type, we need a vtable generating so that
@@ -16868,10 +17018,10 @@ resolve_component (gfc_component *c, gfc_symbol *sym)
      derived type list; even in formal namespaces, where derived type
      pointer components might not have been declared.  */
   if (c->ts.type == BT_DERIVED
-        && c->ts.u.derived
-        && c->ts.u.derived->components
-        && c->attr.pointer
-        && sym != c->ts.u.derived)
+      && c->ts.u.derived
+      && c->ts.u.derived->components
+      && c->attr.pointer
+      && sym != c->ts.u.derived)
     add_dt_to_dt_list (c->ts.u.derived);
 
   if (c->as && c->as->type != AS_DEFERRED
@@ -16879,8 +17029,8 @@ resolve_component (gfc_component *c, gfc_symbol *sym)
     return false;
 
   if (!gfc_resolve_array_spec (c->as,
-                               !(c->attr.pointer || c->attr.proc_pointer
-                                 || c->attr.allocatable)))
+			       !(c->attr.pointer || c->attr.proc_pointer
+				 || c->attr.allocatable)))
     return false;
 
   if (c->initializer && !sym->attr.vtype

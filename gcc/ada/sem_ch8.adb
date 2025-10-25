@@ -4340,7 +4340,12 @@ package body Sem_Ch8 is
          --  by inserting an extra with clause since redundant clauses don't
          --  really matter.
 
-         if All_Extensions_Allowed and then Is_In_Context_Clause (Clause) then
+         if All_Extensions_Allowed
+           and then Is_In_Context_Clause (Clause)
+           and then Nkind (Pack) in N_Expanded_Name
+                                  | N_Identifier
+                                  | N_Selected_Component
+         then
             declare
                Unum        : Unit_Number_Type;
                With_Clause : constant Node_Id :=
@@ -4531,6 +4536,10 @@ package body Sem_Ch8 is
 
       Id := Subtype_Mark (N);
       Find_Type (Id);
+      if not Is_Entity_Name (Id) then
+         pragma Assert (Serious_Errors_Detected > 0);
+         return;
+      end if;
       E := Base_Type (Entity (Id));
 
       --  There are many cases where a use_type_clause may be reanalyzed due to
@@ -5031,9 +5040,36 @@ package body Sem_Ch8 is
    -----------------------------------
 
    procedure Check_In_Previous_With_Clause (N, Nam : Node_Id) is
-      Pack : constant Entity_Id := Entity (Original_Node (Nam));
+
+      function Get_Name (N : Node_Id) return Node_Id;
+      --  Return the name of a package that may be present in a clause
+
+      --------------
+      -- Get_Name --
+      --------------
+
+      function Get_Name (N : Node_Id) return Node_Id is
+      begin
+         case Nkind (N) is
+            when N_Indexed_Component =>
+               return Prefix (N);
+
+            when N_Function_Call =>
+               return Name (N);
+
+            when others =>
+               return N;
+         end case;
+      end Get_Name;
+
+      --  Local variables
+
+      Pack : constant Entity_Id := Entity (Get_Name (Original_Node (Nam)));
+
       Item : Node_Id;
       Par  : Node_Id;
+
+   --  Start of processing for Check_In_Previous_With_Clause
 
    begin
       Item := First (Context_Items (Parent (N)));
@@ -5045,7 +5081,7 @@ package body Sem_Ch8 is
            and then Nkind (Name (Item)) /= N_Selected_Component
            and then Entity (Name (Item)) = Pack
          then
-            Par := Nam;
+            Par := Get_Name (Original_Node (Nam));
 
             --  Find root library unit in with_clause
 
@@ -5053,7 +5089,7 @@ package body Sem_Ch8 is
                Par := Prefix (Par);
             end loop;
 
-            if Is_Child_Unit (Entity (Original_Node (Par))) then
+            if Is_Child_Unit (Entity (Par)) then
                Error_Msg_NE ("& is not directly visible", Par, Entity (Par));
             else
                return;
@@ -5083,6 +5119,14 @@ package body Sem_Ch8 is
 
    begin
       if Nkind (Parent (N)) /= N_Compilation_Unit then
+         return;
+
+      --  Structural instances can always be renamed
+
+      elsif Is_Generic_Instance (Old_E)
+        and then Present (Get_Unit_Instantiation_Node (Old_E))
+        and then Is_Structural (Get_Unit_Instantiation_Node (Old_E))
+      then
          return;
 
       --  Check for library unit. Note that we used to check for the scope
@@ -5291,23 +5335,19 @@ package body Sem_Ch8 is
       Id        : Entity_Id;
       Elmt      : Elmt_Id;
 
-      function Is_Primitive_Operator_In_Use
-        (Op : Entity_Id;
-         F  : Entity_Id) return Boolean;
-      --  Check whether Op is a primitive operator of a use-visible type
+      function Type_In_Use (T : Entity_Id; P : Entity_Id) return Boolean;
+      --  Check whether type T is declared in P and appears in an active
+      --  use_type clause.
 
-      ----------------------------------
-      -- Is_Primitive_Operator_In_Use --
-      ----------------------------------
+      -----------------
+      -- Type_In_Use --
+      -----------------
 
-      function Is_Primitive_Operator_In_Use
-        (Op : Entity_Id;
-         F  : Entity_Id) return Boolean
-      is
-         T : constant Entity_Id := Base_Type (Etype (F));
+      function Type_In_Use (T : Entity_Id; P : Entity_Id) return Boolean is
+         BT : constant Entity_Id := Base_Type (T);
       begin
-         return In_Use (T) and then Scope (T) = Scope (Op);
-      end Is_Primitive_Operator_In_Use;
+         return Scope (BT) = P and then (In_Use (T) or else In_Use (BT));
+      end Type_In_Use;
 
    --  Start of processing for End_Use_Package
 
@@ -5337,12 +5377,13 @@ package body Sem_Ch8 is
 
                if Nkind (Id) = N_Defining_Operator_Symbol
                  and then
-                   (Is_Primitive_Operator_In_Use (Id, First_Formal (Id))
+                   (Type_In_Use (Etype (Id), Pack)
+                     or else Type_In_Use (Etype (First_Formal (Id)), Pack)
                      or else
                        (Present (Next_Formal (First_Formal (Id)))
                          and then
-                           Is_Primitive_Operator_In_Use
-                             (Id, Next_Formal (First_Formal (Id)))))
+                           Type_In_Use
+                             (Etype (Next_Formal (First_Formal (Id))), Pack)))
                then
                   null;
                else
@@ -5467,10 +5508,7 @@ package body Sem_Ch8 is
          end if;
       end if;
 
-      if Is_Empty_Elmt_List (Used_Operations (N)) then
-         return;
-
-      else
+      if Present (Used_Operations (N)) then
          Elmt := First_Elmt (Used_Operations (N));
          while Present (Elmt) loop
             Set_Is_Potentially_Use_Visible (Node (Elmt), False);

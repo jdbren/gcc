@@ -252,8 +252,9 @@ reload                  Ulrich Weigand          <uweigand@de.ibm.com>
 RTL optimizers          Eric Botcazou           <ebotcazou@libertysurf.fr>
 instruction combiner    Segher Boessenkool      <segher@kernel.crashing.org>
 pair fusion             Alex Coplan             <alex.coplan@arm.com>
-auto-vectorizer         Richard Biener          <rguenther@suse.de>
-auto-vectorizer         Zdenek Dvorak           <ook@ucw.cz>
+vectorizer (+ tree-if-conv) Richard Biener      <rguenther@suse.de>
+vectorizer (+ tree-if-conv) Tamar Christina     <tamar.christina@arm.com>
+vectorizer (+ tree-if-conv) Zdenek Dvorak       <ook@ucw.cz>
 loop infrastructure     Zdenek Dvorak           <ook@ucw.cz>
 loop ivopts             Bin Cheng               <bin.cheng@linux.alibaba.com>
 loop optimizer          Bin Cheng               <bin.cheng@linux.alibaba.com>
@@ -274,8 +275,10 @@ check in changes outside of the parts of the compiler they maintain.
 
                         Reviewers
 
+aarch64 port            Alice Carlotti          <alice.carlotti@arm.com>
 aarch64 port            Alex Coplan             <alex.coplan@arm.com>
 aarch64 port            Andrew Pinski           <andrew.pinski@oss.qualcomm.com>
+aarch64 port            Wilco Dijkstra          <wilco.dijkstra@arm.com>
 arm port (MVE)          Christophe Lyon         <christophe.lyon@arm.com>
 callgraph               Martin Jambor           <mjambor@suse.cz>
 C front end             Marek Polacek           <polacek@redhat.com>
@@ -446,7 +449,7 @@ Jerry DeLisle                   jvdelisle       <jvdelisle@gcc.gnu.org>
 DJ Delorie                      dj              <dj@delorie.com>
 Chris Demetriou                 cgd             <cgd@google.com>
 Sameera Deshpande               sameerad        <sameera.deshpande@linaro.org>
-Wilco Dijkstra                  wilco           <wdijkstr@arm.com>
+Wilco Dijkstra                  wilco           <wilco.dijkstra@arm.com>
 Dimitar Dimitrov                dimitar         <dimitar@dinux.eu>
 Benoit Dupont de Dinechin       bd3             <benoit.dupont-de-dinechin@st.com>
 Lehua Ding                      -               <lehua.ding@rivai.ai>
@@ -676,7 +679,7 @@ Bryce McKinlay                  bryce           <mckinlay@redhat.com>
 Adam Megacz                     -               <adam@xwt.org>
 Bingfeng Mei                    meibf           <bmei@broadcom.com>
 Michael Meissner                meissner        <gnu@the-meissners.org>
-Josef Melcr                     -               <melcrjos@fit.cvut.cz>
+Josef Melcr                     jmelcr          <jmelcr02@gmail.com>
 Jason Merrill                   jason           <jason@redhat.com>
 Jim Meyering                    -               <jim@meyering.net>
 Martin Michlmayr                tbm             <tbm@cyrius.com>

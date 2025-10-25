@@ -986,6 +986,30 @@ is_parm (tree decl)
   return (TREE_CODE (decl) == PARM_DECL);
 }
 
+/* Copy the TREE_THIS_NOTRAP flag from OLD to T if it is appropriate to do so.
+   T and OLD must be both either INDIRECT_REF or MEM_REF.  */
+
+static void
+maybe_copy_this_notrap (copy_body_data *id, tree t, tree old)
+{
+  gcc_assert (TREE_CODE (t) == TREE_CODE (old));
+
+  /* We cannot blindly propagate the TREE_THIS_NOTRAP flag if we have remapped
+     a parameter as the property might be valid only for the parameter itself,
+     typically when it is passed by reference.  But we propagate the flag when
+     this is the dereference of an entire object done in a type that has self-
+     referential size, to avoid the static size check in tree_could_trap_p.  */
+  if (TREE_THIS_NOTRAP (old)
+      && (!is_parm (TREE_OPERAND (old, 0))
+	  || (!id->transform_parameter && is_parm (TREE_OPERAND (t, 0)))
+	  || ((TREE_CODE (t) == INDIRECT_REF
+	       || integer_zerop (TREE_OPERAND (t, 1)))
+	      && TREE_CODE (TREE_OPERAND (t, 0)) == ADDR_EXPR
+	      && DECL_P (TREE_OPERAND (TREE_OPERAND (t, 0), 0))
+	      && type_contains_placeholder_p (TREE_TYPE (t)))))
+    TREE_THIS_NOTRAP (t) = 1;
+}
+
 /* Remap the dependence CLIQUE from the source to the destination function
    as specified in ID.  */
 
@@ -1118,13 +1142,7 @@ remap_gimple_op_r (tree *tp, int *walk_subtrees, void *data)
 	        = remap_dependence_clique (id, MR_DEPENDENCE_CLIQUE (old));
 	      MR_DEPENDENCE_BASE (*tp) = MR_DEPENDENCE_BASE (old);
 	    }
-	  /* We cannot propagate the TREE_THIS_NOTRAP flag if we have
-	     remapped a parameter as the property might be valid only
-	     for the parameter itself.  */
-	  if (TREE_THIS_NOTRAP (old)
-	      && (!is_parm (TREE_OPERAND (old, 0))
-		  || (!id->transform_parameter && is_parm (ptr))))
-	    TREE_THIS_NOTRAP (*tp) = 1;
+	  maybe_copy_this_notrap (id, *tp, old);
 	  REF_REVERSE_STORAGE_ORDER (*tp) = REF_REVERSE_STORAGE_ORDER (old);
 	  *walk_subtrees = 0;
 	  return NULL;
@@ -1352,13 +1370,7 @@ copy_tree_body_r (tree *tp, int *walk_subtrees, void *data)
 		      TREE_THIS_VOLATILE (*tp) = TREE_THIS_VOLATILE (old);
 		      TREE_SIDE_EFFECTS (*tp) = TREE_SIDE_EFFECTS (old);
 		      TREE_READONLY (*tp) = TREE_READONLY (old);
-		      /* We cannot propagate the TREE_THIS_NOTRAP flag if we
-			 have remapped a parameter as the property might be
-			 valid only for the parameter itself.  */
-		      if (TREE_THIS_NOTRAP (old)
-			  && (!is_parm (TREE_OPERAND (old, 0))
-			      || (!id->transform_parameter && is_parm (ptr))))
-		        TREE_THIS_NOTRAP (*tp) = 1;
+		      maybe_copy_this_notrap (id, *tp, old);
 		    }
 		}
 	      *walk_subtrees = 0;
@@ -1384,13 +1396,7 @@ copy_tree_body_r (tree *tp, int *walk_subtrees, void *data)
 		= remap_dependence_clique (id, MR_DEPENDENCE_CLIQUE (old));
 	      MR_DEPENDENCE_BASE (*tp) = MR_DEPENDENCE_BASE (old);
 	    }
-	  /* We cannot propagate the TREE_THIS_NOTRAP flag if we have
-	     remapped a parameter as the property might be valid only
-	     for the parameter itself.  */
-	  if (TREE_THIS_NOTRAP (old)
-	      && (!is_parm (TREE_OPERAND (old, 0))
-		  || (!id->transform_parameter && is_parm (ptr))))
-	    TREE_THIS_NOTRAP (*tp) = 1;
+	  maybe_copy_this_notrap (id, *tp, old);
 	  REF_REVERSE_STORAGE_ORDER (*tp) = REF_REVERSE_STORAGE_ORDER (old);
 	  *walk_subtrees = 0;
 	  return NULL;
@@ -2353,6 +2359,19 @@ copy_bb (copy_body_data *id, basic_block bb,
 			  indirect->count
 			     = copy_basic_block->count.apply_probability (prob);
 			}
+		      /* If edge is a callback-carrying edge, copy all its
+			 attached edges as well.  */
+		      else if (edge->has_callback)
+			{
+			  edge
+			    = edge->clone (id->dst_node, call_stmt,
+					   gimple_uid (stmt), num, den, true);
+			  cgraph_edge *e;
+			  for (e = old_edge->first_callback_edge (); e;
+			       e = e->next_callback_edge ())
+			    edge = e->clone (id->dst_node, call_stmt,
+					     gimple_uid (stmt), num, den, true);
+			}
 		      else
 			{
 			  edge = edge->clone (id->dst_node, call_stmt,
@@ -3045,8 +3064,18 @@ redirect_all_calls (copy_body_data * id, basic_block bb)
 	    {
 	      if (!id->killed_new_ssa_names)
 		id->killed_new_ssa_names = new hash_set<tree> (16);
-	      cgraph_edge::redirect_call_stmt_to_callee (edge,
-		id->killed_new_ssa_names);
+	      cgraph_edge::redirect_call_stmt_to_callee (
+		edge, id->killed_new_ssa_names);
+	      if (edge->has_callback)
+		{
+		  /* When redirecting a carrying edge, we need to redirect its
+		     attached edges as well.  */
+		  cgraph_edge *cbe;
+		  for (cbe = edge->first_callback_edge (); cbe;
+		       cbe = cbe->next_callback_edge ())
+		    cgraph_edge::redirect_call_stmt_to_callee (
+		      cbe, id->killed_new_ssa_names);
+		}
 
 	      if (stmt == last && id->call_stmt && maybe_clean_eh_stmt (stmt))
 		gimple_purge_dead_eh_edges (bb);

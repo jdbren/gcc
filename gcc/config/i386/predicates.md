@@ -1319,6 +1319,9 @@
   (ior (match_operand 0 "nonimmediate_operand")
        (match_test "const_vec_duplicate_p (op)")))
 
+(define_predicate "const_vec_dup_operand"
+       (match_test "const_vec_duplicate_p (op)"))
+
 ;; Return true when OP is either register operand, or any
 ;; CONST_VECTOR.
 (define_predicate "reg_or_const_vector_operand"
@@ -2071,6 +2074,25 @@
   for (i = 1; i < nelt; ++i)
     if (XVECEXP (op, 0, i) != elt)
       return false;
+  return true;
+})
+
+;; Return true if OP is a parallel for a vbroadcastf128 permute.
+(define_predicate "avx_vbroadcast128_operand"
+  (and (match_code "parallel")
+       (match_code "const_int" "a"))
+{
+  int i, nelt = XVECLEN (op, 0);
+  int half = nelt / 2;
+
+  for (i = 0; i < nelt; ++i)
+    {
+      int index = INTVAL (XVECEXP (op, 0, i));
+      if ((i < half && index != i)
+	  || (i >= half && index != (i - half)))
+	return false;
+    }
+
   return true;
 })
 

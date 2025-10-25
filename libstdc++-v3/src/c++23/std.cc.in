@@ -1869,9 +1869,15 @@ export namespace std
   using std::aligned_accessor;
 #endif
   using std::mdspan;
-  // FIXME layout_left_padded, layout_right_padded, strided_slice,
-  // submdspan_mapping_result, full_extent_t, full_extent, submdspan_extents,
-  // mdsubspan
+#if __glibcxx_padded_layouts
+  using std::layout_left_padded;
+  using std::layout_right_padded;
+  using std::strided_slice;
+  using std::full_extent_t;
+  using std::full_extent;
+  using std::submdspan_mapping_result;
+#endif
+  // FIXME submdspan_extents, mdsubspan
 }
 #endif
 
@@ -2003,6 +2009,10 @@ export namespace std
 #if __cpp_lib_smart_ptr_owner_equality
   using std::owner_equal;
   using std::owner_hash;
+#endif
+#if __cpp_lib_start_lifetime_as
+  using std::start_lifetime_as;
+  using std::start_lifetime_as_array;
 #endif
 }
 
@@ -2997,6 +3007,10 @@ export namespace std
   using std::conditional_t;
   using std::conjunction;
   using std::conjunction_v;
+#if __cpp_lib_constant_wrapper
+  using std::constant_wrapper;
+  using std::cw;
+#endif
   using std::decay;
   using std::decay_t;
   using std::disjunction;
@@ -3322,6 +3336,9 @@ export namespace std
 #pragma GCC diagnostic pop
 #if __cpp_lib_unreachable
   using std::unreachable;
+#endif
+#if __cpp_lib_observable_checkpoint
+  using std::observable_checkpoint;
 #endif
 }
 

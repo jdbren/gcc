@@ -675,14 +675,15 @@ c_token_starts_typename (c_token *token)
     }
 }
 
-/* Return true if the next token from PARSER can start a type name,
-   false otherwise.  LA specifies how to do lookahead in order to
+/* Return true if the next token from PARSER, starting from token N, can start
+   a type name, false otherwise.  LA specifies how to do lookahead in order to
    detect unknown type names.  If unsure, pick CLA_PREFER_ID.  */
 
 static inline bool
-c_parser_next_tokens_start_typename (c_parser *parser, enum c_lookahead_kind la)
+c_parser_next_tokens_start_typename (c_parser *parser, enum c_lookahead_kind la,
+				     unsigned int n = 1)
 {
-  c_token *token = c_parser_peek_token (parser);
+  c_token *token = c_parser_peek_nth_token (parser, n);
   if (c_token_starts_typename (token))
     return true;
 
@@ -695,8 +696,8 @@ c_parser_next_tokens_start_typename (c_parser *parser, enum c_lookahead_kind la)
       && !parser->objc_could_be_foreach_context
 
       && (la == cla_prefer_type
-	  || c_parser_peek_2nd_token (parser)->type == CPP_NAME
-	  || c_parser_peek_2nd_token (parser)->type == CPP_MULT)
+	  || c_parser_peek_nth_token (parser, n + 1)->type == CPP_NAME
+	  || c_parser_peek_nth_token (parser, n + 1)->type == CPP_MULT)
 
       /* Only unknown identifiers.  */
       && !lookup_name (token->value))
@@ -892,30 +893,47 @@ c_parser_next_token_starts_declspecs (c_parser *parser)
   return c_token_starts_declspecs (token);
 }
 
-/* Return true if the next tokens from PARSER can start declaration
-   specifiers (not including standard attributes) or a static
-   assertion, false otherwise.  */
+static bool c_parser_check_balanced_raw_token_sequence (c_parser *,
+							unsigned int *);
+
+/* Return true if the next tokens from PARSER (starting with token N, 1-based)
+   can start declaration specifiers (not including standard attributes) or a
+   static assertion, false otherwise.  */
 bool
-c_parser_next_tokens_start_declaration (c_parser *parser)
+c_parser_next_tokens_start_declaration (c_parser *parser, unsigned int n)
 {
-  c_token *token = c_parser_peek_token (parser);
+  c_token *token = c_parser_peek_nth_token (parser, n);
 
   /* Same as above.  */
   if (c_dialect_objc ()
       && token->type == CPP_NAME
       && token->id_kind == C_ID_CLASSNAME
-      && c_parser_peek_2nd_token (parser)->type == CPP_DOT)
+      && c_parser_peek_nth_token (parser, n + 1)->type == CPP_DOT)
     return false;
 
   /* Labels do not start declarations.  */
   if (token->type == CPP_NAME
-      && c_parser_peek_2nd_token (parser)->type == CPP_COLON)
+      && c_parser_peek_nth_token (parser, n + 1)->type == CPP_COLON)
     return false;
+
+  /* A static assertion is only a declaration if followed by a semicolon;
+     otherwise, it may be an expression in C2Y.  */
+  if (token->keyword == RID_STATIC_ASSERT
+      && c_parser_peek_nth_token (parser, n + 1)->type == CPP_OPEN_PAREN)
+    {
+      n += 2;
+      if (!c_parser_check_balanced_raw_token_sequence (parser, &n)
+	  || c_parser_peek_nth_token_raw (parser, n)->type != CPP_CLOSE_PAREN)
+	/* Invalid static assertion syntax; treat as a declaration and report a
+	   syntax error there.  */
+	return true;
+      return c_parser_peek_nth_token_raw (parser, n + 1)->type == CPP_SEMICOLON;
+    }
 
   if (c_token_starts_declaration (token))
     return true;
 
-  if (c_parser_next_tokens_start_typename (parser, cla_nonabstract_decl))
+  if (c_parser_next_tokens_start_typename (parser, cla_nonabstract_decl, n))
     return true;
 
   return false;
@@ -3222,7 +3240,7 @@ c_parser_declaration_or_fndef (c_parser *parser, bool fndef_ok,
       else
 	fnbody = c_parser_compound_statement (parser, &endloc);
       tree fndecl = current_function_decl;
-      if (nested)
+      if (nested && specs->declspec_il == cdil_none)
 	{
 	  tree decl = current_function_decl;
 	  /* Mark nested functions as needing static-chain initially.
@@ -3234,6 +3252,15 @@ c_parser_declaration_or_fndef (c_parser *parser, bool fndef_ok,
 	  finish_function (endloc);
 	  c_pop_function_context ();
 	  add_stmt (build_stmt (DECL_SOURCE_LOCATION (decl), DECL_EXPR, decl));
+	}
+      else if (nested)
+	{
+	  if (specs->declspec_il == cdil_rtl)
+	    error ("%<__RTL%> function cannot be a nested function");
+	  else
+	    error ("%<__GIMPLE%> function cannot be a nested function");
+	  finish_function (endloc);
+	  c_pop_function_context ();
 	}
       else
 	{
@@ -5846,9 +5873,6 @@ c_parser_balanced_token_sequence (c_parser *parser)
     }
 }
 
-static bool c_parser_check_balanced_raw_token_sequence (c_parser *,
-							unsigned int *);
-
 /* Parse arguments of omp::directive or omp::decl attribute.
 
    directive-name ,[opt] clause-list[opt]
@@ -7715,7 +7739,7 @@ c_parser_compound_statement_nostart (c_parser *parser)
 		     == RID_EXTENSION))
 	    c_parser_consume_token (parser);
 	  if (!have_std_attrs
-	      && (c_token_starts_declaration (c_parser_peek_2nd_token (parser))
+	      && (c_parser_next_tokens_start_declaration (parser, 2)
 		  || c_parser_nth_token_starts_std_attributes (parser, 2)))
 	    {
 	      int ext;
@@ -9123,7 +9147,7 @@ c_parser_for_statement (c_parser *parser, bool ivdep, unsigned short unroll,
 		 && (c_parser_peek_2nd_token (parser)->keyword
 		     == RID_EXTENSION))
 	    c_parser_consume_token (parser);
-	  if (c_token_starts_declaration (c_parser_peek_2nd_token (parser))
+	  if (c_parser_next_tokens_start_declaration (parser, 2)
 	      || c_parser_nth_token_starts_std_attributes (parser, 2))
 	    {
 	      int ext;
@@ -10504,8 +10528,9 @@ c_parser_cast_expression (c_parser *parser, struct c_expr *after)
      _Countof ( type-name )
      sizeof unary-expression
      sizeof ( type-name )
+     static-assert-declaration-no-semi
 
-   (_Countof is new in C2y.)
+   (_Countof and the use of static assertions in expressions are new in C2y.)
 
    unary-operator: one of
      & * + - ~ !
@@ -10670,6 +10695,15 @@ c_parser_unary_expression (c_parser *parser)
 	case RID_TRANSACTION_RELAXED:
 	  return c_parser_transaction_expression (parser,
 	      c_parser_peek_token (parser)->keyword);
+	case RID_STATIC_ASSERT:
+	  c_parser_static_assert_declaration_no_semi (parser);
+	  pedwarn_c23 (op_loc, OPT_Wpedantic,
+		       "ISO C does not support static assertions in "
+		       "expressions before C2Y");
+	  ret.value = void_node;
+	  set_c_expr_source_range (&ret, op_loc, op_loc);
+	  ret.m_decimal = 0;
+	  return ret;
 	default:
 	  return c_parser_postfix_expression (parser);
 	}
@@ -11174,9 +11208,12 @@ c_parser_generic_selection (c_parser *parser)
   else
     {
       c_inhibit_evaluation_warnings++;
+      in_generic++;
       selector = c_parser_expr_no_commas (parser, NULL);
       selector = default_function_array_conversion (selector_loc, selector);
       c_inhibit_evaluation_warnings--;
+      in_generic--;
+      pop_maybe_used (!flag_isoc23);
 
       if (selector.value == error_mark_node)
 	{
@@ -11205,6 +11242,7 @@ c_parser_generic_selection (c_parser *parser)
     }
 
   auto_vec<c_generic_association> associations;
+  struct maybe_used_decl *maybe_used_default = NULL;
   while (1)
     {
       struct c_generic_association assoc, *iter;
@@ -11227,7 +11265,7 @@ c_parser_generic_selection (c_parser *parser)
 	      c_parser_skip_until_found (parser, CPP_CLOSE_PAREN, NULL);
 	      return error_expr;
 	    }
-	  assoc.type = groktypename (type_name, NULL, NULL);
+	  assoc.type = grokgenassoc (type_name);
 	  if (assoc.type == error_mark_node)
 	    {
 	      c_parser_skip_until_found (parser, CPP_CLOSE_PAREN, NULL);
@@ -11244,9 +11282,9 @@ c_parser_generic_selection (c_parser *parser)
 			 "incomplete type before C2Y");
 
 	  if (c_type_variably_modified_p (assoc.type))
-	    error_at (assoc.type_location,
-		      "%<_Generic%> association has "
-		      "variable length type");
+	    pedwarn_c23 (assoc.type_location, OPT_Wpedantic,
+			 "ISO C does not support %<_Generic%> association with "
+			 "variably-modified type before C2Y");
 	}
 
       if (!c_parser_require (parser, CPP_COLON, "expected %<:%>"))
@@ -11260,11 +11298,19 @@ c_parser_generic_selection (c_parser *parser)
 
       if (!match)
 	c_inhibit_evaluation_warnings++;
+      in_generic++;
 
       assoc.expression = c_parser_expr_no_commas (parser, NULL);
 
       if (!match)
 	  c_inhibit_evaluation_warnings--;
+      in_generic--;
+      if (!match)
+	pop_maybe_used (!flag_isoc23);
+      else if (assoc.type == NULL_TREE)
+	maybe_used_default = save_maybe_used ();
+      else
+	pop_maybe_used (true);
 
       if (assoc.expression.value == error_mark_node)
 	{
@@ -11323,6 +11369,20 @@ c_parser_generic_selection (c_parser *parser)
       if (c_parser_peek_token (parser)->type != CPP_COMMA)
 	break;
       c_parser_consume_token (parser);
+    }
+
+  if (match_found >= 0 && matched_assoc.type == NULL_TREE)
+    {
+      /* Declarations referenced in the default association are used.  */
+      restore_maybe_used (maybe_used_default);
+      pop_maybe_used (true);
+    }
+  else if (maybe_used_default)
+    {
+      /* Declarations referenced in the default association are not used, but
+	 are treated as used before C23.  */
+      restore_maybe_used (maybe_used_default);
+      pop_maybe_used (!flag_isoc23);
     }
 
   unsigned int ix;
@@ -15752,11 +15812,15 @@ c_parser_pragma (c_parser *parser, enum pragma_context context, bool *if_p,
   gcc_assert (id != PRAGMA_NONE);
   if (parser->omp_for_parse_state
       && parser->omp_for_parse_state->in_intervening_code
-      && id >= PRAGMA_OMP__START_
-      && id <= PRAGMA_OMP__LAST_)
+      && id >= PRAGMA_OMP__START_ && id <= PRAGMA_OMP__LAST_
+      /* Allow a safe subset of non-executable directives. See classification in
+	 array c_omp_directives.  */
+      && id != PRAGMA_OMP_METADIRECTIVE && id != PRAGMA_OMP_NOTHING
+      && id != PRAGMA_OMP_ASSUME && id != PRAGMA_OMP_ERROR)
     {
-      error_at (input_location,
-		"intervening code must not contain OpenMP directives");
+      error_at (
+	input_location,
+	"intervening code must not contain executable OpenMP directives");
       parser->omp_for_parse_state->fail = true;
       c_parser_skip_until_found (parser, CPP_PRAGMA_EOL, NULL);
       return false;
@@ -27767,6 +27831,13 @@ c_finish_omp_declare_simd (c_parser *parser, tree fndecl, tree parms,
       clauses[0].type = CPP_EOF;
       return;
     }
+  if (DECL_FUNCTION_VERSIONED (fndecl))
+    {
+      error_at (DECL_SOURCE_LOCATION (fndecl),
+		"%<#pragma omp declare %s%> cannot be used with function "
+		"multi-versioning", kind);
+      return;
+    }
 
   if (parms == NULL_TREE)
     parms = DECL_ARGUMENTS (fndecl);
@@ -29292,6 +29363,14 @@ c_parser_omp_error (c_parser *parser, enum pragma_context context)
 			 "may only be used in compound statements");
 	  return true;
 	}
+      if (parser->omp_for_parse_state
+	  && parser->omp_for_parse_state->in_intervening_code)
+	{
+	  error_at (loc, "%<#pragma omp error%> with %<at(execution)%> clause "
+			 "may not be used in intervening code");
+	  parser->omp_for_parse_state->fail = true;
+	  return true;
+	}
       tree fndecl
 	= builtin_decl_explicit (severity_fatal ? BUILT_IN_GOMP_ERROR
 						: BUILT_IN_GOMP_WARNING);
@@ -29438,6 +29517,7 @@ c_parser_omp_assumption_clauses (c_parser *parser, bool is_assume)
 						      directive[1],
 						      directive[2]);
 		      if (dir
+			  && dir->id != PRAGMA_OMP_END
 			  && (dir->kind == C_OMP_DIR_DECLARATIVE
 			      || dir->kind == C_OMP_DIR_INFORMATIONAL
 			      || dir->kind == C_OMP_DIR_META))
@@ -29821,6 +29901,17 @@ c_parser_omp_metadirective (c_parser *parser, bool *if_p)
     }
   c_parser_skip_to_pragma_eol (parser);
 
+  /* If only one selector matches and it evaluates to 'omp nothing', no need to
+     proceed.  */
+  if (ctxs.length () == 1)
+    {
+      tree ctx = ctxs[0];
+      if (ctx == NULL_TREE
+	  || (omp_context_selector_matches (ctx, NULL_TREE, false) == 1
+	      && directive_tokens[0].pragma_kind == PRAGMA_OMP_NOTHING))
+	return;
+    }
+
   if (!default_seen)
     {
       /* Add a default clause that evaluates to 'omp nothing'.  */
@@ -29901,7 +29992,7 @@ c_parser_omp_metadirective (c_parser *parser, bool *if_p)
 	  if (standalone_body == NULL_TREE)
 	    {
 	      standalone_body = push_stmt_list ();
-	      c_parser_statement (parser, if_p);
+	      c_parser_statement (parser, if_p); // TODO skip this
 	      standalone_body = pop_stmt_list (standalone_body);
 	    }
 	  else
@@ -30173,10 +30264,12 @@ c_parser_transaction (c_parser *parser, enum rid keyword)
   if (flag_tm)
     stmt = c_finish_transaction (loc, stmt, this_in);
   else
-    error_at (loc, (keyword == RID_TRANSACTION_ATOMIC ?
-	"%<__transaction_atomic%> without transactional memory support enabled"
-	: "%<__transaction_relaxed %> "
-	"without transactional memory support enabled"));
+    error_at (loc, 
+	      keyword == RID_TRANSACTION_ATOMIC
+	      ? G_("%<__transaction_atomic%> without transactional memory "
+		   "support enabled")
+	      : G_("%<__transaction_relaxed%> without transactional memory "
+		   "support enabled"));
 
   return stmt;
 }
@@ -30240,10 +30333,12 @@ c_parser_transaction_expression (c_parser *parser, enum rid keyword)
   parser->in_transaction = old_in;
 
   if (!flag_tm)
-    error_at (loc, (keyword == RID_TRANSACTION_ATOMIC ?
-	"%<__transaction_atomic%> without transactional memory support enabled"
-	: "%<__transaction_relaxed %> "
-	"without transactional memory support enabled"));
+    error_at (loc,
+	      keyword == RID_TRANSACTION_ATOMIC
+	      ? G_("%<__transaction_atomic%> without transactional memory "
+		   "support enabled")
+	      : G_("%<__transaction_relaxed%> without transactional memory "
+		   "support enabled"));
 
   set_c_expr_source_range (&ret, loc, loc);
 

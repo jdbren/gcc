@@ -46,6 +46,7 @@ along with GCC; see the file COPYING3.  If not see
 #include "predict.h"
 #include "memmodel.h"
 #include "gimplify.h"
+#include "contracts.h"
 
 /* There routines provide a modular interface to perform many parsing
    operations.  They may therefore be used during actual parsing, or
@@ -918,10 +919,12 @@ finish_goto_stmt (tree destination)
 	}
     }
 
-  check_goto (destination);
-
   add_stmt (build_predict_expr (PRED_GOTO, NOT_TAKEN));
-  return add_stmt (build_stmt (input_location, GOTO_EXPR, destination));
+
+  tree stmt = build_stmt (input_location, GOTO_EXPR, destination);
+  check_goto (&TREE_OPERAND (stmt, 0));
+
+  return add_stmt (stmt);
 }
 
 /* Returns true if T corresponds to an assignment operator expression.  */
@@ -3324,6 +3327,13 @@ finish_call_expr (tree fn, vec<tree, va_gc> **args, bool disallow_virtual,
 
   orig_fn = fn;
 
+  if (concept_check_p (fn))
+    {
+      error_at (EXPR_LOC_OR_LOC (fn, input_location),
+		"cannot call a concept as a function");
+      return error_mark_node;
+    }
+
   if (processing_template_decl)
     {
       /* If FN is a local extern declaration (or set thereof) in a template,
@@ -3452,12 +3462,6 @@ finish_call_expr (tree fn, vec<tree, va_gc> **args, bool disallow_virtual,
 				       : LOOKUP_NORMAL),
 				      /*fn_p=*/NULL,
 				      complain);
-    }
-  else if (concept_check_p (fn))
-    {
-      error_at (EXPR_LOC_OR_LOC (fn, input_location),
-		"cannot call a concept as a function");
-      return error_mark_node;
     }
   else if (is_overloaded_fn (fn))
     {
@@ -13591,6 +13595,9 @@ trait_expr_value (cp_trait_kind kind, tree type1, tree type2)
     case CPTK_IS_FUNCTION:
       return type_code1 == FUNCTION_TYPE;
 
+    case CPTK_IS_IMPLICIT_LIFETIME:
+      return implicit_lifetime_type_p (type1);
+
     case CPTK_IS_INVOCABLE:
       return !error_operand_p (build_invoke (type1, type2, tf_none));
 
@@ -13910,6 +13917,7 @@ finish_trait_expr (location_t loc, cp_trait_kind kind, tree type1, tree type2)
        type to know whether an array is an aggregate, so use kind=4 here.  */
     case CPTK_IS_AGGREGATE:
     case CPTK_IS_FINAL:
+    case CPTK_IS_IMPLICIT_LIFETIME:
       if (!check_trait_type (type1, /* kind = */ 4))
 	return error_mark_node;
       break;

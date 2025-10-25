@@ -449,6 +449,30 @@ scalar_chain::analyze_register_chain (bitmap candidates, df_ref ref,
   return true;
 }
 
+/* Check whether X is a convertible *concatditi_? variant.  X is known
+   to be any_or_plus:TI, i.e. PLUS:TI, IOR:TI or XOR:TI.  */
+
+static bool
+timode_concatdi_p (rtx x)
+{
+  rtx op0 = XEXP (x, 0);
+  rtx op1 = XEXP (x, 1);
+
+  if (GET_CODE (op1) == ASHIFT)
+    std::swap (op0, op1);
+
+  return GET_CODE (op0) == ASHIFT
+	 && GET_CODE (XEXP (op0, 0)) == ZERO_EXTEND
+	 && GET_MODE (XEXP (XEXP (op0, 0), 0)) == DImode
+	 && REG_P (XEXP (XEXP (op0, 0), 0))
+	 && CONST_INT_P (XEXP (op0, 1))
+	 && INTVAL (XEXP (op0, 1)) == 64
+	 && GET_CODE (op1) == ZERO_EXTEND
+	 && GET_MODE (XEXP (op1, 0)) == DImode
+	 && REG_P (XEXP (op1, 0));
+}
+
+
 /* Add instruction into a chain.  Return true if OK, false if the search
    was aborted.  */
 
@@ -477,9 +501,26 @@ scalar_chain::add_insn (bitmap candidates, unsigned int insn_uid,
       if (!analyze_register_chain (candidates, ref, disallowed))
 	return false;
 
-  /* The operand(s) of VEC_SELECT don't need to be converted/convertible.  */
-  if (def_set && GET_CODE (SET_SRC (def_set)) == VEC_SELECT)
-    return true;
+  /* The operand(s) of VEC_SELECT, ZERO_EXTEND and similar ops don't need
+     to be converted/convertible.  */
+  if (def_set)
+    switch (GET_CODE (SET_SRC (def_set)))
+      {
+      case VEC_SELECT:
+	return true;
+      case ZERO_EXTEND:
+	if (GET_MODE (XEXP (SET_SRC (def_set), 0)) == DImode)
+	  return true;
+	break;
+      case PLUS:
+      case IOR:
+      case XOR:
+	if (smode == TImode && timode_concatdi_p (SET_SRC (def_set)))
+	  return true;
+	break;
+      default:
+	break;
+      }
 
   for (ref = DF_INSN_UID_USES (insn_uid); ref; ref = DF_REF_NEXT_LOC (ref))
     if (!DF_REF_REG_MEM_P (ref))
@@ -545,7 +586,7 @@ scalar_chain::build (bitmap candidates, unsigned insn_uid, bitmap disallowed)
   return true;
 }
 
-/* Return a cost of building a vector costant
+/* Return a cost of building a vector constant
    instead of using a scalar one.  */
 
 int
@@ -1628,12 +1669,32 @@ timode_scalar_chain::compute_convert_gain ()
 	  break;
 
 	case AND:
-	case XOR:
-	case IOR:
 	  if (!MEM_P (dst))
 	    igain = COSTS_N_INSNS (1);
 	  if (CONST_SCALAR_INT_P (XEXP (src, 1)))
 	    igain += timode_immed_const_gain (XEXP (src, 1), bb);
+	  break;
+
+	case XOR:
+	case IOR:
+	  if (timode_concatdi_p (src))
+	    {
+	      /* vmovq;vpinsrq (11 bytes).  */
+	      igain = speed_p ? -2 * ix86_cost->sse_to_integer
+			      : -COSTS_N_BYTES (11);
+	      break;
+	    }
+	  if (!MEM_P (dst))
+	    igain = COSTS_N_INSNS (1);
+	  if (CONST_SCALAR_INT_P (XEXP (src, 1)))
+	    igain += timode_immed_const_gain (XEXP (src, 1), bb);
+	  break;
+
+	case PLUS:
+	  if (timode_concatdi_p (src))
+	    /* vmovq;vpinsrq (11 bytes).  */
+	    igain = speed_p ? -2 * ix86_cost->sse_to_integer
+			    : -COSTS_N_BYTES (11);
 	  break;
 
 	case ASHIFT:
@@ -1794,6 +1855,13 @@ timode_scalar_chain::compute_convert_gain ()
 	    igain = !speed_p ? -COSTS_N_BYTES (6) : -COSTS_N_INSNS (1);
 	  break;
 
+	case ZERO_EXTEND:
+	  if (GET_MODE (XEXP (src, 0)) == DImode)
+	    /* xor (2 bytes) vs. vmovq (5 bytes).  */
+	    igain = speed_p ? COSTS_N_INSNS (1) - ix86_cost->sse_to_integer
+			    : -COSTS_N_BYTES (3);
+	  break;
+
 	default:
 	  break;
 	}
@@ -1856,6 +1924,28 @@ timode_scalar_chain::fix_debug_reg_uses (rtx reg)
 	    df_insn_rescan (insn);
 	}
     }
+}
+
+/* Convert SRC, a *concatditi3 pattern, into a vec_concatv2di instruction.
+   Insert this before INSN, and return the result as a V1TImode subreg.  */
+
+static rtx
+timode_convert_concatdi (rtx src, rtx_insn *insn)
+{
+  rtx hi, lo;
+  rtx tmp = gen_reg_rtx (V2DImode);
+  if (GET_CODE (XEXP (src, 0)) == ASHIFT)
+    {
+      hi = XEXP (XEXP (XEXP (src, 0), 0), 0);
+      lo = XEXP (XEXP (src, 1), 0);
+    }
+  else
+    {
+      hi = XEXP (XEXP (XEXP (src, 1), 0), 0);
+      lo = XEXP (XEXP (src, 0), 0);
+    }
+  emit_insn_before (gen_vec_concatv2di (tmp, lo, hi), insn);
+  return gen_rtx_SUBREG (V1TImode, tmp, 0);
 }
 
 /* Convert INSN from TImode to V1T1mode.  */
@@ -1967,10 +2057,24 @@ timode_scalar_chain::convert_insn (rtx_insn *insn)
 	  PUT_MODE (src, V1TImode);
 	  break;
 	}
-      /* FALLTHRU */
+      convert_op (&XEXP (src, 0), insn);
+      convert_op (&XEXP (src, 1), insn);
+      PUT_MODE (src, V1TImode);
+      if (MEM_P (dst))
+	{
+	  tmp = gen_reg_rtx (V1TImode);
+	  emit_insn_before (gen_rtx_SET (tmp, src), insn);
+	  src = tmp;
+	}
+      break;
 
     case XOR:
     case IOR:
+      if (timode_concatdi_p (src))
+	{
+	  src = timode_convert_concatdi (src, insn);
+	  break;
+	}
       convert_op (&XEXP (src, 0), insn);
       convert_op (&XEXP (src, 1), insn);
       PUT_MODE (src, V1TImode);
@@ -2008,6 +2112,26 @@ timode_scalar_chain::convert_insn (rtx_insn *insn)
     case ROTATE:
       convert_op (&XEXP (src, 0), insn);
       PUT_MODE (src, V1TImode);
+      break;
+
+    case ZERO_EXTEND:
+      if (GET_MODE (XEXP (src, 0)) == DImode)
+	{
+	  /* Convert to *vec_concatv2di_0.  */
+	  rtx tmp = gen_reg_rtx (V2DImode);
+	  rtx pat = gen_rtx_VEC_CONCAT (V2DImode, XEXP (src, 0), const0_rtx);
+	  emit_insn_before (gen_move_insn (tmp, pat), insn);
+	  src = gen_rtx_SUBREG (vmode, tmp, 0);
+	}
+      else
+	gcc_unreachable ();
+      break;
+
+    case PLUS:
+      if (timode_concatdi_p (src))
+	src = timode_convert_concatdi (src, insn);
+      else
+	gcc_unreachable ();
       break;
 
     default:
@@ -2389,6 +2513,8 @@ timode_scalar_to_vector_candidate_p (rtx_insn *insn)
 
     case IOR:
     case XOR:
+      if (timode_concatdi_p (src))
+	return true;
       return (REG_P (XEXP (src, 0))
 	      || timode_mem_p (XEXP (src, 0)))
 	     && (REG_P (XEXP (src, 1))
@@ -2407,6 +2533,13 @@ timode_scalar_to_vector_candidate_p (rtx_insn *insn)
       return REG_P (XEXP (src, 0))
 	     && CONST_INT_P (XEXP (src, 1))
 	     && (INTVAL (XEXP (src, 1)) & ~0x7f) == 0;
+
+    case PLUS:
+      return timode_concatdi_p (src);
+
+    case ZERO_EXTEND:
+      return REG_P (XEXP (src, 0))
+	     && GET_MODE (XEXP (src, 0)) == DImode;
 
     default:
       return false;
@@ -5299,8 +5432,7 @@ static tree
 ix86_mangle_function_version_assembler_name (tree decl, tree id)
 {
   tree version_attr;
-  const char *orig_name, *version_string;
-  char *attr_str, *assembler_name;
+  char *attr_str;
 
   if (DECL_DECLARED_INLINE_P (decl)
       && lookup_attribute ("gnu_inline",
@@ -5318,25 +5450,16 @@ ix86_mangle_function_version_assembler_name (tree decl, tree id)
   /* target attribute string cannot be NULL.  */
   gcc_assert (version_attr != NULL_TREE);
 
-  orig_name = IDENTIFIER_POINTER (id);
-  version_string
-    = TREE_STRING_POINTER (TREE_VALUE (TREE_VALUE (version_attr)));
-
-  if (strcmp (version_string, "default") == 0)
-    return id;
-
   attr_str = sorted_attr_string (TREE_VALUE (version_attr));
-  assembler_name = XNEWVEC (char, strlen (orig_name) + strlen (attr_str) + 2);
-
-  sprintf (assembler_name, "%s.%s", orig_name, attr_str);
 
   /* Allow assembler name to be modified if already set.  */
   if (DECL_ASSEMBLER_NAME_SET_P (decl))
     SET_DECL_RTL (decl, NULL);
 
-  tree ret = get_identifier (assembler_name);
+  tree ret = clone_identifier (id, attr_str, true);
+
   XDELETEVEC (attr_str);
-  XDELETEVEC (assembler_name);
+
   return ret;
 }
 
@@ -5344,9 +5467,21 @@ tree
 ix86_mangle_decl_assembler_name (tree decl, tree id)
 {
   /* For function version, add the target suffix to the assembler name.  */
-  if (TREE_CODE (decl) == FUNCTION_DECL
-      && DECL_FUNCTION_VERSIONED (decl))
-    id = ix86_mangle_function_version_assembler_name (decl, id);
+  if (TREE_CODE (decl) == FUNCTION_DECL)
+    {
+      cgraph_node *node = cgraph_node::get (decl);
+      /* Mangle all versions when annotated with target_clones, but only
+	 non-default versions when annotated with target attributes.  */
+      if (DECL_FUNCTION_VERSIONED (decl)
+	  && (node->is_target_clone
+	      || !is_function_default_version (node->decl)))
+	id = ix86_mangle_function_version_assembler_name (decl, id);
+      /* Mangle the dispatched symbol but only in the case of target clones.  */
+      else if (node && node->dispatcher_function && !node->is_target_clone)
+	id = clone_identifier (id, "ifunc");
+      else if (node && node->dispatcher_resolver_function)
+	id = clone_identifier (id, "resolver");
+    }
 #ifdef SUBTARGET_MANGLE_DECL_ASSEMBLER_NAME
   id = SUBTARGET_MANGLE_DECL_ASSEMBLER_NAME (decl, id);
 #endif
@@ -5395,20 +5530,9 @@ ix86_get_function_versions_dispatcher (void *decl)
   if (targetm.has_ifunc_p ())
     {
       struct cgraph_function_version_info *it_v = NULL;
-      struct cgraph_node *dispatcher_node = NULL;
-      struct cgraph_function_version_info *dispatcher_version_info = NULL;
 
       /* Right now, the dispatching is done via ifunc.  */
       dispatch_decl = make_dispatcher_decl (default_node->decl);
-      TREE_NOTHROW (dispatch_decl) = TREE_NOTHROW (fn);
-
-      dispatcher_node = cgraph_node::get_create (dispatch_decl);
-      gcc_assert (dispatcher_node != NULL);
-      dispatcher_node->dispatcher_function = 1;
-      dispatcher_version_info
-	= dispatcher_node->insert_new_function_version ();
-      dispatcher_version_info->next = default_version_info;
-      dispatcher_node->definition = 1;
 
       /* Set the dispatcher for all the versions.  */
       it_v = default_version_info;
@@ -5442,17 +5566,28 @@ make_resolver_func (const tree default_decl,
 {
   tree decl, type, t;
 
-  /* Create resolver function name based on default_decl.  */
-  tree decl_name = clone_function_name (default_decl, "resolver");
-  const char *resolver_name = IDENTIFIER_POINTER (decl_name);
-
   /* The resolver function should return a (void *). */
   type = build_function_type_list (ptr_type_node, NULL_TREE);
 
-  decl = build_fn_decl (resolver_name, type);
-  SET_DECL_ASSEMBLER_NAME (decl, decl_name);
+  cgraph_node *node = cgraph_node::get (default_decl);
+  gcc_assert (node && node->function_version ());
 
-  DECL_NAME (decl) = decl_name;
+  decl = build_fn_decl (IDENTIFIER_POINTER (DECL_NAME (default_decl)), type);
+
+  /* Set the assembler name to prevent cgraph_node attempting to mangle.  */
+  SET_DECL_ASSEMBLER_NAME (decl, DECL_ASSEMBLER_NAME (default_decl));
+
+  cgraph_node *resolver_node = cgraph_node::get_create (decl);
+  resolver_node->dispatcher_resolver_function = true;
+
+  if (node->is_target_clone)
+    resolver_node->is_target_clone = true;
+
+  tree id = ix86_mangle_decl_assembler_name
+    (decl, node->function_version ()->assembler_name);
+  SET_DECL_ASSEMBLER_NAME (decl, id);
+
+  DECL_NAME (decl) = DECL_NAME (default_decl);
   TREE_USED (decl) = 1;
   DECL_ARTIFICIAL (decl) = 1;
   DECL_IGNORED_P (decl) = 1;
@@ -5499,7 +5634,7 @@ make_resolver_func (const tree default_decl,
   gcc_assert (ifunc_alias_decl != NULL);
   /* Mark ifunc_alias_decl as "ifunc" with resolver as resolver_name.  */
   DECL_ATTRIBUTES (ifunc_alias_decl)
-    = make_attribute ("ifunc", resolver_name,
+    = make_attribute ("ifunc", IDENTIFIER_POINTER (DECL_ASSEMBLER_NAME (decl)),
 		      DECL_ATTRIBUTES (ifunc_alias_decl));
 
   /* Create the alias for dispatch to resolver here.  */

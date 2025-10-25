@@ -317,6 +317,7 @@ struct riscv_tune_param
   const char *function_align;
   const char *jump_align;
   const char *loop_align;
+  bool prefer_agnostic;
 };
 
 
@@ -481,6 +482,7 @@ static const struct riscv_tune_param generic_tune_info = {
   NULL,						/* function_align */
   NULL,						/* jump_align */
   NULL,						/* loop_align */
+  false,					/* prefer-agnostic.  */
 };
 
 /* Costs to use when optimizing for rocket.  */
@@ -505,6 +507,7 @@ static const struct riscv_tune_param rocket_tune_info = {
   NULL,						/* function_align */
   NULL,						/* jump_align */
   NULL,						/* loop_align */
+  false,					/* prefer-agnostic.  */
 };
 
 /* Costs to use when optimizing for Sifive 7 Series.  */
@@ -529,6 +532,7 @@ static const struct riscv_tune_param sifive_7_tune_info = {
   NULL,						/* function_align */
   NULL,						/* jump_align */
   NULL,						/* loop_align */
+  false,					/* prefer-agnostic.  */
 };
 
 /* Costs to use when optimizing for Sifive p400 Series.  */
@@ -553,6 +557,7 @@ static const struct riscv_tune_param sifive_p400_tune_info = {
   NULL,						/* function_align */
   NULL,						/* jump_align */
   NULL,						/* loop_align */
+  true,						/* prefer-agnostic.  */
 };
 
 /* Costs to use when optimizing for Sifive p600 Series.  */
@@ -577,6 +582,7 @@ static const struct riscv_tune_param sifive_p600_tune_info = {
   NULL,						/* function_align */
   NULL,						/* jump_align */
   NULL,						/* loop_align */
+  true,						/* prefer-agnostic.  */
 };
 
 /* Costs to use when optimizing for T-HEAD c906.  */
@@ -601,6 +607,7 @@ static const struct riscv_tune_param thead_c906_tune_info = {
   NULL,						/* function_align */
   NULL,						/* jump_align */
   NULL,						/* loop_align */
+  false,					/* prefer-agnostic.  */
 };
 
 /* Costs to use when optimizing for xiangshan nanhu.  */
@@ -625,6 +632,7 @@ static const struct riscv_tune_param xiangshan_nanhu_tune_info = {
   NULL,						/* function_align */
   NULL,						/* jump_align */
   NULL,						/* loop_align */
+  true,						/* prefer-agnostic.  */
 };
 
 /* Costs to use when optimizing for a generic ooo profile.  */
@@ -649,6 +657,7 @@ static const struct riscv_tune_param generic_ooo_tune_info = {
   NULL,						/* function_align */
   NULL,						/* jump_align */
   NULL,						/* loop_align */
+  true,						/* prefer-agnostic.  */
 };
 
 /* Costs to use when optimizing for Tenstorrent Ascalon 8 wide.  */
@@ -659,7 +668,7 @@ static const struct riscv_tune_param tt_ascalon_d8_tune_info = {
   {COSTS_N_INSNS (3), COSTS_N_INSNS (3)},	/* int_mul */
   {COSTS_N_INSNS (13), COSTS_N_INSNS (13)},	/* int_div */
   8,						/* issue_rate */
-  3,						/* branch_cost */
+  4,						/* branch_cost */
   4,						/* memory_cost */
   4,						/* fmv_cost */
   false,					/* slow_unaligned_access */
@@ -673,6 +682,7 @@ static const struct riscv_tune_param tt_ascalon_d8_tune_info = {
   NULL,						/* function_align */
   NULL,						/* jump_align */
   NULL,						/* loop_align */
+  true,						/* prefer-agnostic.  */
 };
 
 /* Costs to use when optimizing for size.  */
@@ -697,6 +707,7 @@ static const struct riscv_tune_param optimize_size_tune_info = {
   NULL,						/* function_align */
   NULL,						/* jump_align */
   NULL,						/* loop_align */
+  false,					/* prefer-agnostic.  */
 };
 
 /* Costs to use when optimizing for MIPS P8700 */
@@ -720,7 +731,8 @@ static const struct riscv_tune_param mips_p8700_tune_info = {
   NULL,         /* vector cost */
   NULL,         /* function_align */
   NULL,         /* jump_align */
-  NULL,         /* loop_align */
+  NULL,		/* loop_align.  */
+  true,		/* prefer-agnostic.  */
 };
 
 static bool riscv_avoid_shrink_wrapping_separate ();
@@ -3686,7 +3698,8 @@ riscv_legitimize_move (machine_mode mode, rtx dest, rtx src)
 	 not enabled.  In that case we just want to let the standard
 	 expansion path run.  */
       if (riscv_vector::get_vector_mode (smode, nunits).exists (&vmode)
-	  && gen_lowpart_common (vmode, SUBREG_REG (src)))
+	  && gen_lowpart_common (vmode, SUBREG_REG (src))
+	  && convert_optab_handler (vec_extract_optab, vmode, smode))
 	{
 	  rtx v = gen_lowpart (vmode, SUBREG_REG (src));
 	  rtx int_reg = dest;
@@ -3933,6 +3946,10 @@ riscv_extend_cost (rtx op, bool unsigned_p)
   if (MEM_P (op))
     return 0;
 
+  /* Andes bfo patterns.  */
+  if (TARGET_XANDESPERF)
+    return COSTS_N_INSNS (1);
+
   if (unsigned_p && GET_MODE (op) == QImode)
     /* We can use ANDI.  */
     return COSTS_N_INSNS (1);
@@ -4162,6 +4179,12 @@ riscv_rtx_costs (rtx x, machine_mode mode, int outer_code, int opno ATTRIBUTE_UN
       return false;
 
     case AND:
+      /* Andes bfo patterns.  */
+      if (TARGET_XANDESPERF && GET_CODE (XEXP (x, 0)) == ASHIFT)
+	{
+	  *total = COSTS_N_INSNS (1);
+	  return true;
+	}
       /* slli.uw pattern for zba.  */
       if (TARGET_ZBA && TARGET_64BIT && mode == DImode
 	  && GET_CODE (XEXP (x, 0)) == ASHIFT)
@@ -4221,6 +4244,13 @@ riscv_rtx_costs (rtx x, machine_mode mode, int outer_code, int opno ATTRIBUTE_UN
       return false;
 
     case ZERO_EXTRACT:
+      /* Andes bbcs patterns.  */
+      if (TARGET_XANDESPERF
+	  && (outer_code == NE || outer_code == EQ))
+	{
+	  *total = 0;
+	  return true;
+	}
       /* This is an SImode shift.  */
       if (outer_code == SET
 	  && CONST_INT_P (XEXP (x, 1))
@@ -4246,6 +4276,12 @@ riscv_rtx_costs (rtx x, machine_mode mode, int outer_code, int opno ATTRIBUTE_UN
 	  && CONST_INT_P (XEXP (x, 2)))
 	{
 	  *total = COSTS_N_INSNS (SINGLE_SHIFT_COST);
+	  return true;
+	}
+      /* Andes bfo patterns.  */
+      if (TARGET_XANDESPERF)
+	{
+	  *total = COSTS_N_INSNS (1);
 	  return true;
 	}
       return false;
@@ -4414,6 +4450,15 @@ riscv_rtx_costs (rtx x, machine_mode mode, int outer_code, int opno ATTRIBUTE_UN
 		return true;
 	      }
 	  } while (false);
+	}
+
+      /* Andes lea patterns.  */
+      if (TARGET_XANDESPERF
+	  && ((TARGET_64BIT && GET_CODE (XEXP (x, 0)) == AND)
+	      || GET_CODE (XEXP (x, 0)) == ASHIFT))
+	{
+	  *total = COSTS_N_INSNS (1);
+	  return true;
 	}
 
       if (float_mode_p)
@@ -4607,9 +4652,6 @@ riscv_noce_conversion_profitable_p (rtx_insn *seq,
 				    struct noce_if_info *if_info)
 {
   struct noce_if_info riscv_if_info = *if_info;
-
-  riscv_if_info.original_cost -= COSTS_N_INSNS (2);
-  riscv_if_info.original_cost += insn_cost (if_info->jump, if_info->speed_p);
 
   /* Hack alert!  When `noce_try_store_flag_mask' uses `cstore<mode>4'
      to emit a conditional set operation on DImode output it comes up
@@ -8079,14 +8121,7 @@ riscv_compute_frame_info (void)
       /* Only use save/restore routines if they don't alter the stack size.  */
       if (riscv_stack_align (num_save_restore * UNITS_PER_WORD) == x_save_size
           && !riscv_avoid_save_libcall ())
-	{
-	  /* Libcall saves/restores 3 registers at once, so we need to
-	     allocate 12 bytes for callee-saved register.  */
-	  if (TARGET_RVE)
-	    x_save_size = 3 * UNITS_PER_WORD;
-
-	  frame->save_libcall_adjustment = x_save_size;
-	}
+        frame->save_libcall_adjustment = x_save_size;
 
       if (!riscv_avoid_multi_push (frame))
 	{
@@ -9004,8 +9039,7 @@ riscv_allocate_and_probe_stack_space (rtx temp1, HOST_WIDE_INT size)
 	 from the top of the frame, as it might be lowered before.
 	 To consider the correct SP addresses for the CFA notes, it is needed
 	 to correct them with the initial offset value.  */
-      HOST_WIDE_INT initial_cfa_offset
-	= cfun->machine->frame.total_size.to_constant () - size;
+      poly_int64 initial_cfa_offset = cfun->machine->frame.total_size - size;
 
       if (!frame_pointer_needed)
 	{
@@ -10346,6 +10380,7 @@ riscv_macro_fusion_pair_p (rtx_insn *prev, rtx_insn *curr)
 	  && GET_CODE (SET_SRC (curr_set)) == LSHIFTRT
 	  && REG_P (SET_DEST (prev_set))
 	  && REG_P (SET_DEST (curr_set))
+	  && REG_P (XEXP (SET_SRC (curr_set), 0))
 	  && REGNO (XEXP (SET_SRC (curr_set), 0)) == curr_dest_regno
 	  && CONST_INT_P (XEXP (SET_SRC (prev_set), 1))
 	  && CONST_INT_P (XEXP (SET_SRC (curr_set), 1))
@@ -10374,6 +10409,7 @@ riscv_macro_fusion_pair_p (rtx_insn *prev, rtx_insn *curr)
 	  && GET_CODE (SET_SRC (curr_set)) == LSHIFTRT
 	  && REG_P (SET_DEST (prev_set))
 	  && REG_P (SET_DEST (curr_set))
+	  && REG_P (XEXP (SET_SRC (curr_set), 0))
 	  && REGNO (XEXP (SET_SRC (curr_set), 0)) == curr_dest_regno
 	  && CONST_INT_P (XEXP (SET_SRC (prev_set), 1))
 	  && CONST_INT_P (XEXP (SET_SRC (curr_set), 1))
@@ -10397,6 +10433,7 @@ riscv_macro_fusion_pair_p (rtx_insn *prev, rtx_insn *curr)
 
       if (MEM_P (SET_SRC (curr_set))
 	  && SCALAR_INT_MODE_P (GET_MODE (SET_DEST (curr_set)))
+	  && REG_P (XEXP (SET_SRC (curr_set), 0))
 	  && REG_P (XEXP (SET_SRC (curr_set), 0))
 	  && REGNO (XEXP (SET_SRC (curr_set), 0)) == prev_dest_regno
 	  && GET_CODE (SET_SRC (prev_set)) == PLUS
@@ -10458,6 +10495,7 @@ riscv_macro_fusion_pair_p (rtx_insn *prev, rtx_insn *curr)
       if (MEM_P (SET_SRC (curr_set))
 	  && SCALAR_INT_MODE_P (GET_MODE (SET_DEST (curr_set)))
 	  && GET_CODE (XEXP (SET_SRC (curr_set), 0)) == PLUS
+	  && REG_P (XEXP (XEXP (SET_SRC (curr_set), 0), 0))
 	  && REGNO (XEXP (XEXP (SET_SRC (curr_set), 0), 0)) == prev_dest_regno)
 	{
 	  if (riscv_set_is_add (prev_set))
@@ -10516,8 +10554,8 @@ riscv_macro_fusion_pair_p (rtx_insn *prev, rtx_insn *curr)
 	  && MEM_P (XEXP (SET_SRC (curr_set), 0))
 	  && SCALAR_INT_MODE_P (GET_MODE (SET_DEST (curr_set)))
 	  && GET_CODE (XEXP (XEXP (SET_SRC (curr_set), 0), 0)) == PLUS
-	  && REG_P (XEXP (XEXP (XEXP (SET_SRC (curr_set), 0), 0),0))
-	  && (REGNO (XEXP (XEXP (XEXP (SET_SRC (curr_set), 0), 0),0))
+	  && REG_P (XEXP (XEXP (XEXP (SET_SRC (curr_set), 0), 0), 0))
+	  && (REGNO (XEXP (XEXP (XEXP (SET_SRC (curr_set), 0), 0), 0))
 	      == prev_dest_regno))
 	{
 	  if (riscv_set_is_adduw (prev_set))
@@ -10649,6 +10687,7 @@ riscv_macro_fusion_pair_p (rtx_insn *prev, rtx_insn *curr)
 	  && MEM_P (SET_SRC (curr_set))
 	  && SCALAR_INT_MODE_P (GET_MODE (SET_DEST (curr_set)))
 	  && GET_CODE (XEXP (SET_SRC (curr_set), 0)) == PLUS
+	  && REG_P (XEXP (XEXP (SET_SRC (curr_set), 0), 0))
 	  && REGNO (XEXP (XEXP (SET_SRC (curr_set), 0), 0)) == prev_dest_regno)
 	{
 	  if (dump_file)
@@ -10660,6 +10699,7 @@ riscv_macro_fusion_pair_p (rtx_insn *prev, rtx_insn *curr)
 	  && MEM_P (SET_SRC (curr_set))
 	  && SCALAR_INT_MODE_P (GET_MODE (SET_DEST (curr_set)))
 	  && GET_CODE (XEXP (SET_SRC (curr_set), 0)) == LO_SUM
+	  && REG_P (XEXP (XEXP (SET_SRC (curr_set), 0), 0))
 	  && REGNO (XEXP (XEXP (SET_SRC (curr_set), 0), 0)) == prev_dest_regno)
 	{
 	  if (dump_file)
@@ -10673,6 +10713,7 @@ riscv_macro_fusion_pair_p (rtx_insn *prev, rtx_insn *curr)
 	  && MEM_P (XEXP (SET_SRC (curr_set), 0))
 	  && SCALAR_INT_MODE_P (GET_MODE (SET_DEST (curr_set)))
 	  && (GET_CODE (XEXP (XEXP (SET_SRC (curr_set), 0), 0)) == LO_SUM
+	      && REG_P (XEXP (XEXP (XEXP (SET_SRC (curr_set), 0), 0), 0))
 	      && (REGNO (XEXP (XEXP (XEXP (SET_SRC (curr_set), 0), 0), 0))
 		  == prev_dest_regno)))
 	{
@@ -11964,6 +12005,12 @@ riscv_function_ok_for_sibcall (tree decl ATTRIBUTE_UNUSED,
   if (cfun->machine->interrupt_handler_p)
     return false;
 
+  /* Don't use sibcall if a non-vector CC function is being called
+     from a vector CC function.  */
+  if ((riscv_cc) crtl->abi->id () == RISCV_CC_V
+      && (riscv_cc) expr_callee_abi (exp).id () != RISCV_CC_V)
+    return false;
+
   /* Don't use sibcalls in the large model, because a sibcall instruction
      expanding and a epilogue expanding both use RISCV_PROLOGUE_TEMP
      register.  */
@@ -12594,6 +12641,13 @@ riscv_dwarf_poly_indeterminate_value (unsigned int i, unsigned int *factor,
   */
   gcc_assert (i == 1);
   *factor = BYTES_PER_RISCV_VECTOR.coeffs[1];
+
+  /* The factor will be zero if vector is not enabled.  That ultimately
+     causes problems in the dwarf2 emitter as the factor is used for
+     a division, causing a divide by zero.  */
+  if (*factor == 0)
+    *factor = 1;
+
   *offset = 1;
   return RISCV_DWARF_VLENB;
 }
@@ -12612,12 +12666,11 @@ riscv_estimated_poly_value (poly_int64 val,
 /* Return true if the vector misalignment factor is supported by the
    target.  */
 bool
-riscv_support_vector_misalignment (machine_mode mode, const_tree type,
-				   int misalignment, bool is_packed,
-				   bool is_gather_scatter)
+riscv_support_vector_misalignment (machine_mode mode, int misalignment,
+				   bool is_packed, bool is_gather_scatter)
 {
   /* IS_PACKED is true if the corresponding scalar element is not naturally
-     aligned.  If the misalignment is unknown and the the access is packed
+     aligned.  If the misalignment is unknown and the access is packed
      we defer to the default hook which will check if movmisalign is present.
      Movmisalign, in turn, depends on TARGET_VECTOR_MISALIGN_SUPPORTED.  */
   if (misalignment == DR_MISALIGNMENT_UNKNOWN)
@@ -12629,12 +12682,12 @@ riscv_support_vector_misalignment (machine_mode mode, const_tree type,
     {
       /* If we know that misalignment is a multiple of the element size, we're
 	 good.  */
-      if (misalignment % TYPE_ALIGN_UNIT (type) == 0)
+      if (misalignment % (GET_MODE_UNIT_SIZE (mode)) == 0)
 	return true;
     }
 
   /* Otherwise fall back to movmisalign again.  */
-  return default_builtin_support_vector_misalignment (mode, type, misalignment,
+  return default_builtin_support_vector_misalignment (mode, misalignment,
 						      is_packed,
 						      is_gather_scatter);
 }
@@ -12804,6 +12857,15 @@ bool
 strided_load_broadcast_p ()
 {
   return tune_param->use_zero_stride_load;
+}
+
+/* Return TRUE if we should use the tail agnostic and mask agnostic policies for
+   vector code, false otherwise.  */
+
+bool
+riscv_prefer_agnostic_p ()
+{
+  return tune_param->prefer_agnostic;
 }
 
 /* Return TRUE if we should use the divmod expander, FALSE otherwise.  This
@@ -13965,34 +14027,24 @@ riscv_c_mode_for_floating_type (enum tree_index ti)
   return default_mode_for_floating_type (ti);
 }
 
-/* Parse the attribute arguments to target_version in DECL and modify
-   the feature mask and priority required to select those targets.
+/* This parses the version string STR and modifies the feature mask and
+   priority required to select those targets.
    If LOC is nonnull, report diagnostics against *LOC, otherwise
    remain silent.  */
 static void
-parse_features_for_version (tree decl,
+parse_features_for_version (string_slice version_str,
 			    location_t *loc,
 			    struct riscv_feature_bits &res,
 			    int &priority)
 {
-  tree version_attr = lookup_attribute ("target_version",
-					DECL_ATTRIBUTES (decl));
-  if (version_attr == NULL_TREE)
+  gcc_assert (version_str.is_valid ());
+  if (version_str == "default")
     {
       res.length = 0;
       priority = 0;
       return;
     }
 
-  const char *version_string = TREE_STRING_POINTER (TREE_VALUE (TREE_VALUE
-						    (version_attr)));
-  gcc_assert (version_string != NULL);
-  if (strcmp (version_string, "default") == 0)
-    {
-      res.length = 0;
-      priority = 0;
-      return;
-    }
   struct cl_target_option cur_target;
   cl_target_option_save (&cur_target, &global_options,
 			 &global_options_set);
@@ -14002,7 +14054,7 @@ parse_features_for_version (tree decl,
   cl_target_option_restore (&global_options, &global_options_set,
 			    default_opts);
 
-  riscv_process_target_version_attr (TREE_VALUE (version_attr), loc);
+  riscv_process_target_version_str (version_str, loc);
 
   priority = global_options.x_riscv_fmv_priority;
   const char *arch_string = global_options.x_riscv_arch_string;
@@ -14054,6 +14106,23 @@ compare_fmv_features (const struct riscv_feature_bits &mask1,
   return 0;
 }
 
+/* This function returns true if V1 and V2 specify the same function
+   version.  */
+
+bool
+riscv_same_function_versions (string_slice v1, string_slice v2)
+{
+  struct riscv_feature_bits mask1, mask2;
+  int prio1, prio2;
+
+  /* Invalid features should have already been rejected by this point so
+     providing no location should be okay.  */
+  parse_features_for_version (v1, UNKNOWN_LOCATION, mask1, prio1);
+  parse_features_for_version (v2, UNKNOWN_LOCATION, mask2, prio2);
+
+  return compare_fmv_features (mask1, mask2, prio1, prio2) == 0;
+}
+
 /* Compare priorities of two version decls.  Return:
      1: mask1 is higher priority
     -1: mask2 is higher priority
@@ -14064,24 +14133,37 @@ riscv_compare_version_priority (tree decl1, tree decl2)
   struct riscv_feature_bits mask1, mask2;
   int prio1, prio2;
 
-  parse_features_for_version (decl1, nullptr, mask1, prio1);
-  parse_features_for_version (decl2, nullptr, mask2, prio2);
+  string_slice v1 = get_target_version (decl1);
+  string_slice v2 = get_target_version (decl2);
+
+  if (!v1.is_valid ())
+    v1 = "default";
+  if (!v2.is_valid ())
+    v2 = "default";
+
+  parse_features_for_version (v1, nullptr, mask1, prio1);
+  parse_features_for_version (v2, nullptr, mask2, prio2);
 
   return compare_fmv_features (mask1, mask2, prio1, prio2);
 }
 
-/* This function returns true if FN1 and FN2 are versions of the same function,
-   that is, the target_version attributes of the function decls are different.
-   This assumes that FN1 and FN2 have the same signature.  */
+/* Checks if the function version specifying string STR parses correctly.
+   If it is an invalid string, currently emits a diagnostic at LOC.
+   Always returns true.  */
 
 bool
-riscv_common_function_versions (tree fn1, tree fn2)
+riscv_check_target_clone_version (string_slice str, location_t *loc_p)
 {
-  if (TREE_CODE (fn1) != FUNCTION_DECL
-      || TREE_CODE (fn2) != FUNCTION_DECL)
-    return false;
+  struct riscv_feature_bits mask;
+  int prio;
 
-  return riscv_compare_version_priority (fn1, fn2) != 0;
+  /* Currently it is not possible to parse without emitting errors on failure
+     so do not reject on a failed parse, as this would then emit two
+     diagnostics.  Instead let errors be emitted which will halt
+     compilation.  */
+  parse_features_for_version (str, loc_p, mask, prio);
+
+  return true;
 }
 
 /* Implement TARGET_MANGLE_DECL_ASSEMBLER_NAME, to add function multiversioning
@@ -14091,32 +14173,31 @@ tree
 riscv_mangle_decl_assembler_name (tree decl, tree id)
 {
   /* For function version, add the target suffix to the assembler name.  */
-  if (TREE_CODE (decl) == FUNCTION_DECL
-      && DECL_FUNCTION_VERSIONED (decl))
+  if (TREE_CODE (decl) == FUNCTION_DECL)
     {
-      std::string name = IDENTIFIER_POINTER (id) + std::string (".");
-      tree target_attr = lookup_attribute ("target_version",
-					   DECL_ATTRIBUTES (decl));
-
-      if (target_attr == NULL_TREE)
+      cgraph_node *node = cgraph_node::get (decl);
+      if (node && node->dispatcher_resolver_function)
+	return clone_identifier (id, "resolver");
+      else if (DECL_FUNCTION_VERSIONED (decl))
 	{
-	  name += "default";
-	  return get_identifier (name.c_str ());
+	  tree target_attr
+	    = lookup_attribute ("target_version", DECL_ATTRIBUTES (decl));
+
+	  if (target_attr == NULL_TREE)
+	    return clone_identifier (id, "default");
+
+	  const char *version_string
+	    = TREE_STRING_POINTER (TREE_VALUE (TREE_VALUE (target_attr)));
+
+	  /* Replace non-alphanumeric characters with underscores as the suffix.
+	   */
+	  std::string suffix = "";
+	  for (const char *c = version_string; *c; c++)
+	    suffix += ISALNUM (*c) == 0 ? '_' : *c;
+
+	  id = clone_identifier (id, suffix.c_str ());
 	}
-
-      const char *version_string = TREE_STRING_POINTER (TREE_VALUE (TREE_VALUE
-							(target_attr)));
-
-      /* Replace non-alphanumeric characters with underscores as the suffix.  */
-      for (const char *c = version_string; *c; c++)
-	name += ISALNUM (*c) == 0 ? '_' : *c;
-
-      if (DECL_ASSEMBLER_NAME_SET_P (decl))
-	SET_DECL_RTL (decl, NULL);
-
-      id = get_identifier (name.c_str ());
     }
-
   return id;
 }
 
@@ -14367,7 +14448,10 @@ dispatch_function_versions (tree dispatch_decl,
       struct function_version_info version_info;
       version_info.version_decl = version_decl;
       // Get attribute string, parse it and find the right features.
-      parse_features_for_version (version_decl,
+      string_slice v = get_target_version (version_decl);
+      if (!v.is_valid ())
+	v = "default";
+      parse_features_for_version (v,
 				  &DECL_SOURCE_LOCATION (version_decl),
 				  version_info.features,
 				  version_info.prio);
@@ -14398,22 +14482,6 @@ dispatch_function_versions (tree dispatch_decl,
   return 0;
 }
 
-/* Return an identifier for the base assembler name of a versioned function.
-   This is computed by taking the default version's assembler name, and
-   stripping off the ".default" suffix if it's already been appended.  */
-
-static tree
-get_suffixed_assembler_name (tree default_decl, const char *suffix)
-{
-  std::string name = IDENTIFIER_POINTER (DECL_ASSEMBLER_NAME (default_decl));
-
-  auto size = name.size ();
-  if (size >= 8 && name.compare (size - 8, 8, ".default") == 0)
-    name.resize (size - 8);
-  name += suffix;
-  return get_identifier (name.c_str ());
-}
-
 /* Make the resolver function decl to dispatch the versions of
    a multi-versioned function,  DEFAULT_DECL.  IFUNC_ALIAS_DECL is
    ifunc alias that will point to the created resolver.  Create an
@@ -14427,10 +14495,8 @@ make_resolver_func (const tree default_decl,
 {
   tree decl, type, t;
 
-  /* Create resolver function name based on default_decl.  We need to remove an
-     existing ".default" suffix if this has already been appended.  */
-  tree decl_name = get_suffixed_assembler_name (default_decl, ".resolver");
-  const char *resolver_name = IDENTIFIER_POINTER (decl_name);
+  cgraph_node *node = cgraph_node::get (default_decl);
+  gcc_assert (node && node->function_version ());
 
   /* The resolver function should have signature
      (void *) resolver (uint64_t, void *) */
@@ -14439,10 +14505,21 @@ make_resolver_func (const tree default_decl,
 				   ptr_type_node,
 				   NULL_TREE);
 
-  decl = build_fn_decl (resolver_name, type);
-  SET_DECL_ASSEMBLER_NAME (decl, decl_name);
+  decl = build_fn_decl (IDENTIFIER_POINTER (DECL_NAME (default_decl)), type);
 
-  DECL_NAME (decl) = decl_name;
+  /* Set the assembler name to prevent cgraph_node attempting to mangle.  */
+  SET_DECL_ASSEMBLER_NAME (decl, DECL_ASSEMBLER_NAME (default_decl));
+
+  cgraph_node *resolver_node = cgraph_node::get_create (decl);
+  resolver_node->dispatcher_resolver_function = true;
+
+  if (node->is_target_clone)
+    resolver_node->is_target_clone = true;
+
+  tree id = riscv_mangle_decl_assembler_name
+    (decl, node->function_version ()->assembler_name);
+  symtab->change_decl_assembler_name (decl, id);
+
   TREE_USED (decl) = 1;
   DECL_ARTIFICIAL (decl) = 1;
   DECL_IGNORED_P (decl) = 1;
@@ -14507,7 +14584,7 @@ make_resolver_func (const tree default_decl,
   gcc_assert (ifunc_alias_decl != NULL);
   /* Mark ifunc_alias_decl as "ifunc" with resolver as resolver_name.  */
   DECL_ATTRIBUTES (ifunc_alias_decl)
-    = make_attribute ("ifunc", resolver_name,
+    = make_attribute ("ifunc", IDENTIFIER_POINTER (DECL_ASSEMBLER_NAME (decl)),
 		      DECL_ATTRIBUTES (ifunc_alias_decl));
 
   /* Create the alias for dispatch to resolver here.  */
@@ -14572,87 +14649,42 @@ riscv_generate_version_dispatcher_body (void *node_p)
   cgraph_edge::rebuild_edges ();
   pop_cfun ();
 
-  /* Fix up symbol names.  First we need to obtain the base name, which may
-     have already been mangled.  */
-  tree base_name = get_suffixed_assembler_name (default_ver_decl, "");
-
-  /* We need to redo the version mangling on the non-default versions for the
-     target_clones case.  Redoing the mangling for the target_version case is
-     redundant but does no harm.  We need to skip the default version, because
-     expand_clones will append ".default" later; fortunately that suffix is the
-     one we want anyway.  */
-  for (versn_info = node_version_info->next->next; versn_info;
-       versn_info = versn_info->next)
-    {
-      tree version_decl = versn_info->this_node->decl;
-      tree name = riscv_mangle_decl_assembler_name (version_decl,
-						    base_name);
-      symtab->change_decl_assembler_name (version_decl, name);
-    }
-
-  /* We also need to use the base name for the ifunc declaration.  */
-  symtab->change_decl_assembler_name (node->decl, base_name);
-
   return resolver_decl;
 }
 
-/* Make a dispatcher declaration for the multi-versioned function DECL.
-   Calls to DECL function will be replaced with calls to the dispatcher
-   by the front-end.  Returns the decl of the dispatcher function.  */
+/* Make a dispatcher declaration for the multi-versioned default function DECL.
+   Calls to DECL function will be replaced with calls to the dispatcher by
+   the target_clones pass.  Returns the decl of the dispatcher function.  */
 
 tree
 riscv_get_function_versions_dispatcher (void *decl)
 {
-  tree fn = (tree) decl;
-  struct cgraph_node *node = NULL;
-  struct cgraph_node *default_node = NULL;
-  struct cgraph_function_version_info *node_v = NULL;
-
+  tree default_decl = (tree) decl;
   tree dispatch_decl = NULL;
 
-  struct cgraph_function_version_info *default_version_info = NULL;
+  gcc_assert (decl != NULL
+	      && DECL_FUNCTION_VERSIONED (default_decl)
+	      && is_function_default_version (default_decl));
 
-  gcc_assert (fn != NULL && DECL_FUNCTION_VERSIONED (fn));
+  struct cgraph_node *default_node = cgraph_node::get (default_decl);
+  gcc_assert (default_node != NULL);
 
-  node = cgraph_node::get (fn);
-  gcc_assert (node != NULL);
+  struct cgraph_function_version_info *default_node_v
+    = default_node->function_version ();
+  gcc_assert (default_node_v != NULL && !default_node_v->prev);
 
-  node_v = node->function_version ();
-  gcc_assert (node_v != NULL);
-
-  if (node_v->dispatcher_resolver != NULL)
-    return node_v->dispatcher_resolver;
-
-  /* The default node is always the beginning of the chain.  */
-  default_version_info = node_v;
-  while (default_version_info->prev)
-    default_version_info = default_version_info->prev;
-  default_node = default_version_info->this_node;
-
-  /* If there is no default node, just return NULL.  */
-  if (!is_function_default_version (default_node->decl))
-    return NULL;
+  if (default_node_v->dispatcher_resolver != NULL)
+    return default_node_v->dispatcher_resolver;
 
   if (targetm.has_ifunc_p ())
     {
       struct cgraph_function_version_info *it_v = NULL;
-      struct cgraph_node *dispatcher_node = NULL;
-      struct cgraph_function_version_info *dispatcher_version_info = NULL;
 
       /* Right now, the dispatching is done via ifunc.  */
       dispatch_decl = make_dispatcher_decl (default_node->decl);
-      TREE_NOTHROW (dispatch_decl) = TREE_NOTHROW (fn);
-
-      dispatcher_node = cgraph_node::get_create (dispatch_decl);
-      gcc_assert (dispatcher_node != NULL);
-      dispatcher_node->dispatcher_function = 1;
-      dispatcher_version_info
-	= dispatcher_node->insert_new_function_version ();
-      dispatcher_version_info->next = default_version_info;
-      dispatcher_node->definition = 1;
 
       /* Set the dispatcher for all the versions.  */
-      it_v = default_version_info;
+      it_v = default_node_v;
       while (it_v != NULL)
 	{
 	  it_v->dispatcher_resolver = dispatch_decl;
@@ -15408,9 +15440,13 @@ synthesize_add (rtx operands[3])
 
       ival -= saturated;
 
-      rtx x = gen_rtx_PLUS (word_mode, operands[1], GEN_INT (saturated));
+      /* The first add may be an FP relative address during reload.  FP
+	 may be replaced with (sp + C).  We don't want that to already
+	 be saturated as (sp + C) would then exceed a simm12 field.  So
+	 emit the smaller offset first and the saturated constant last.  */
+      rtx x = gen_rtx_PLUS (word_mode, operands[1], GEN_INT (ival));
       emit_insn (gen_rtx_SET (operands[0], x));
-      rtx output = gen_rtx_PLUS (word_mode, operands[0], GEN_INT (ival));
+      rtx output = gen_rtx_PLUS (word_mode, operands[0], GEN_INT (saturated));
       emit_insn (gen_rtx_SET (operands[0], output));
       return true;
     }
@@ -15465,6 +15501,96 @@ synthesize_add (rtx operands[3])
   emit_insn (gen_rtx_SET (operands[0], x));
   return true;
 }
+
+/*  Synthesize OPERANDS[0] = OPERANDS[1] + OPERANDS[2].
+
+    For 32-bit object cases with a 64-bit target.
+
+    OPERANDS[0] and OPERANDS[1] will be a REG and may be the same
+    REG.
+
+    OPERANDS[2] is a CONST_INT.
+
+    Return TRUE if the operation was fully synthesized and the caller
+    need not generate additional code.  Return FALSE if the operation
+    was not synthesized and the caller is responsible for emitting the
+    proper sequence.  */
+
+
+bool
+synthesize_add_extended (rtx operands[3])
+{
+
+/*  If operands[2] is a 12-bit signed immediate,
+    no synthesis needs to be done.  */
+
+  if (SMALL_OPERAND (INTVAL (operands[2])))
+    return false;
+
+  HOST_WIDE_INT ival = INTVAL (operands[2]);
+  int budget1 = riscv_const_insns (operands[2], true);
+  int budget2 = riscv_const_insns (GEN_INT (-INTVAL (operands[2])), true);
+
+/*  If operands[2] can be split into two 12-bit signed immediates,
+    split add into two adds.  */
+
+  if (SUM_OF_TWO_S12 (ival))
+    {
+      HOST_WIDE_INT saturated = HOST_WIDE_INT_M1U << (IMM_BITS - 1);
+
+      if (ival >= 0)
+	saturated = ~saturated;
+
+      ival -= saturated;
+
+      /* The first add may be an FP relative address during reload.  FP
+	 may be replaced with (sp + C).  We don't want that to already
+	 be saturated as (sp + C) would then exceed a simm12 field.  So
+	 emit the smaller offset first and the saturated constant last.  */
+      rtx temp = gen_reg_rtx (DImode);
+      emit_insn (gen_addsi3_extended (temp, operands[1], GEN_INT (ival)));
+      temp = gen_lowpart (SImode, temp);
+      SUBREG_PROMOTED_VAR_P (temp) = 1;
+      SUBREG_PROMOTED_SET (temp, SRP_SIGNED);
+      emit_insn (gen_rtx_SET (operands[0], temp));
+      rtx t = gen_reg_rtx (DImode);
+      emit_insn (gen_addsi3_extended (t, operands[0], GEN_INT (saturated)));
+      t = gen_lowpart (SImode, t);
+      SUBREG_PROMOTED_VAR_P (t) = 1;
+      SUBREG_PROMOTED_SET (t, SRP_SIGNED);
+      emit_move_insn (operands[0], t);
+      return true;
+    }
+
+
+/*  If the negated value is cheaper to synthesize, subtract that from
+    operands[1]. */
+
+  if (budget2 < budget1)
+    {
+      rtx tmp = gen_reg_rtx (SImode);
+      emit_insn (gen_rtx_SET (tmp, GEN_INT (-INTVAL (operands[2]))));
+
+      rtx t = gen_reg_rtx (DImode);
+      emit_insn (gen_subsi3_extended (t, operands[1], tmp));
+      t = gen_lowpart (SImode, t);
+      SUBREG_PROMOTED_VAR_P (t) = 1;
+      SUBREG_PROMOTED_SET (t, SRP_SIGNED);
+      emit_move_insn (operands[0], t);
+      return true;
+    }
+
+  rtx tsrc = force_reg (SImode, operands[2]);
+  rtx tdest = gen_reg_rtx (DImode);
+  emit_insn (gen_addsi3_extended (tdest, operands[1], tsrc));
+  tdest = gen_lowpart (SImode, tdest);
+  SUBREG_PROMOTED_VAR_P (tdest) = 1;
+  SUBREG_PROMOTED_SET (tdest, SRP_SIGNED);
+  emit_move_insn (operands[0], tdest);
+  return true;
+
+}
+
 
 /*
     HINT : argument specify the target cache
@@ -15884,8 +16010,11 @@ riscv_prefetch_offset_address_p (rtx x, machine_mode mode)
 #undef TARGET_COMPARE_VERSION_PRIORITY
 #define TARGET_COMPARE_VERSION_PRIORITY riscv_compare_version_priority
 
-#undef TARGET_OPTION_FUNCTION_VERSIONS
-#define TARGET_OPTION_FUNCTION_VERSIONS riscv_common_function_versions
+#undef TARGET_CHECK_TARGET_CLONE_VERSION
+#define TARGET_CHECK_TARGET_CLONE_VERSION riscv_check_target_clone_version
+
+#undef TARGET_OPTION_SAME_FUNCTION_VERSIONS
+#define TARGET_OPTION_SAME_FUNCTION_VERSIONS riscv_same_function_versions
 
 #undef TARGET_MANGLE_DECL_ASSEMBLER_NAME
 #define TARGET_MANGLE_DECL_ASSEMBLER_NAME riscv_mangle_decl_assembler_name

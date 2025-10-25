@@ -450,9 +450,7 @@ public:
       else
 	{
 	  gcc_checking_assert (other.m_val);
-	  ret.m_val = MIN (RDIV ((uint64_t)m_val * max_probability,
-				 other.m_val),
-			   max_probability);
+	  ret.m_val = RDIV ((uint64_t)m_val * max_probability, other.m_val);
 	}
       ret.set_quality (MIN (MIN (quality (), other.quality ()), ADJUSTED));
       return ret;
@@ -480,9 +478,7 @@ public:
 	  else
 	    {
 	      gcc_checking_assert (other.m_val);
-	      m_val = MIN (RDIV ((uint64_t)m_val * max_probability,
-				 other.m_val),
-			   max_probability);
+	      m_val = RDIV ((uint64_t)m_val * max_probability, other.m_val);
 	    }
 	  set_quality (MIN (MIN (quality (), other.quality ()), ADJUSTED));
 	}
@@ -576,9 +572,8 @@ public:
       gcc_checking_assert (den.m_val);
 
       profile_probability ret;
-      uint64_t val;
-      safe_scale_64bit (m_val, num.m_val, den.m_val, &val);
-      ret.m_val = MIN (val, max_probability);
+      ret.m_val = MIN (RDIV ((uint64_t)m_val * num.m_val, den.m_val),
+		       max_probability);
       ret.set_quality (MIN (MIN (MIN (quality (), ADJUSTED),
 			    num.quality ()), den.quality ()));
       return ret;
@@ -1114,30 +1109,23 @@ public:
   /* Make counter forcibly nonzero.  */
   profile_count force_nonzero () const;
 
-  profile_count max (profile_count other) const
-    {
-      profile_count val = *this;
 
-      /* Always prefer nonzero IPA counts over local counts.  */
-      if (ipa ().nonzero_p () || other.ipa ().nonzero_p ())
-	{
-	  val = ipa ();
-	  other = other.ipa ();
-	}
-      if (!initialized_p ())
-	return other;
-      if (!other.initialized_p ())
-	return *this;
-      if (*this == zero ())
-	return other;
-      if (other == zero ())
-	return *this;
-      gcc_checking_assert (compatible_p (other));
-      if (val.m_val < other.m_val || (m_val == other.m_val
-				      && val.m_quality < other.m_quality))
-	return other;
-      return *this;
-    }
+  /* Return maximum of A and B.  If one of values is uninitialized return the
+     other.  */
+
+  static profile_count
+  max_prefer_initialized (const profile_count a, const profile_count b)
+  {
+    if (!a.initialized_p ())
+      return b;
+    if (!b.initialized_p ())
+      return a;
+    profile_count ret;
+    gcc_checking_assert (a.compatible_p (b));
+    ret.m_val = MAX (a.m_val, b.m_val);
+    ret.m_quality = MIN (a.m_quality, b.m_quality);
+    return ret;
+  }
 
   /* PROB is a probability in scale 0...REG_BR_PROB_BASE.  Scale counter
      accordingly.  */
@@ -1212,8 +1200,18 @@ public:
       /* Be sure that ret is not local if num is global.
 	 Also ensure that ret is not global0 when num is global.  */
       if (num.ipa_p ())
-	ret.m_quality = MAX (ret.m_quality,
-			     num == num.ipa () ? GUESSED : num.m_quality);
+	{
+	  /* This is common case of AFDO scaling when we upgrade
+	     GLOBAL0_AFDO function to AFDO.  Be sure that result
+	     is AFDO and not GUESSED (which is unnecesarily low).  */
+	  if (num.m_quality == AFDO
+	      && (ret.m_quality != GUESSED
+		  && ret.m_quality != GUESSED_LOCAL))
+	    ret.m_quality = AFDO;
+	  else
+	    ret.m_quality = MAX (ret.m_quality,
+				 num == num.ipa () ? GUESSED : num.m_quality);
+	}
       return ret;
     }
 
@@ -1321,8 +1319,14 @@ public:
 	  return ret;
 	}
       else
-	ret.m_val = RDIV (m_val * profile_probability::max_probability,
-			  overall.m_val);
+	{
+	  gcc_checking_assert (overall.m_val);
+	  uint64_t tmp;
+	  safe_scale_64bit (m_val, profile_probability::max_probability,
+			    overall.m_val, &tmp);
+	  gcc_checking_assert (tmp <= profile_probability::max_probability);
+	  ret.m_val = tmp;
+	}
       ret.set_quality (MIN (MAX (MIN (m_quality, overall.m_quality),
 				 GUESSED), ADJUSTED));
       return ret;

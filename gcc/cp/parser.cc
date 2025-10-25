@@ -2575,6 +2575,7 @@ static cp_expr cp_parser_expression
   (cp_parser *, cp_id_kind * = NULL, bool = false, bool = false, bool = false);
 static cp_expr cp_parser_constant_expression
   (cp_parser *, int = 0, bool * = NULL, bool = false);
+static cp_expr cp_parser_builtin_c23_va_start (cp_parser *);
 static cp_expr cp_parser_builtin_offsetof
   (cp_parser *);
 static cp_expr cp_parser_lambda_expression
@@ -6406,6 +6407,9 @@ cp_parser_primary_expression (cp_parser *parser,
 	      = make_location (type_location, start_loc, finish_loc);
 	    return build_x_va_arg (combined_loc, expression, type);
 	  }
+
+	case RID_C23_VA_START:
+	  return cp_parser_builtin_c23_va_start (parser);
 
 	case RID_OFFSETOF:
 	  return cp_parser_builtin_offsetof (parser);
@@ -11497,6 +11501,133 @@ cp_parser_constant_expression (cp_parser* parser,
   return expression;
 }
 
+/* Parse __builtin_c23_va_start.
+
+   c23-va-start-expression:
+     __builtin_c23_va_start ( assignment-expression )
+     __builtin_c23_va_start ( assignment-expression , identifier )
+     __builtin_c23_va_start ( assignment-expression , tokens[opt] )
+
+   The first form is the expected new C++26 form, the second if
+   identifier is the name of the last parameter before ... is meant
+   for backwards compatibility with C++23 and older.
+   The third form where LWG4388 requires all the preprocessing tokens
+   to be convertible to tokens and it can't contain unbalanced
+   parentheses is parsed with a warning and the tokens are just skipped.
+   This is because C++26 like C23 defines va_start macro as
+   va_start (ap, ...) and says second and later arguments to the macro
+   are discarded, yet we want to diagnose when people use something
+   which wasn't valid before C++26 and is not the single argument
+   va_start either.  */
+
+static cp_expr
+cp_parser_builtin_c23_va_start (cp_parser *parser)
+{
+  location_t start_loc = cp_lexer_peek_token (parser->lexer)->location;
+  cp_lexer_consume_token (parser->lexer);
+  /* Look for the opening `('.  */
+  matching_parens parens;
+  parens.require_open (parser);
+  location_t arg_loc = cp_lexer_peek_token (parser->lexer)->location;
+  /* Now, parse the assignment-expression.  */
+  tree expression = cp_parser_assignment_expression (parser);
+  if (!cp_lexer_next_token_is (parser->lexer, CPP_CLOSE_PAREN))
+    {
+      location_t cloc = cp_lexer_peek_token (parser->lexer)->location;
+      if (!cp_parser_require (parser, CPP_COMMA, RT_COMMA))
+	{
+	  cp_parser_skip_to_closing_parenthesis (parser, false, false,
+						 /*consume_paren=*/ true);
+	  return error_mark_node;
+	}
+      if (cp_lexer_next_token_is (parser->lexer, CPP_NAME)
+	  && cp_lexer_nth_token_is (parser->lexer, 2, CPP_CLOSE_PAREN))
+	{
+	  tree name = cp_lexer_peek_token (parser->lexer)->u.value;
+	  location_t nloc = cp_lexer_peek_token (parser->lexer)->location;
+	  tree decl = lookup_name (name);
+	  tree last_parm = tree_last (DECL_ARGUMENTS (current_function_decl));
+	  if (!last_parm || decl != last_parm)
+	    warning_at (nloc, OPT_Wvarargs, "optional second parameter of "
+			"%<va_start%> not last named argument");
+	  else
+	    {
+	      /* __builtin_va_start parsing does mark the argument as used and
+		 read, for -Wunused* purposes mark it the same.  */
+	      TREE_USED (last_parm) = 1;
+	      mark_exp_read (last_parm);
+	    }
+	  cp_lexer_consume_token (parser->lexer);
+	}
+      else
+	{
+	  unsigned nesting_depth = 0;
+	  location_t sloc = cp_lexer_peek_token (parser->lexer)->location;
+	  location_t eloc = sloc;
+
+	  /* For va_start (ap,) the ) comes from stdarg.h.
+	     Use location of , in that case, otherwise without -Wsystem-headers
+	     nothing is reported.  After all, the problematic token is the
+	     comma in that case.  */
+	  if (cp_lexer_next_token_is (parser->lexer, CPP_CLOSE_PAREN))
+	    sloc = eloc = cloc;
+	  /* Not using cp_parser_skip_to_closing_parenthesis here, because
+	     the tokens in second and further arguments don't have to be
+	     fully balanced, only can't contain unbalanced parentheses.
+	     So, va_start (ap, [[[[[[[[[{{{{{{{{{}]);
+	     is valid C++ for which we want to warn,
+	     #define X id); something (
+	     va_start (ap, X);
+	     is IFNDR (not detectable unless the preprocessor special cases
+	     va_start macro).  */
+	  while (true)
+	    {
+	      cp_token *token = cp_lexer_peek_token (parser->lexer);
+	      if (token->type == CPP_CLOSE_PAREN && !nesting_depth)
+		break;
+
+	      if (token->type == CPP_EOF)
+		break;
+	      if (token->type == CPP_OPEN_PAREN)
+		++nesting_depth;
+	      else if (token->type == CPP_CLOSE_PAREN)
+		--nesting_depth;
+	      else if (token->type == CPP_PRAGMA)
+		{
+		  cp_parser_skip_to_pragma_eol (parser, token);
+		  continue;
+		}
+	      eloc = token->location;
+	      cp_lexer_consume_token (parser->lexer);
+	    }
+	  if (sloc != eloc)
+	    sloc = make_location (sloc, sloc, eloc);
+	  warning_at (sloc, OPT_Wvarargs,
+		      "%<va_start%> macro used with additional "
+		      "arguments other than identifier of the "
+		      "last named argument");
+	}
+    }
+  /* Look for the closing `)'.  */
+  location_t finish_loc = cp_lexer_peek_token (parser->lexer)->location;
+  /* Construct a location of the form:
+     __builtin_c23_va_start (ap, arg)
+     ~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~
+     with the caret at the first argument, ranging from the start
+     of the "__builtin_c23_va_start" token to the close paren.  */
+  location_t combined_loc = make_location (arg_loc, start_loc, finish_loc);
+  parens.require_close (parser);
+  tree fndecl = builtin_decl_explicit (BUILT_IN_VA_START);
+  releasing_vec args;
+  vec_safe_push (args, expression);
+  vec_safe_push (args, integer_zero_node);
+  tree ret = finish_call_expr (fndecl, &args, false, true,
+			       tf_warning_or_error);
+  if (TREE_CODE (ret) == CALL_EXPR)
+    SET_EXPR_LOCATION (ret, combined_loc);
+  return cp_expr (ret, combined_loc);
+}	  
+
 /* Parse __builtin_offsetof.
 
    offsetof-expression:
@@ -16267,13 +16398,7 @@ cp_parser_import_declaration (cp_parser *parser, module_parse mp_state,
 		      " must not be from header inclusion");
 	}
 
-      auto mk = module_kind;
-      if (exporting)
-	module_kind |= MK_EXPORTING;
-
       import_module (mod, token->location, exporting, attrs, parse_in);
-
-      module_kind = mk;
     }
 }
 
@@ -18966,7 +19091,7 @@ cp_parser_mem_initializer_id (cp_parser* parser)
     return cp_parser_class_name (parser,
 				 /*typename_keyword_p=*/true,
 				 /*template_keyword_p=*/template_p,
-				 typename_type,
+				 class_type,
 				 /*check_dependency_p=*/true,
 				 /*class_head_p=*/false,
 				 /*is_declaration=*/true);
@@ -28029,8 +28154,7 @@ cp_parser_class_name (cp_parser *parser,
   /* If this is a typename, create a TYPENAME_TYPE.  */
   if (typename_p && decl != error_mark_node)
     {
-      decl = make_typename_type (scope, decl, typename_type,
-				 /*complain=*/tf_error);
+      decl = make_typename_type (scope, decl, tag_type, /*complain=*/tf_error);
       if (decl != error_mark_node)
 	decl = TYPE_NAME (decl);
     }
@@ -28130,6 +28254,7 @@ cp_parser_class_specifier (cp_parser* parser)
   bool in_switch_statement_p;
   bool saved_in_unbraced_linkage_specification_p;
   bool saved_in_unbraced_export_declaration_p;
+  bool saved_auto_is_implicit_function_template_parm_p;
   tree old_scope = NULL_TREE;
   tree scope = NULL_TREE;
   cp_token *closing_brace;
@@ -28187,6 +28312,10 @@ cp_parser_class_specifier (cp_parser* parser)
   saved_in_unbraced_export_declaration_p
     = parser->in_unbraced_export_declaration_p;
   parser->in_unbraced_export_declaration_p = false;
+  saved_auto_is_implicit_function_template_parm_p
+    = parser->auto_is_implicit_function_template_parm_p;
+  parser->auto_is_implicit_function_template_parm_p = false;
+
   /* 'this' from an enclosing non-static member function is unavailable.  */
   tree saved_ccp = current_class_ptr;
   tree saved_ccr = current_class_ref;
@@ -28577,6 +28706,8 @@ cp_parser_class_specifier (cp_parser* parser)
     = saved_in_unbraced_linkage_specification_p;
   parser->in_unbraced_export_declaration_p
     = saved_in_unbraced_export_declaration_p;
+  parser->auto_is_implicit_function_template_parm_p
+    = saved_auto_is_implicit_function_template_parm_p;
   current_class_ptr = saved_ccp;
   current_class_ref = saved_ccr;
 
@@ -30424,7 +30555,7 @@ cp_parser_base_specifier (cp_parser* parser)
       type = cp_parser_class_name (parser,
 				   class_scope_p,
 				   template_p,
-				   typename_type,
+				   class_type,
 				   /*check_dependency_p=*/true,
 				   /*class_head_p=*/false,
 				   /*is_declaration=*/true);
@@ -31185,10 +31316,10 @@ cp_parser_asm_label_list (cp_parser* parser)
 	  if (TREE_CODE (label) == LABEL_DECL)
 	    {
 	      TREE_USED (label) = 1;
-	      check_goto (label);
 	      name = build_string (IDENTIFIER_LENGTH (identifier),
 				   IDENTIFIER_POINTER (identifier));
 	      labels = tree_cons (name, label, labels);
+	      check_goto (&TREE_VALUE (labels));
 	    }
 	}
       /* If the next token is not a `,', then the list is
@@ -51102,6 +51233,7 @@ cp_parser_omp_assumption_clauses (cp_parser *parser, cp_token *pragma_tok,
 						      directive[1],
 						      directive[2]);
 		      if (dir
+			  && dir->id != PRAGMA_OMP_END
 			  && (dir->kind == C_OMP_DIR_DECLARATIVE
 			      || dir->kind == C_OMP_DIR_INFORMATIONAL
 			      || dir->kind == C_OMP_DIR_META))
@@ -51110,9 +51242,9 @@ cp_parser_omp_assumption_clauses (cp_parser *parser, cp_token *pragma_tok,
 					"informational, and meta directives "
 					"not permitted", p);
 		      else if (dir == NULL
-			  || dir->id == PRAGMA_OMP_END
-			  || (!dir->second && directive[1])
-			  || (!dir->third && directive[2]))
+			       || dir->id == PRAGMA_OMP_END
+			       || (!dir->second && directive[1])
+			       || (!dir->third && directive[2]))
 			error_at (dloc, "unknown OpenMP directive name in "
 					"%qs clause argument", p);
 		      else
@@ -52608,6 +52740,18 @@ cp_parser_omp_metadirective (cp_parser *parser, cp_token *pragma_tok,
     }
   cp_parser_skip_to_pragma_eol (parser, pragma_tok);
 
+  /* If only one selector matches and it evaluates to 'omp nothing', no need to
+     proceed.  */
+  if (ctxs.length () == 1)
+    {
+      tree ctx = ctxs[0];
+      if (ctx == NULL_TREE
+	  || (omp_context_selector_matches (ctx, NULL_TREE, false) == 1
+	      && cp_parser_pragma_kind (&directive_tokens[0])
+		   == PRAGMA_OMP_NOTHING))
+	return;
+    }
+
   if (!default_seen)
     {
       /* Add a default clause that evaluates to 'omp nothing'.  */
@@ -53720,6 +53864,14 @@ cp_parser_omp_error (cp_parser *parser, cp_token *pragma_tok,
 			 "may only be used in compound statements");
 	  return true;
 	}
+      if (parser->omp_for_parse_state
+	  && parser->omp_for_parse_state->in_intervening_code)
+	{
+	  error_at (loc, "%<#pragma omp error%> with %<at(execution)%> clause "
+			 "may not be used in intervening code");
+	  parser->omp_for_parse_state->fail = true;
+	  return true;
+	}
       tree fndecl
 	= builtin_decl_explicit (severity_fatal ? BUILT_IN_GOMP_ERROR
 						: BUILT_IN_GOMP_WARNING);
@@ -54637,11 +54789,15 @@ cp_parser_pragma (cp_parser *parser, enum pragma_context context, bool *if_p)
   id = cp_parser_pragma_kind (pragma_tok);
   if (parser->omp_for_parse_state
       && parser->omp_for_parse_state->in_intervening_code
-      && id >= PRAGMA_OMP__START_
-      && id <= PRAGMA_OMP__LAST_)
+      && id >= PRAGMA_OMP__START_ && id <= PRAGMA_OMP__LAST_
+      /* Allow a safe subset of non-executable directives. See classification in
+	 array c_omp_directives.  */
+      && id != PRAGMA_OMP_METADIRECTIVE && id != PRAGMA_OMP_NOTHING
+      && id != PRAGMA_OMP_ASSUME && id != PRAGMA_OMP_ERROR)
     {
-      error_at (pragma_tok->location,
-		"intervening code must not contain OpenMP directives");
+      error_at (
+	pragma_tok->location,
+	"intervening code must not contain executable OpenMP directives");
       parser->omp_for_parse_state->fail = true;
       cp_parser_skip_to_pragma_eol (parser, pragma_tok);
       return false;

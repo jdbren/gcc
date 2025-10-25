@@ -1095,10 +1095,14 @@ struct discrim_entry
 
 location_t
 assign_discriminator (location_t loc, unsigned int bb_id,
-		      hash_map<int_hash <int64_t, -1, -2>, discrim_entry> &map)
+		      hash_map<int_hash <unsigned, -1U, -2U>,
+			       discrim_entry> &map)
 {
   bool existed;
-  discrim_entry &e = map.get_or_insert (LOCATION_LINE (loc), &existed);
+  if ((unsigned) LOCATION_LINE (loc) >= -2U)
+    return loc;
+  discrim_entry &e
+    = map.get_or_insert ((unsigned) LOCATION_LINE (loc), &existed);
   gcc_checking_assert (!has_discriminator (loc));
   if (!existed)
     {
@@ -1121,15 +1125,15 @@ assign_discriminator (location_t loc, unsigned int bb_id,
 static void
 assign_discriminators (void)
 {
-  hash_map<int_hash <int64_t, -1, -2>, discrim_entry> map (13);
+  hash_map<int_hash <unsigned, -1U, -2U>, discrim_entry> map (13);
   unsigned int bb_id = 0;
   basic_block bb;
   FOR_EACH_BB_FN (bb, cfun)
     {
       location_t prev_loc = UNKNOWN_LOCATION, prev_replacement = UNKNOWN_LOCATION;
       /* Traverse the basic block, if two function calls within a basic block
-	are mapped to the same line, assign a new discriminator because a call
-	stmt could be a split point of a basic block.  */
+	 are mapped to the same line, assign a new discriminator because a call
+	 stmt could be a split point of a basic block.  */
       for (gimple_stmt_iterator gsi = gsi_start_bb (bb);
 	   !gsi_end_p (gsi); gsi_next (&gsi))
 	{
@@ -1145,8 +1149,8 @@ assign_discriminators (void)
 	      prev_replacement = assign_discriminator (loc, bb_id, map);
 	      gimple_set_location (stmt, prev_replacement);
 	    }
-	  /* Break basic blocks after each call.  This is requires so each
-	     call site has unque discriminator.
+	  /* Break basic blocks after each call.  This is required so each
+	     call site has unique discriminator.
 	     More correctly, we can break after each statement that can possibly
 	     terinate execution of the basic block, but for auto-profile this
 	     precision is probably not useful.  */
@@ -1156,16 +1160,27 @@ assign_discriminators (void)
 	      bb_id++;
 	    }
 	}
-      /* IF basic block has multiple sucessors, consdier every edge as a separate
-	 block.  */
+      /* If basic block has multiple sucessors, consdier every edge as a
+	 separate block.  */
       if (!single_succ_p (bb))
 	bb_id++;
       for (edge e : bb->succs)
-	if (e->goto_locus != UNKNOWN_LOCATION)
-	  {
+	{
+	  if (e->goto_locus != UNKNOWN_LOCATION)
 	    e->goto_locus = assign_discriminator (e->goto_locus, bb_id, map);
-	    bb_id++;
-	  }
+	  for (gphi_iterator gpi = gsi_start_phis (bb);
+	       !gsi_end_p (gpi); gsi_next (&gpi))
+	    {
+	      gphi *phi = gpi.phi ();
+	      location_t phi_loc
+		= gimple_phi_arg_location_from_edge (phi, e);
+	      if (phi_loc == UNKNOWN_LOCATION)
+		continue;
+	      gimple_phi_arg_set_location
+		(phi, e->dest_idx, assign_discriminator (phi_loc, bb_id, map));
+	    }
+	   bb_id++;
+	}
       bb_id++;
     }
 
@@ -4771,6 +4786,7 @@ verify_gimple_return (greturn *stmt)
 {
   tree op = gimple_return_retval (stmt);
   tree restype = TREE_TYPE (TREE_TYPE (cfun->decl));
+  tree resdecl = DECL_RESULT (cfun->decl);
 
   /* We cannot test for present return values as we do not fix up missing
      return values from the original source.  */
@@ -4785,12 +4801,7 @@ verify_gimple_return (greturn *stmt)
       return true;
     }
 
-  if ((TREE_CODE (op) == RESULT_DECL
-       && DECL_BY_REFERENCE (op))
-      || (TREE_CODE (op) == SSA_NAME
-	  && SSA_NAME_VAR (op)
-	  && TREE_CODE (SSA_NAME_VAR (op)) == RESULT_DECL
-	  && DECL_BY_REFERENCE (SSA_NAME_VAR (op))))
+  if (resdecl && DECL_BY_REFERENCE (resdecl))
     op = TREE_TYPE (op);
 
   if (!useless_type_conversion_p (restype, TREE_TYPE (op)))

@@ -98,6 +98,7 @@
 #include "ipa-prop.h"
 #include "ipa-fnsummary.h"
 #include "hash-map.h"
+#include "aarch64-sched-dispatch.h"
 
 /* This file should be included last.  */
 #include "target-def.h"
@@ -354,7 +355,6 @@ static void aarch64_override_options_after_change (void);
 static bool aarch64_vector_mode_supported_p (machine_mode);
 static int aarch64_address_cost (rtx, machine_mode, addr_space_t, bool);
 static bool aarch64_builtin_support_vector_misalignment (machine_mode mode,
-							 const_tree type,
 							 int misalignment,
 							 bool is_packed,
 							 bool is_gather_scatter);
@@ -519,7 +519,6 @@ typedef struct {
 #define F_DEPRECATED		   (1 << 1)
 #define F_REG_READ		   (1 << 2)
 #define F_REG_WRITE		   (1 << 3)
-#define F_ARCHEXT		   (1 << 4)
 /* Flag indicating register name is alias for another system register.  */
 #define F_REG_ALIAS		   (1 << 5)
 /* Flag indicatinig registers which may be implemented with 128-bits.  */
@@ -17770,13 +17769,12 @@ aarch64_adjust_stmt_cost (vec_info *vinfo, vect_cost_for_stmt kind,
 
    with the single accumulator being read and written multiple times.  */
 static bool
-aarch64_force_single_cycle (vec_info *vinfo, stmt_vec_info stmt_info)
+aarch64_force_single_cycle (vec_info *vinfo, slp_tree node)
 {
-  if (!STMT_VINFO_REDUC_DEF (stmt_info))
+  auto reduc_info = info_for_reduction (as_a <loop_vec_info> (vinfo), node);
+  if (!reduc_info)
     return false;
-
-  auto reduc_info = info_for_reduction (vinfo, stmt_info);
-  return STMT_VINFO_FORCE_SINGLE_CYCLE (reduc_info);
+  return VECT_REDUC_INFO_FORCE_SINGLE_CYCLE (reduc_info);
 }
 
 /* COUNT, KIND and STMT_INFO are the same as for vector_costs::add_stmt_cost
@@ -17803,7 +17801,7 @@ aarch64_vector_costs::count_ops (unsigned int count, vect_cost_for_stmt kind,
 	= aarch64_in_loop_reduction_latency (m_vinfo, node,
 					     stmt_info, m_vec_flags);
       if (m_costing_for_scalar
-	  || aarch64_force_single_cycle (m_vinfo, stmt_info))
+	  || aarch64_force_single_cycle (m_vinfo, node))
 	/* ??? Ideally we'd use a tree to reduce the copies down to 1 vector,
 	   and then accumulate that, but at the moment the loop-carried
 	   dependency includes all copies.  */
@@ -19252,6 +19250,12 @@ aarch64_override_options_internal (struct gcc_options *opts)
     SET_OPTION_IF_UNSET (opts, &global_options_set, param_fully_pipelined_fma,
 			 1);
 
+  /* If dispatch scheduling is enabled, the dispatch_constraints in the
+     tune_params struct must be defined.  */
+  if (aarch64_tune_params.extra_tuning_flags
+      & AARCH64_EXTRA_TUNE_DISPATCH_SCHED)
+    gcc_assert (aarch64_tune_params.dispatch_constraints != NULL);
+
   /* TODO: SME codegen without SVE2 is not supported, once this support is added
      remove this 'sorry' and the implicit enablement of SVE2 in the checks for
      streaming mode above in this function.  */
@@ -20383,7 +20387,7 @@ static aarch64_fmv_feature_datum aarch64_fmv_feature_data[] = {
 #include "config/aarch64/aarch64-option-extensions.def"
 };
 
-/* Parse a function multiversioning feature string STR, as found in a
+/* Parse a function multiversioning feature string_slice STR, as found in a
    target_version or target_clones attribute.
 
    If ISA_FLAGS is nonnull, then update it with the specified architecture
@@ -20395,37 +20399,34 @@ static aarch64_fmv_feature_datum aarch64_fmv_feature_data[] = {
    the extension string is created and stored to INVALID_EXTENSION.  */
 
 static enum aarch_parse_opt_result
-aarch64_parse_fmv_features (const char *str, aarch64_feature_flags *isa_flags,
+aarch64_parse_fmv_features (string_slice str, aarch64_feature_flags *isa_flags,
 			    aarch64_fmv_feature_mask *feature_mask,
 			    std::string *invalid_extension)
 {
   if (feature_mask)
     *feature_mask = 0ULL;
 
-  if (strcmp (str, "default") == 0)
+  if (str == "default")
     return AARCH_PARSE_OK;
 
-  while (str != NULL && *str != 0)
+  gcc_assert (str.is_valid ());
+
+  while (str.is_valid ())
     {
-      const char *ext;
-      size_t len;
+      string_slice ext;
 
-      ext = strchr (str, '+');
+      ext = string_slice::tokenize (&str, "+");
 
-      if (ext != NULL)
-	len = ext - str;
-      else
-	len = strlen (str);
+      gcc_assert (ext.is_valid ());
 
-      if (len == 0)
+      if (!ext.is_valid () || ext.empty ())
 	return AARCH_PARSE_MISSING_ARG;
 
       int num_features = ARRAY_SIZE (aarch64_fmv_feature_data);
       int i;
       for (i = 0; i < num_features; i++)
 	{
-	  if (strlen (aarch64_fmv_feature_data[i].name) == len
-	      && strncmp (aarch64_fmv_feature_data[i].name, str, len) == 0)
+	  if (aarch64_fmv_feature_data[i].name == ext)
 	    {
 	      if (isa_flags)
 		*isa_flags |= aarch64_fmv_feature_data[i].opt_flags;
@@ -20437,7 +20438,8 @@ aarch64_parse_fmv_features (const char *str, aarch64_feature_flags *isa_flags,
 		    {
 		      /* Duplicate feature.  */
 		      if (invalid_extension)
-			*invalid_extension = std::string (str, len);
+			*invalid_extension
+			  = std::string (ext.begin (), ext.size ());
 		      return AARCH_PARSE_DUPLICATE_FEATURE;
 		    }
 		}
@@ -20449,14 +20451,9 @@ aarch64_parse_fmv_features (const char *str, aarch64_feature_flags *isa_flags,
 	{
 	  /* Feature not found in list.  */
 	  if (invalid_extension)
-	    *invalid_extension = std::string (str, len);
+	    *invalid_extension = std::string (ext.begin (), ext.size ());
 	  return AARCH_PARSE_INVALID_FEATURE;
 	}
-
-      str = ext;
-      if (str)
-	/* Skip over the next '+'.  */
-	str++;
     }
 
   return AARCH_PARSE_OK;
@@ -20468,15 +20465,6 @@ aarch64_parse_fmv_features (const char *str, aarch64_feature_flags *isa_flags,
 static bool
 aarch64_process_target_version_attr (tree args)
 {
-  static bool issued_warning = false;
-  if (!issued_warning)
-    {
-      warning (OPT_Wexperimental_fmv_target,
-	       "Function Multi Versioning support is experimental, and the "
-	       "behavior is likely to change");
-      issued_warning = true;
-    }
-
   if (TREE_CODE (args) == TREE_LIST)
     {
       if (TREE_CHAIN (args))
@@ -20493,7 +20481,7 @@ aarch64_process_target_version_attr (tree args)
       return false;
     }
 
-  const char *str = TREE_STRING_POINTER (args);
+  string_slice str = TREE_STRING_POINTER (args);
 
   enum aarch_parse_opt_result parse_res;
   auto isa_flags = aarch64_asm_isa_flags;
@@ -20517,13 +20505,13 @@ aarch64_process_target_version_attr (tree args)
     case AARCH_PARSE_INVALID_FEATURE:
       error ("invalid feature modifier %qs of value %qs in "
 	     "%<target_version%> attribute", invalid_extension.c_str (),
-	     str);
+	     TREE_STRING_POINTER (args));
       break;
 
     case AARCH_PARSE_DUPLICATE_FEATURE:
       error ("duplicate feature modifier %qs of value %qs in "
 	     "%<target_version%> attribute", invalid_extension.c_str (),
-	     str);
+	     TREE_STRING_POINTER (args));
       break;
 
     default:
@@ -20595,13 +20583,14 @@ get_feature_mask_for_version (tree decl)
   if (version_attr == NULL)
     return 0;
 
-  const char *version_string = TREE_STRING_POINTER (TREE_VALUE (TREE_VALUE
-						    (version_attr)));
+  string_slice version_string
+    = TREE_STRING_POINTER (TREE_VALUE (TREE_VALUE (version_attr)));
+
   enum aarch_parse_opt_result parse_res;
   aarch64_fmv_feature_mask feature_mask;
 
-  parse_res = aarch64_parse_fmv_features (version_string, NULL, &feature_mask,
-					  NULL);
+  parse_res = aarch64_parse_fmv_features (version_string, NULL,
+					  &feature_mask, NULL);
 
   /* We should have detected any errors before getting here.  */
   gcc_assert (parse_res == AARCH_PARSE_OK);
@@ -20618,14 +20607,8 @@ static int
 compare_feature_masks (aarch64_fmv_feature_mask mask1,
 		       aarch64_fmv_feature_mask mask2)
 {
-  int pop1 = popcount_hwi (mask1);
-  int pop2 = popcount_hwi (mask2);
-  if (pop1 > pop2)
-    return 1;
-  if (pop2 > pop1)
-    return -1;
-
   auto diff_mask = mask1 ^ mask2;
+  /* If there is no difference.  */
   if (diff_mask == 0ULL)
     return 0;
   int num_features = ARRAY_SIZE (aarch64_fmv_feature_data);
@@ -20647,6 +20630,30 @@ aarch64_compare_version_priority (tree decl1, tree decl2)
   auto mask2 = get_feature_mask_for_version (decl2);
 
   return compare_feature_masks (mask1, mask2);
+}
+
+/* Implement TARGET_OPTION_FUNCTIONS_B_RESOLVABLE_FROM_A.  */
+
+bool
+aarch64_functions_b_resolvable_from_a (tree decl_a, tree decl_b, tree baseline)
+{
+  auto baseline_isa = aarch64_get_isa_flags
+		 (TREE_TARGET_OPTION (aarch64_fndecl_options (baseline)));
+  auto isa_a = baseline_isa;
+  auto isa_b = baseline_isa;
+
+  auto a_version = get_target_version (decl_a);
+  auto b_version = get_target_version (decl_b);
+  if (a_version.is_valid ())
+    aarch64_parse_fmv_features (a_version, &isa_a, NULL, NULL);
+  if (b_version.is_valid ())
+    aarch64_parse_fmv_features (b_version, &isa_b, NULL, NULL);
+
+  /* Are there any bits of b that arent in a.  */
+  if (isa_b & (~isa_a))
+    return false;
+
+  return true;
 }
 
 /* Build the struct __ifunc_arg_t type:
@@ -20708,54 +20715,35 @@ tree
 aarch64_mangle_decl_assembler_name (tree decl, tree id)
 {
   /* For function version, add the target suffix to the assembler name.  */
-  if (TREE_CODE (decl) == FUNCTION_DECL
-      && DECL_FUNCTION_VERSIONED (decl))
+  if (TREE_CODE (decl) == FUNCTION_DECL)
     {
-      aarch64_fmv_feature_mask feature_mask = get_feature_mask_for_version (decl);
-
-      std::string name = IDENTIFIER_POINTER (id);
-
-      /* For the default version, append ".default".  */
-      if (feature_mask == 0ULL)
+      cgraph_node *node = cgraph_node::get (decl);
+      if (node && node->dispatcher_function)
+	return id;
+      else if (node && node->dispatcher_resolver_function)
+	return clone_identifier (id, "resolver");
+      else if (DECL_FUNCTION_VERSIONED (decl))
 	{
-	  name += ".default";
-	  return get_identifier (name.c_str());
+	  aarch64_fmv_feature_mask feature_mask
+	    = get_feature_mask_for_version (decl);
+
+	  if (feature_mask == 0ULL)
+	    return clone_identifier (id, "default");
+
+	  std::string suffix = "_";
+
+	  int num_features = ARRAY_SIZE (aarch64_fmv_feature_data);
+	  for (int i = 0; i < num_features; i++)
+	    if (feature_mask & aarch64_fmv_feature_data[i].feature_mask)
+	      {
+		suffix += "M";
+		suffix += aarch64_fmv_feature_data[i].name;
+	      }
+
+	  id = clone_identifier (id, suffix.c_str (), true);
 	}
-
-      name += "._";
-
-      int num_features = ARRAY_SIZE (aarch64_fmv_feature_data);
-      for (int i = 0; i < num_features; i++)
-	{
-	  if (feature_mask & aarch64_fmv_feature_data[i].feature_mask)
-	    {
-	      name += "M";
-	      name += aarch64_fmv_feature_data[i].name;
-	    }
-	}
-
-      if (DECL_ASSEMBLER_NAME_SET_P (decl))
-	SET_DECL_RTL (decl, NULL);
-
-      id = get_identifier (name.c_str());
     }
   return id;
-}
-
-/* Return an identifier for the base assembler name of a versioned function.
-   This is computed by taking the default version's assembler name, and
-   stripping off the ".default" suffix if it's already been appended.  */
-
-static tree
-get_suffixed_assembler_name (tree default_decl, const char *suffix)
-{
-  std::string name = IDENTIFIER_POINTER (DECL_ASSEMBLER_NAME (default_decl));
-
-  auto size = name.size ();
-  if (size >= 8 && name.compare (size - 8, 8, ".default") == 0)
-    name.resize (size - 8);
-  name += suffix;
-  return get_identifier (name.c_str());
 }
 
 /* Make the resolver function decl to dispatch the versions of
@@ -20771,11 +20759,6 @@ make_resolver_func (const tree default_decl,
 {
   tree decl, type, t;
 
-  /* Create resolver function name based on default_decl.  We need to remove an
-     existing ".default" suffix if this has already been appended.  */
-  tree decl_name = get_suffixed_assembler_name (default_decl, ".resolver");
-  const char *resolver_name = IDENTIFIER_POINTER (decl_name);
-
   /* The resolver function should have signature
      (void *) resolver (uint64_t, const __ifunc_arg_t *) */
   type = build_function_type_list (ptr_type_node,
@@ -20783,10 +20766,21 @@ make_resolver_func (const tree default_decl,
 				   build_ifunc_arg_type (),
 				   NULL_TREE);
 
-  decl = build_fn_decl (resolver_name, type);
-  SET_DECL_ASSEMBLER_NAME (decl, decl_name);
+  cgraph_node *node = cgraph_node::get (default_decl);
+  gcc_assert (node && node->function_version ());
 
-  DECL_NAME (decl) = decl_name;
+  decl = build_fn_decl (IDENTIFIER_POINTER (DECL_NAME (default_decl)), type);
+
+  /* Set the assembler name to prevent cgraph_node attempting to mangle.  */
+  SET_DECL_ASSEMBLER_NAME (decl, DECL_ASSEMBLER_NAME (default_decl));
+
+  cgraph_node *resolver_node = cgraph_node::get_create (decl);
+  resolver_node->dispatcher_resolver_function = true;
+
+  tree id = aarch64_mangle_decl_assembler_name
+    (decl, node->function_version ()->assembler_name);
+  symtab->change_decl_assembler_name (decl, id);
+
   TREE_USED (decl) = 1;
   DECL_ARTIFICIAL (decl) = 1;
   DECL_IGNORED_P (decl) = 1;
@@ -20851,7 +20845,7 @@ make_resolver_func (const tree default_decl,
   gcc_assert (ifunc_alias_decl != NULL);
   /* Mark ifunc_alias_decl as "ifunc" with resolver as resolver_name.  */
   DECL_ATTRIBUTES (ifunc_alias_decl)
-    = make_attribute ("ifunc", resolver_name,
+    = make_attribute ("ifunc", IDENTIFIER_POINTER (DECL_ASSEMBLER_NAME (decl)),
 		      DECL_ATTRIBUTES (ifunc_alias_decl));
 
   /* Create the alias for dispatch to resolver here.  */
@@ -21029,45 +21023,16 @@ dispatch_function_versions (tree dispatch_decl,
   unsigned int num_versions = fndecls->length ();
   gcc_assert (num_versions >= 2);
 
-  struct function_version_info
+  int i;
+  tree version_decl;
+  FOR_EACH_VEC_ELT_REVERSE ((*fndecls), i, version_decl)
     {
-      tree version_decl;
-      aarch64_fmv_feature_mask feature_mask;
-    } *function_versions;
-
-  function_versions = (struct function_version_info *)
-    XNEWVEC (struct function_version_info, (num_versions));
-
-  unsigned int actual_versions = 0;
-
-  for (tree version_decl : *fndecls)
-    {
-      aarch64_fmv_feature_mask feature_mask;
-      /* Get attribute string, parse it and find the right features.  */
-      feature_mask = get_feature_mask_for_version (version_decl);
-      function_versions [actual_versions].version_decl = version_decl;
-      function_versions [actual_versions].feature_mask = feature_mask;
-      actual_versions++;
+      aarch64_fmv_feature_mask feature_mask
+	= get_feature_mask_for_version (version_decl);
+      *empty_bb = add_condition_to_bb (dispatch_decl, version_decl,
+				       feature_mask, mask_var, *empty_bb);
     }
 
-  auto compare_feature_version_info = [](const void *p1, const void *p2) {
-    const function_version_info v1 = *(const function_version_info *)p1;
-    const function_version_info v2 = *(const function_version_info *)p2;
-    return - compare_feature_masks (v1.feature_mask, v2.feature_mask);
-  };
-
-  /* Sort the versions according to descending order of dispatch priority.  */
-  qsort (function_versions, actual_versions,
-	 sizeof (struct function_version_info), compare_feature_version_info);
-
-  for (unsigned int i = 0; i < actual_versions; ++i)
-    *empty_bb = add_condition_to_bb (dispatch_decl,
-				     function_versions[i].version_decl,
-				     function_versions[i].feature_mask,
-				     mask_var,
-				     *empty_bb);
-
-  free (function_versions);
   return 0;
 }
 
@@ -21109,6 +21074,9 @@ aarch64_generate_version_dispatcher_body (void *node_p)
 
   auto_vec<tree, 2> fn_ver_vec;
 
+  if (dump_enabled_p ())
+    dump_printf (MSG_NOTE, "Version order for %s:\n", node->dump_asm_name ());
+
   for (versn_info = node_version_info->next; versn_info;
        versn_info = versn_info->next)
     {
@@ -21121,6 +21089,9 @@ aarch64_generate_version_dispatcher_body (void *node_p)
       if (DECL_VINDEX (versn->decl))
 	sorry ("virtual function multiversioning not supported");
 
+      if (dump_enabled_p ())
+	dump_printf (MSG_NOTE, "%s\n", versn->dump_asm_name ());
+
       fn_ver_vec.safe_push (versn->decl);
     }
 
@@ -21128,87 +21099,42 @@ aarch64_generate_version_dispatcher_body (void *node_p)
   cgraph_edge::rebuild_edges ();
   pop_cfun ();
 
-  /* Fix up symbol names.  First we need to obtain the base name, which may
-     have already been mangled.  */
-  tree base_name = get_suffixed_assembler_name (default_ver_decl, "");
-
-  /* We need to redo the version mangling on the non-default versions for the
-     target_clones case.  Redoing the mangling for the target_version case is
-     redundant but does no harm.  We need to skip the default version, because
-     expand_clones will append ".default" later; fortunately that suffix is the
-     one we want anyway.  */
-  for (versn_info = node_version_info->next->next; versn_info;
-       versn_info = versn_info->next)
-    {
-      tree version_decl = versn_info->this_node->decl;
-      tree name = aarch64_mangle_decl_assembler_name (version_decl,
-						      base_name);
-      symtab->change_decl_assembler_name (version_decl, name);
-    }
-
-  /* We also need to use the base name for the ifunc declaration.  */
-  symtab->change_decl_assembler_name (node->decl, base_name);
-
   return resolver_decl;
 }
 
-/* Make a dispatcher declaration for the multi-versioned function DECL.
-   Calls to DECL function will be replaced with calls to the dispatcher
-   by the front-end.  Returns the decl of the dispatcher function.  */
+/* Make a dispatcher declaration for the multi-versioned default function DECL.
+   Calls to DECL function will be replaced with calls to the dispatcher by
+   the target_clones pass.  Returns the decl of the dispatcher function.  */
 
 tree
 aarch64_get_function_versions_dispatcher (void *decl)
 {
-  tree fn = (tree) decl;
-  struct cgraph_node *node = NULL;
-  struct cgraph_node *default_node = NULL;
-  struct cgraph_function_version_info *node_v = NULL;
-
+  tree default_decl = (tree) decl;
   tree dispatch_decl = NULL;
 
-  struct cgraph_function_version_info *default_version_info = NULL;
+  gcc_assert (decl != NULL
+	      && DECL_FUNCTION_VERSIONED (default_decl)
+	      && is_function_default_version (default_decl));
 
-  gcc_assert (fn != NULL && DECL_FUNCTION_VERSIONED (fn));
+  struct cgraph_node *default_node = cgraph_node::get (default_decl);
+  gcc_assert (default_node != NULL);
 
-  node = cgraph_node::get (fn);
-  gcc_assert (node != NULL);
+  struct cgraph_function_version_info *default_node_v
+    = default_node->function_version ();
+  gcc_assert (default_node_v != NULL && !default_node_v->prev);
 
-  node_v = node->function_version ();
-  gcc_assert (node_v != NULL);
-
-  if (node_v->dispatcher_resolver != NULL)
-    return node_v->dispatcher_resolver;
-
-  /* The default node is always the beginning of the chain.  */
-  default_version_info = node_v;
-  while (default_version_info->prev)
-    default_version_info = default_version_info->prev;
-  default_node = default_version_info->this_node;
-
-  /* If there is no default node, just return NULL.  */
-  if (!is_function_default_version (default_node->decl))
-    return NULL;
+  if (default_node_v->dispatcher_resolver != NULL)
+    return default_node_v->dispatcher_resolver;
 
   if (targetm.has_ifunc_p ())
     {
       struct cgraph_function_version_info *it_v = NULL;
-      struct cgraph_node *dispatcher_node = NULL;
-      struct cgraph_function_version_info *dispatcher_version_info = NULL;
 
       /* Right now, the dispatching is done via ifunc.  */
       dispatch_decl = make_dispatcher_decl (default_node->decl);
-      TREE_NOTHROW (dispatch_decl) = TREE_NOTHROW (fn);
-
-      dispatcher_node = cgraph_node::get_create (dispatch_decl);
-      gcc_assert (dispatcher_node != NULL);
-      dispatcher_node->dispatcher_function = 1;
-      dispatcher_version_info
-	= dispatcher_node->insert_new_function_version ();
-      dispatcher_version_info->next = default_version_info;
-      dispatcher_node->definition = 1;
 
       /* Set the dispatcher for all the versions.  */
-      it_v = default_version_info;
+      it_v = default_node_v;
       while (it_v != NULL)
 	{
 	  it_v->dispatcher_resolver = dispatch_decl;
@@ -21225,18 +21151,23 @@ aarch64_get_function_versions_dispatcher (void *decl)
   return dispatch_decl;
 }
 
-/* This function returns true if FN1 and FN2 are versions of the same function,
-   that is, the target_version attributes of the function decls are different.
-   This assumes that FN1 and FN2 have the same signature.  */
+/* This function returns true if STR1 and STR2 are version strings for the same
+   function.  */
 
 bool
-aarch64_common_function_versions (tree fn1, tree fn2)
+aarch64_same_function_versions (string_slice str1, string_slice str2)
 {
-  if (TREE_CODE (fn1) != FUNCTION_DECL
-      || TREE_CODE (fn2) != FUNCTION_DECL)
-    return false;
+  enum aarch_parse_opt_result parse_res;
+  aarch64_fmv_feature_mask feature_mask1;
+  aarch64_fmv_feature_mask feature_mask2;
+  parse_res = aarch64_parse_fmv_features (str1, NULL,
+					  &feature_mask1, NULL);
+  gcc_assert (parse_res == AARCH_PARSE_OK);
+  parse_res = aarch64_parse_fmv_features (str2, NULL,
+					  &feature_mask2, NULL);
+  gcc_assert (parse_res == AARCH_PARSE_OK);
 
-  return (aarch64_compare_version_priority (fn1, fn2) != 0);
+  return feature_mask1 == feature_mask2;
 }
 
 /* Implement TARGET_FUNCTION_ATTRIBUTE_INLINABLE_P.  Use an opt-out
@@ -24602,7 +24533,7 @@ aarch64_simd_vector_alignment_reachable (const_tree type, bool is_packed)
    target.  */
 static bool
 aarch64_builtin_support_vector_misalignment (machine_mode mode,
-					     const_tree type, int misalignment,
+					     int misalignment,
 					     bool is_packed,
 					     bool is_gather_scatter)
 {
@@ -24619,7 +24550,7 @@ aarch64_builtin_support_vector_misalignment (machine_mode mode,
       if (misalignment == -1)
 	return false;
     }
-  return default_builtin_support_vector_misalignment (mode, type, misalignment,
+  return default_builtin_support_vector_misalignment (mode, misalignment,
 						      is_packed,
 						      is_gather_scatter);
 }
@@ -31703,7 +31634,9 @@ aarch64_valid_sysreg_name_p (const char *regname)
   const sysreg_t *sysreg = aarch64_lookup_sysreg_map (regname);
   if (sysreg == NULL)
     return aarch64_is_implem_def_reg (regname);
-  return true;
+
+  return (!aarch64_enable_sysreg_guarding
+	  || ((~aarch64_isa_flags & sysreg->arch_reqs) == 0));
 }
 
 /* Return the generic sysreg specification for a valid system register
@@ -31725,6 +31658,9 @@ aarch64_retrieve_sysreg (const char *regname, bool write_p, bool is128op)
     return NULL;
   if ((write_p && (sysreg->properties & F_REG_READ))
       || (!write_p && (sysreg->properties & F_REG_WRITE)))
+    return NULL;
+  if (aarch64_enable_sysreg_guarding
+      && ((~aarch64_isa_flags & sysreg->arch_reqs) != 0))
     return NULL;
   return sysreg->encoding;
 }
@@ -31995,6 +31931,56 @@ aarch64_expand_fp_spaceship (rtx dest, rtx op0, rtx op1, rtx hint)
       emit_set_insn (dest, gen_rtx_IF_THEN_ELSE (SImode, cc_ungt,
 			gen_rtx_PLUS (SImode, temp1, const1_rtx), temp0));
     }
+}
+
+/* Implement TARGET_CHECK_TARGET_CLONE_VERSION.  */
+
+bool
+aarch64_check_target_clone_version (string_slice str, location_t *loc)
+{
+  str = str.strip ();
+
+  if (str == "default")
+    return true;
+
+  enum aarch_parse_opt_result parse_res;
+  auto isa_flags = aarch64_asm_isa_flags;
+  std::string invalid_extension;
+
+  parse_res
+    = aarch64_parse_fmv_features (str, &isa_flags, NULL, &invalid_extension);
+
+  if (loc == NULL)
+    return parse_res == AARCH_PARSE_OK;
+
+  switch (parse_res)
+    {
+    case AARCH_PARSE_OK:
+      return true;
+    case AARCH_PARSE_MISSING_ARG:
+      warning_at (*loc, OPT_Wattributes,
+		  "empty string not valid for a %<target_clones%> version");
+      return false;
+    case AARCH_PARSE_INVALID_FEATURE:
+      warning_at (*loc, OPT_Wattributes,
+		  "invalid feature modifier %qs in version %qB for "
+		  "%<target_clones%> attribute",
+		  invalid_extension.c_str (), &str);
+      return false;
+    case AARCH_PARSE_DUPLICATE_FEATURE:
+      warning_at (*loc, OPT_Wattributes,
+		  "duplicate feature modifier %qs in version %qB for "
+		  "%<target_clones%> attribute",
+		  invalid_extension.c_str (), &str);
+      return false;
+    case AARCH_PARSE_INVALID_ARG:
+      warning_at (*loc, OPT_Wattributes,
+		  "invalid feature %qs in version %qB for "
+		  "%<target_clones%> attribute",
+		  invalid_extension.c_str (), &str);
+      return false;
+    }
+  gcc_unreachable ();
 }
 
 /* Target-specific selftests.  */
@@ -32485,6 +32471,12 @@ aarch64_libgcc_floating_mode_supported_p
 #undef TARGET_SCHED_REASSOCIATION_WIDTH
 #define TARGET_SCHED_REASSOCIATION_WIDTH aarch64_reassociation_width
 
+#undef TARGET_SCHED_DISPATCH
+#define TARGET_SCHED_DISPATCH aarch64_sched_dispatch
+
+#undef TARGET_SCHED_DISPATCH_DO
+#define TARGET_SCHED_DISPATCH_DO aarch64_sched_dispatch_do
+
 #undef TARGET_DWARF_FRAME_REG_MODE
 #define TARGET_DWARF_FRAME_REG_MODE aarch64_dwarf_frame_reg_mode
 
@@ -32851,11 +32843,18 @@ aarch64_libgcc_floating_mode_supported_p
 #undef TARGET_EMIT_EPILOGUE_FOR_SIBCALL
 #define TARGET_EMIT_EPILOGUE_FOR_SIBCALL aarch64_expand_epilogue
 
-#undef TARGET_OPTION_FUNCTION_VERSIONS
-#define TARGET_OPTION_FUNCTION_VERSIONS aarch64_common_function_versions
+#undef TARGET_OPTION_SAME_FUNCTION_VERSIONS
+#define TARGET_OPTION_SAME_FUNCTION_VERSIONS aarch64_same_function_versions
+
+#undef TARGET_CHECK_TARGET_CLONE_VERSION
+#define TARGET_CHECK_TARGET_CLONE_VERSION aarch64_check_target_clone_version
 
 #undef TARGET_COMPARE_VERSION_PRIORITY
 #define TARGET_COMPARE_VERSION_PRIORITY aarch64_compare_version_priority
+
+#undef TARGET_OPTION_FUNCTIONS_B_RESOLVABLE_FROM_A
+#define TARGET_OPTION_FUNCTIONS_B_RESOLVABLE_FROM_A \
+  aarch64_functions_b_resolvable_from_a
 
 #undef TARGET_GENERATE_VERSION_DISPATCHER_BODY
 #define TARGET_GENERATE_VERSION_DISPATCHER_BODY \

@@ -131,7 +131,7 @@ along with GCC; see the file COPYING3.  If not see
 #include "dbgcnt.h"
 #include "symtab-clones.h"
 #include "gimple-range.h"
-
+#include "attr-callback.h"
 
 /* Allocation pools for values and their sources in ipa-cp.  */
 
@@ -3289,14 +3289,17 @@ ipa_get_indirect_edge_target (struct cgraph_edge *ie,
 }
 
 /* Calculate devirtualization time bonus for NODE, assuming we know information
-   about arguments stored in AVALS.  */
+   about arguments stored in AVALS.
 
-static int
+   FIXME: This function will also consider devirtualization of calls that are
+   known to be dead in the clone.  */
+
+static sreal
 devirtualization_time_bonus (struct cgraph_node *node,
 			     ipa_auto_call_arg_values *avals)
 {
   struct cgraph_edge *ie;
-  int res = 0;
+  sreal res = 0;
 
   for (ie = node->indirect_calls; ie; ie = ie->next_callee)
     {
@@ -3314,7 +3317,7 @@ devirtualization_time_bonus (struct cgraph_node *node,
 	continue;
 
       /* Only bare minimum benefit for clearly un-inlineable targets.  */
-      res += 1;
+      int savings = 1;
       callee = cgraph_node::get (target);
       if (!callee || !callee->definition)
 	continue;
@@ -3331,12 +3334,13 @@ devirtualization_time_bonus (struct cgraph_node *node,
       int max_inline_insns_auto
 	= opt_for_fn (callee->decl, param_max_inline_insns_auto);
       if (size <= max_inline_insns_auto / 4)
-	res += 31 / ((int)speculative + 1);
+	savings += 31 / ((int)speculative + 1);
       else if (size <= max_inline_insns_auto / 2)
-	res += 15 / ((int)speculative + 1);
+	savings += 15 / ((int)speculative + 1);
       else if (size <= max_inline_insns_auto
 	       || DECL_DECLARED_INLINE_P (callee->decl))
-	res += 7 / ((int)speculative + 1);
+	savings += 7 / ((int)speculative + 1);
+      res = res + ie->combined_sreal_frequency () * (sreal) savings;
     }
 
   return res;
@@ -3624,8 +3628,8 @@ estimate_local_effects (struct cgraph_node *node)
   ipa_auto_call_arg_values avals;
   always_const = gather_context_independent_values (info, &avals, true,
 						    &removable_params_cost);
-  int devirt_bonus = devirtualization_time_bonus (node, &avals);
-  if (always_const || devirt_bonus
+  sreal devirt_bonus = devirtualization_time_bonus (node, &avals);
+  if (always_const || devirt_bonus > 0
       || (removable_params_cost && clone_for_param_removal_p (node)))
     {
       struct caller_statistics stats;
@@ -4555,7 +4559,8 @@ gather_count_of_non_rec_edges (cgraph_node *node, void *data)
   gather_other_count_struct *desc = (gather_other_count_struct *) data;
   for (cgraph_edge *cs = node->callers; cs; cs = cs->next_caller)
     if (cs->caller != desc->orig && cs->caller->clone_of != desc->orig)
-      desc->other_count += cs->count.ipa ();
+      if (cs->count.ipa ().initialized_p ())
+	desc->other_count += cs->count.ipa ();
   return false;
 }
 
@@ -4696,7 +4701,14 @@ update_counts_for_self_gen_clones (cgraph_node *orig_node,
 	  if (den > 0)
 	    for (cgraph_edge *e = cs; e; e = get_next_cgraph_edge_clone (e))
 	      if (e->callee->ultimate_alias_target () == orig_node
-		  && processed_edges.contains (e))
+		  && processed_edges.contains (e)
+		  /* If count is not IPA, this adjustment makes verifier
+		     unhappy, since we expect bb->count to match e->count.
+		     We may add a flag to mark edge conts that has been
+		     modified by IPA code, but so far it does not seem
+		     to be worth the effort.  With local counts the profile
+		     will not propagate at IPA level.  */
+		  && e->count.ipa_p ())
 		e->count /= den;
 	}
     }
@@ -6202,6 +6214,72 @@ identify_dead_nodes (struct cgraph_node *node)
     }
 }
 
+/* Removes all useless callback edges from the callgraph.  Useless callback
+   edges might mess up the callgraph, because they might be impossible to
+   redirect and so on, leading to crashes.  Their usefulness is evaluated
+   through callback_edge_useful_p.  */
+
+static void
+purge_useless_callback_edges ()
+{
+  if (dump_file)
+    fprintf (dump_file, "\nPurging useless callback edges:\n");
+
+  cgraph_edge *e;
+  cgraph_node *node;
+  FOR_EACH_FUNCTION_WITH_GIMPLE_BODY (node)
+    {
+      for (e = node->callees; e; e = e->next_callee)
+	{
+	  if (e->has_callback)
+	    {
+	      if (dump_file)
+		fprintf (dump_file, "\tExamining callbacks of edge %s -> %s:\n",
+			 e->caller->dump_name (), e->callee->dump_name ());
+	      if (!lookup_attribute (CALLBACK_ATTR_IDENT,
+				     DECL_ATTRIBUTES (e->callee->decl))
+		  && !callback_is_special_cased (e->callee->decl, e->call_stmt))
+		{
+		  if (dump_file)
+		    fprintf (
+		      dump_file,
+		      "\t\tPurging callbacks, because the callback-dispatching"
+		      "function no longer has any callback attributes.\n");
+		  e->purge_callback_edges ();
+		  continue;
+		}
+	      cgraph_edge *cbe, *next;
+	      for (cbe = e->first_callback_edge (); cbe; cbe = next)
+		{
+		  next = cbe->next_callback_edge ();
+		  if (!callback_edge_useful_p (cbe))
+		    {
+		      if (dump_file)
+			fprintf (dump_file,
+				 "\t\tCallback edge %s -> %s not deemed "
+				 "useful, removing.\n",
+				 cbe->caller->dump_name (),
+				 cbe->callee->dump_name ());
+		      cgraph_edge::remove (cbe);
+		    }
+		  else
+		    {
+		      if (dump_file)
+			fprintf (dump_file,
+				 "\t\tKept callback edge %s -> %s "
+				 "because it looks useful.\n",
+				 cbe->caller->dump_name (),
+				 cbe->callee->dump_name ());
+		    }
+		}
+	    }
+	}
+    }
+
+  if (dump_file)
+    fprintf (dump_file, "\n");
+}
+
 /* The decision stage.  Iterate over the topological order of call graph nodes
    TOPO and make specialized clones if deemed beneficial.  */
 
@@ -6232,6 +6310,11 @@ ipcp_decision_stage (class ipa_topo_info *topo)
       if (change)
 	identify_dead_nodes (node);
     }
+
+  /* Currently, the primary use of callback edges is constant propagation.
+     Constant propagation is now over, so we have to remove unused callback
+     edges.  */
+  purge_useless_callback_edges ();
 }
 
 /* Look up all VR and bits information that we have discovered and copy it

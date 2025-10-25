@@ -120,6 +120,25 @@ const avr_addrspace_t avr_addrspace[ADDR_SPACE_COUNT] =
 };
 
 
+#ifdef HAVE_LD_AVR_AVRXMEGA2_FLMAP
+static const bool have_avrxmega2_flmap = true;
+#else
+static const bool have_avrxmega2_flmap = false;
+#endif
+
+#ifdef HAVE_LD_AVR_AVRXMEGA4_FLMAP
+static const bool have_avrxmega4_flmap = true;
+#else
+static const bool have_avrxmega4_flmap = false;
+#endif
+
+#ifdef HAVE_LD_AVR_AVRXMEGA3_RODATA_IN_FLASH
+static const bool have_avrxmega3_rodata_in_flash = true;
+#else
+static const bool have_avrxmega3_rodata_in_flash = false;
+#endif
+
+
 /* Holding RAM addresses of some SFRs used by the compiler and that
    are unique over all devices in an architecture like 'avr4'.  */
 
@@ -284,6 +303,36 @@ avr_tolower (char *lo, const char *up)
   *lo = '\0';
 
   return lo0;
+}
+
+
+/* Return TRUE when the .rodata sections are located in program memory (flash).
+   Otherwise, the .rodata input sections are located in RAM and FALSE is
+   returned.  Note that the FLMAP cases are a bit wonky since the libs are
+   compiled with the default but -mrodata-in-ram is not a multilib option.  */
+
+static bool
+avr_rodata_in_flash_p ()
+{
+  switch (avr_arch_index)
+    {
+    default:
+      break;
+
+    case ARCH_AVRTINY:
+      return true;
+
+    case ARCH_AVRXMEGA3:
+      return have_avrxmega3_rodata_in_flash;
+
+    case ARCH_AVRXMEGA2:
+      return avropt_flmap && have_avrxmega2_flmap && avropt_rodata_in_ram != 1;
+
+    case ARCH_AVRXMEGA4:
+      return avropt_flmap && have_avrxmega4_flmap && avropt_rodata_in_ram != 1;
+    }
+
+  return false;
 }
 
 
@@ -6597,34 +6646,14 @@ avr_out_compare (rtx_insn *insn, rtx *xop, int *plen)
 	    }
 	}
 
-      /* Comparing against 0 is easy.  */
+      /* Otherwise, compare a single byte with CP / CPC or equivalent.  */
 
-      if (val8 == 0)
+      const bool ldreg_p = test_hard_reg_class (LD_REGS, xop[0]);
+
+      if (ldreg_p && i == start)
 	{
-	  avr_asm_len (i == start
-		       ? "cp %0,__zero_reg__"
-		       : "cpc %0,__zero_reg__", xop, plen, 1);
+	  avr_asm_len ("cpi %0,%1", xop, plen, 1);
 	  continue;
-	}
-
-      /* Upper registers can compare and subtract-with-carry immediates.
-	 Notice that compare instructions do the same as respective subtract
-	 instruction; the only difference is that comparisons don't write
-	 the result back to the target register.  */
-
-      if (test_hard_reg_class (LD_REGS, xop[0]))
-	{
-	  if (i == start)
-	    {
-	      avr_asm_len ("cpi %0,%1", xop, plen, 1);
-	      continue;
-	    }
-	  else if (reg_unused_after (insn, xreg))
-	    {
-	      avr_asm_len ("sbci %0,%1", xop, plen, 1);
-	      changed[i] = true;
-	      continue;
-	    }
 	}
 
       /* When byte comparisons for an EQ or NE comparison look like
@@ -6641,7 +6670,7 @@ avr_out_compare (rtx_insn *insn, rtx *xop, int *plen)
 
 	  for (int j = start; j < i && ! found; ++j)
 	    if (val8 == avr_uint8 (xval, j)
-		// Make sure that we didn't clobber x[j] above.
+		// Make sure that we didn't clobber x[j] with SBCI.
 		&& ! changed[j])
 	      {
 		rtx op[] = { xop[0], avr_byte (xreg, j) };
@@ -6651,6 +6680,37 @@ avr_out_compare (rtx_insn *insn, rtx *xop, int *plen)
 
 	  if (found)
 	    continue;
+	}
+
+      /* Upper registers can SBCI which has the same effect like CPC on
+	 SREG, but it writes back the result of the subtraction to %0.
+	 Therefore, SBCI can only replace CPC when %0 is unused after,
+	 or when the comparison is against 0x..0000.  */
+
+      if (ldreg_p && i > start)
+	{
+	  bool zero_p = true;
+
+	  for (int j = start; j <= i; ++j)
+	    zero_p &= avr_uint8 (xval, j) == 0;
+
+	  if (zero_p || reg_unused_after (insn, xreg))
+	    {
+	      avr_asm_len ("sbci %0,%1", xop, plen, 1);
+	      changed[i] = !zero_p;
+	      continue;
+	    }
+	}
+
+      /* Comparing against 0 is easy, but only invoke __zero_reg__ when
+	 nothing else has been found.  This is better for small ISRs.  */
+
+      if (val8 == 0)
+	{
+	  avr_asm_len (i == start
+		       ? "cp %0,__zero_reg__"
+		       : "cpc %0,__zero_reg__", xop, plen, 1);
+	  continue;
 	}
 
       /* Must load the value into the scratch register.  */
@@ -8533,11 +8593,17 @@ avr_out_plus_ext (rtx_insn *insn, rtx *yop, int *plen)
   const int n_bytes0 = GET_MODE_SIZE (GET_MODE (xop[0]));
   const int n_bytes1 = GET_MODE_SIZE (GET_MODE (xop[1]));
   rtx msb1 = all_regs_rtx[n_bytes1 - 1 + REGNO (xop[1])];
+  // Prefer SBCI *,0 over SBC *,__zero_reg__.
+  const bool sbci_p = add == MINUS && n_bytes0 > n_bytes1
+    ? test_hard_reg_class (LD_REGS, avr_byte (xop[0], n_bytes1))
+    : false;
 
   const char *const s_ADD = add == PLUS ? "add %0,%1" : "sub %0,%1";
   const char *const s_ADC = add == PLUS ? "adc %0,%1" : "sbc %0,%1";
   const char *const s_DEC = add == PLUS
     ? "adc %0,__zero_reg__"  CR_TAB  "sbrc %1,7"  CR_TAB  "dec %0"
+    : sbci_p
+    ? "sbci %0,0"            CR_TAB  "sbrc %1,7"  CR_TAB  "inc %0"
     : "sbc %0,__zero_reg__"  CR_TAB  "sbrc %1,7"  CR_TAB  "inc %0";
 
   // A register that containts 8 copies of $1.msb.
@@ -8582,6 +8648,8 @@ avr_out_plus_ext (rtx_insn *insn, rtx *yop, int *plen)
 	  regs[1] = msb1;
 	  avr_asm_len (s_DEC, regs, plen, 3);
 	}
+      else if (sbci_p && regs[1] == zero_reg_rtx)
+	avr_asm_len ("sbci %0,0", regs, plen, 1);
       else
 	avr_asm_len (s_ADC, regs, plen, 1);
     }
@@ -8890,7 +8958,8 @@ avr_out_plus_1 (rtx xinsn, rtx *xop, int *plen, rtx_code code,
 	{
 	  if (started)
 	    avr_asm_len (code == PLUS
-			 ? "adc %0,__zero_reg__" : "sbc %0,__zero_reg__",
+			 ? "adc %0,__zero_reg__"
+			 : ld_reg_p ? "sbci %0,0" : "sbc %0,__zero_reg__",
 			 op, plen, 1);
 	  continue;
 	}
@@ -10122,16 +10191,17 @@ avr_out_insv (rtx_insn *insn, rtx xop[], int *plen)
 }
 
 
-/* Output instructions to extract a bit to 8-bit register XOP[0].
-   The input XOP[1] is a register or an 8-bit MEM in the lower I/O range.
-   XOP[2] is the const_int bit position.  Return "".
+/* Output instructions to extract a bit to 8-bit register OP[0].
+   The input OP[1] is a register or an 8-bit MEM in the lower I/O range.
+   OP[2] is the const_int bit position.  Return "".
 
    PLEN != 0: Set *PLEN to the code length in words.  Don't output anything.
    PLEN == 0: Output instructions.  */
 
 const char *
-avr_out_extr (rtx_insn *insn, rtx xop[], int *plen)
+avr_out_extr (rtx_insn *insn, rtx op[], int *plen)
 {
+  rtx xop[] = { op[0], op[1], op[2] };
   rtx dest = xop[0];
   rtx src = xop[1];
   int bit = INTVAL (xop[2]);
@@ -10189,16 +10259,17 @@ avr_out_extr (rtx_insn *insn, rtx xop[], int *plen)
 }
 
 
-/* Output instructions to extract a negated bit to 8-bit register XOP[0].
-   The input XOP[1] is an 8-bit register or MEM in the lower I/O range.
-   XOP[2] is the const_int bit position.  Return "".
+/* Output instructions to extract a negated bit to 8-bit register OP[0].
+   The input OP[1] is an 8-bit register or MEM in the lower I/O range.
+   OP[2] is the const_int bit position.  Return "".
 
    PLEN != 0: Set *PLEN to the code length in words.  Don't output anything.
    PLEN == 0: Output instructions.  */
 
 const char *
-avr_out_extr_not (rtx_insn * /* insn */, rtx xop[], int *plen)
+avr_out_extr_not (rtx_insn * /* insn */, rtx op[], int *plen)
 {
+  rtx xop[] = { op[0], op[1], op[2] };
   rtx dest = xop[0];
   rtx src = xop[1];
   int bit = INTVAL (xop[2]);
@@ -11460,6 +11531,18 @@ avr_addr_space_diagnose_usage (addr_space_t as, location_t loc)
 }
 
 
+/* Implement `TARGET_ADDR_SPACE_FOR_ARTIFICIAL_RODATA'.  */
+
+static addr_space_t
+avr_addr_space_for_artificial_rodata (tree /*type*/,
+				      artificial_rodata /*kind*/)
+{
+  return avr_rodata_in_flash_p ()
+    ? ADDR_SPACE_GENERIC
+    : avropt_n_flash > 1 ? ADDR_SPACE_FLASHX : ADDR_SPACE_FLASH;
+}
+
+
 /* Implement `TARGET_ADDR_SPACE_ZERO_ADDRESS_VALID'.  Zero is a valid
    address in all address spaces. Even in ADDR_SPACE_FLASH1 etc..,
    a zero address is valid and means 0x<RAMPZ val>0000, where RAMPZ is
@@ -11799,49 +11882,6 @@ avr_insert_attributes (tree node, tree *attributes)
 		 " read-only section by means of %qs", node, reason);
 	}
     }
-}
-
-#ifdef HAVE_LD_AVR_AVRXMEGA2_FLMAP
-static const bool have_avrxmega2_flmap = true;
-#else
-static const bool have_avrxmega2_flmap = false;
-#endif
-
-#ifdef HAVE_LD_AVR_AVRXMEGA4_FLMAP
-static const bool have_avrxmega4_flmap = true;
-#else
-static const bool have_avrxmega4_flmap = false;
-#endif
-
-#ifdef HAVE_LD_AVR_AVRXMEGA3_RODATA_IN_FLASH
-static const bool have_avrxmega3_rodata_in_flash = true;
-#else
-static const bool have_avrxmega3_rodata_in_flash = false;
-#endif
-
-
-static bool
-avr_rodata_in_flash_p ()
-{
-  switch (avr_arch_index)
-    {
-    default:
-      break;
-
-    case ARCH_AVRTINY:
-      return true;
-
-    case ARCH_AVRXMEGA3:
-      return have_avrxmega3_rodata_in_flash;
-
-    case ARCH_AVRXMEGA2:
-      return avropt_flmap && have_avrxmega2_flmap && avropt_rodata_in_ram != 1;
-
-    case ARCH_AVRXMEGA4:
-      return avropt_flmap && have_avrxmega4_flmap && avropt_rodata_in_ram != 1;
-    }
-
-  return false;
 }
 
 
@@ -15182,7 +15222,7 @@ avr_emit3_fix_outputs (rtx (*gen)(rtx,rtx,rtx), rtx *op,
 
 
 /* A helper for the insn condition of "*nzb=1.<code>.lsr[.not]_split"
-   where <code> is AND, IOR or XOR.  Return true when
+   where <code> is AND, IOR, XOR or PLUS.  Return true when
 
       OP[0] <code>= OP[1] >> OP[2]
 
@@ -15211,6 +15251,7 @@ avr_nonzero_bits_lsr_operands_p (rtx_code code, rtx *op)
 
     case IOR:
     case XOR:
+    case PLUS:
       return op1_non0 >> offs == 1;
 
     case AND:
@@ -16788,6 +16829,10 @@ avr_unwind_word_mode ()
 
 #undef  TARGET_ADDR_SPACE_DIAGNOSE_USAGE
 #define TARGET_ADDR_SPACE_DIAGNOSE_USAGE avr_addr_space_diagnose_usage
+
+#undef  TARGET_ADDR_SPACE_FOR_ARTIFICIAL_RODATA
+#define TARGET_ADDR_SPACE_FOR_ARTIFICIAL_RODATA \
+  avr_addr_space_for_artificial_rodata
 
 #undef  TARGET_ADDR_SPACE_ZERO_ADDRESS_VALID
 #define TARGET_ADDR_SPACE_ZERO_ADDRESS_VALID avr_addr_space_zero_address_valid

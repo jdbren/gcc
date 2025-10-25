@@ -1916,13 +1916,9 @@ typedef struct ix86_args {
    MOVE_MAX_PIECES defaults to MOVE_MAX.  */
 
 #define MOVE_MAX \
-  ((TARGET_AVX512F \
-    && (ix86_move_max == PVW_AVX512 \
-	|| ix86_store_max == PVW_AVX512)) \
+  ((TARGET_AVX512F && ix86_move_max == PVW_AVX512) \
    ? 64 \
-   : ((TARGET_AVX \
-       && (ix86_move_max >= PVW_AVX256 \
-	   || ix86_store_max >= PVW_AVX256)) \
+   : ((TARGET_AVX && ix86_move_max >= PVW_AVX256) \
       ? 32 \
       : ((TARGET_SSE2 \
 	  && TARGET_SSE_UNALIGNED_LOAD_OPTIMAL \
@@ -1935,15 +1931,14 @@ typedef struct ix86_args {
    store_by_pieces of 16/32/64 bytes.  */
 #define STORE_MAX_PIECES \
   (TARGET_INTER_UNIT_MOVES_TO_VEC \
-   ? ((TARGET_AVX512F && ix86_store_max == PVW_AVX512) \
+   ? ((TARGET_AVX512F && ix86_move_max == PVW_AVX512) \
       ? 64 \
-      : ((TARGET_AVX \
-	  && ix86_store_max >= PVW_AVX256) \
+      : ((TARGET_AVX && ix86_move_max >= PVW_AVX256) \
 	  ? 32 \
 	  : ((TARGET_SSE2 \
 	      && TARGET_SSE_UNALIGNED_STORE_OPTIMAL) \
-	      ? 16 : UNITS_PER_WORD))) \
-   : UNITS_PER_WORD)
+	     ? 16 : UNITS_PER_WORD)))		     \
+      : UNITS_PER_WORD)
 
 /* If a memory-to-memory move would take MOVE_RATIO or more simple
    move-instruction pairs, we will do a cpymem or libcall instead.
@@ -2361,6 +2356,7 @@ enum processor_type
   PROCESSOR_ARROWLAKE_S,
   PROCESSOR_PANTHERLAKE,
   PROCESSOR_DIAMONDRAPIDS,
+  PROCESSOR_NOVALAKE,
   PROCESSOR_INTEL,
   PROCESSOR_LUJIAZUI,
   PROCESSOR_YONGFENG,
@@ -2486,12 +2482,13 @@ constexpr wide_int_bitmask PTA_CLEARWATERFOREST =
   (PTA_SIERRAFOREST & (~(PTA_KL | PTA_WIDEKL))) | PTA_AVXVNNIINT16 | PTA_SHA512
   | PTA_SM3 | PTA_SM4 | PTA_USER_MSR | PTA_PREFETCHI;
 constexpr wide_int_bitmask PTA_PANTHERLAKE =
-  (PTA_ARROWLAKE_S & (~(PTA_KL | PTA_WIDEKL))) | PTA_PREFETCHI;
+  (PTA_ARROWLAKE_S & (~(PTA_KL | PTA_WIDEKL)));
 constexpr wide_int_bitmask PTA_DIAMONDRAPIDS = PTA_GRANITERAPIDS_D
   | PTA_AVXIFMA | PTA_AVXNECONVERT | PTA_AVXVNNIINT16 | PTA_AVXVNNIINT8
   | PTA_CMPCCXADD | PTA_SHA512 | PTA_SM3 | PTA_SM4 | PTA_AVX10_2
-  | PTA_APX_F | PTA_AMX_AVX512 | PTA_AMX_FP8 | PTA_AMX_TF32 | PTA_AMX_TRANSPOSE
-  | PTA_MOVRS | PTA_AMX_MOVRS | PTA_USER_MSR;
+  | PTA_APX_F | PTA_AMX_AVX512 | PTA_AMX_FP8 | PTA_AMX_TF32 | PTA_MOVRS
+  | PTA_AMX_MOVRS;
+constexpr wide_int_bitmask PTA_NOVALAKE = PTA_PANTHERLAKE | PTA_PREFETCHI;
 
 constexpr wide_int_bitmask PTA_BDVER1 = PTA_64BIT | PTA_MMX | PTA_SSE
   | PTA_SSE2 | PTA_SSE3 | PTA_SSE4A | PTA_CX16 | PTA_POPCNT | PTA_LZCNT

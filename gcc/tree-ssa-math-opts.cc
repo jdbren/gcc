@@ -1631,11 +1631,7 @@ static tree
 build_and_insert_cast (gimple_stmt_iterator *gsi, location_t loc,
 		       tree type, tree val)
 {
-  tree result = make_ssa_name (type);
-  gassign *stmt = gimple_build_assign (result, NOP_EXPR, val);
-  gimple_set_location (stmt, loc);
-  gsi_insert_before (gsi, stmt, GSI_SAME_STMT);
-  return result;
+  return gimple_convert (gsi, true, GSI_SAME_STMT, loc, type, val);
 }
 
 struct pow_synth_sqrt_info
@@ -3802,6 +3798,7 @@ maybe_optimize_guarding_check (vec<gimple *> &mul_stmts, gimple *cond_stmt,
   else
     gimple_cond_make_false (zero_cond);
   update_stmt (zero_cond);
+  reset_flow_sensitive_info_in_bb (bb);
   *cfg_changed = true;
 }
 
@@ -6509,6 +6506,7 @@ math_opts_dom_walker::after_dom_children (basic_block bb)
 	      break;
 
 	    case BIT_IOR_EXPR:
+	      match_unsigned_saturation_mul (&gsi, as_a<gassign *> (stmt));
 	      match_saturation_add_with_assign (&gsi, as_a<gassign *> (stmt));
 	      match_unsigned_saturation_trunc (&gsi, as_a<gassign *> (stmt));
 	      /* fall-through  */

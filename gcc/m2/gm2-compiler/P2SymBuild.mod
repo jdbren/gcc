@@ -1284,6 +1284,7 @@ BEGIN
             THEN
                IF isunknown
                THEN
+                  (* --fixme-- spellcheck.  *)      
                   MetaError2('attempting to declare a type {%1ad} to a type which is itself and also unknown {%2ad}',
                              Sym, Type)
                ELSE
@@ -2589,7 +2590,7 @@ BEGIN
          Field := PutFieldRecord(Record, OperandT(NoOfPragmas*2+NoOfFields+3-i), Type, Varient) ;
          HandleRecordFieldPragmas(Record, Field, NoOfPragmas)
       ELSE
-         MetaErrors2('record field {%1ad} has already been declared inside a {%2Dd} {%2a}',
+         MetaErrors2('record field {%1ad} has already been declared inside a {%2Ddv} {%2a}',
                      'attempting to declare a duplicate record field', fsym, Parent)
       END ;
       (* adjust the location of declaration to the one on the stack (rather than GetTokenNo).  *)

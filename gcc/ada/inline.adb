@@ -151,7 +151,7 @@ package body Inline is
    function Node_Hash (Id : Node_Id) return Node_Header_Num;
    --  Simple hash function for Node_Ids
 
-   package To_Pending_Instantiations is new GNAT.Htable.Simple_HTable
+   package To_Pending_Instantiations is new GNAT.HTable.Simple_HTable
      (Header_Num => Node_Header_Num,
       Element    => Int,
       No_Element => -1,
@@ -1061,7 +1061,9 @@ package body Inline is
                E : constant Subprogram_Kind_Id := Inlined.Table (Index).Name;
 
             begin
-               if Is_Called (E) and then not Is_Ignored_Ghost_Entity (E) then
+               if Is_Called (E)
+                 and then not Is_Ignored_Ghost_Entity_In_Codegen (E)
+               then
                   Add_Inlined_Subprogram (E);
                end if;
             end;

@@ -49,6 +49,7 @@ along with GCC; see the file COPYING3.  If not see
 #include "tree-pretty-print.h"
 #include "gcc-rich-location.h"
 #include "gcc-urlifier.h"
+#include "attr-callback.h"
 
 static tree handle_packed_attribute (tree *, tree, tree, int, bool *);
 static tree handle_nocommon_attribute (tree *, tree, tree, int, bool *);
@@ -189,6 +190,9 @@ static tree handle_fd_arg_attribute (tree *, tree, tree, int, bool *);
 static tree handle_flag_enum_attribute (tree *, tree, tree, int, bool *);
 static tree handle_null_terminated_string_arg_attribute (tree *, tree, tree, int, bool *);
 
+static tree handle_btf_decl_tag_attribute (tree *, tree, tree, int, bool *);
+static tree handle_btf_type_tag_attribute (tree *, tree, tree, int, bool *);
+
 /* Helper to define attribute exclusions.  */
 #define ATTR_EXCL(name, function, type, variable)	\
   { name, function, type, variable }
@@ -249,12 +253,28 @@ static const struct attribute_spec::exclusions attr_target_clones_exclusions[] =
   ATTR_EXCL ("always_inline", true, true, true),
   ATTR_EXCL ("target", TARGET_HAS_FMV_TARGET_ATTRIBUTE,
 	     TARGET_HAS_FMV_TARGET_ATTRIBUTE, TARGET_HAS_FMV_TARGET_ATTRIBUTE),
-  ATTR_EXCL ("target_version", true, true, true),
+  ATTR_EXCL ("omp declare simd", true, true, true),
+  ATTR_EXCL ("simd", true, true, true),
   ATTR_EXCL (NULL, false, false, false),
 };
 
 static const struct attribute_spec::exclusions attr_target_version_exclusions[] =
 {
+  ATTR_EXCL ("omp declare simd", true, true, true),
+  ATTR_EXCL ("simd", true, true, true),
+  ATTR_EXCL (NULL, false, false, false),
+};
+
+static const struct attribute_spec::exclusions attr_omp_declare_simd_exclusions[] =
+{
+  ATTR_EXCL ("target_version", true, true, true),
+  ATTR_EXCL ("target_clones", true, true, true),
+  ATTR_EXCL (NULL, false, false, false),
+};
+
+static const struct attribute_spec::exclusions attr_simd_exclusions[] =
+{
+  ATTR_EXCL ("target_version", true, true, true),
   ATTR_EXCL ("target_clones", true, true, true),
   ATTR_EXCL (NULL, false, false, false),
 };
@@ -465,6 +485,8 @@ const struct attribute_spec c_common_gnu_attributes[] =
 			      handle_tm_attribute, NULL },
   { "transaction_may_cancel_outer", 0, 0, false, true, false, false,
 			      handle_tm_attribute, NULL },
+  { CALLBACK_ATTR_IDENT,      1, -1, true, false, false, false,
+			      handle_callback_attribute, NULL },
   /* ??? These two attributes didn't make the transition from the
      Intel language document to the multi-vendor language document.  */
   { "transaction_pure",       0, 0, false, true,  false, false,
@@ -543,7 +565,7 @@ const struct attribute_spec c_common_gnu_attributes[] =
 			      attr_target_exclusions },
   { "target_version",         1, 1, true, false, false, false,
 			      handle_target_version_attribute,
-			      attr_target_version_exclusions },
+			      attr_target_version_exclusions},
   { "target_clones",          1, -1, true, false, false, false,
 			      handle_target_clones_attribute,
 			      attr_target_clones_exclusions },
@@ -570,7 +592,8 @@ const struct attribute_spec c_common_gnu_attributes[] =
   { "returns_nonnull",        0, 0, false, true, true, false,
 			      handle_returns_nonnull_attribute, NULL },
   { "omp declare simd",       0, -1, true,  false, false, false,
-			      handle_omp_declare_simd_attribute, NULL },
+			      handle_omp_declare_simd_attribute,
+			      attr_omp_declare_simd_exclusions },
   { "omp declare variant base", 0, -1, true,  false, false, false,
 			      handle_omp_declare_variant_attribute, NULL },
   { "omp declare variant variant", 0, -1, true,  false, false, false,
@@ -579,7 +602,7 @@ const struct attribute_spec c_common_gnu_attributes[] =
 			      false, false,
 			      handle_omp_declare_variant_attribute, NULL },
   { "simd",		      0, 1, true,  false, false, false,
-			      handle_simd_attribute, NULL },
+			      handle_simd_attribute, attr_simd_exclusions },
   { "omp declare target",     0, -1, true, false, false, false,
 			      handle_omp_declare_target_attribute, NULL },
   { "omp declare target link", 0, 0, true, false, false, false,
@@ -640,7 +663,11 @@ const struct attribute_spec c_common_gnu_attributes[] =
   { "flag_enum",	      0, 0, false, true, false, false,
 			      handle_flag_enum_attribute, NULL },
   { "null_terminated_string_arg", 1, 1, false, true, true, false,
-			      handle_null_terminated_string_arg_attribute, NULL}
+			      handle_null_terminated_string_arg_attribute, NULL},
+  { "btf_type_tag",	      1, 1, false, true, false, false,
+			      handle_btf_type_tag_attribute, NULL},
+  { "btf_decl_tag",	      1, 1, true, false, false, false,
+			      handle_btf_decl_tag_attribute, NULL}
 };
 
 const struct scoped_attribute_specs c_common_gnu_attribute_table =
@@ -5155,6 +5182,107 @@ handle_null_terminated_string_arg_attribute (tree *node, tree name, tree args,
   return NULL_TREE;
 }
 
+/* Common argument checking for btf_type_tag and btf_decl_tag.
+   Return true if the ARGS are valid, otherwise emit an error and
+   return false.  */
+
+static bool
+btf_tag_args_ok (tree name, tree args)
+{
+  if (!args) /* Correct number of args (1) is checked for us.  */
+    return false;
+  else if (TREE_CODE (TREE_VALUE (args)) != STRING_CST)
+    {
+      error ("%qE attribute requires a string argument", name);
+      return false;
+    }
+
+  /* Only narrow character strings are accepted.  */
+  tree argtype = TREE_TYPE (TREE_TYPE (TREE_VALUE (args)));
+  if (!(argtype == char_type_node
+	|| argtype == char8_type_node
+	|| argtype == signed_char_type_node
+	|| argtype == unsigned_char_type_node))
+    {
+      error ("unsupported wide string type argument in %qE attribute", name);
+      return false;
+    }
+
+  return true;
+}
+
+/* Handle the "btf_decl_tag" attribute.  */
+
+static tree
+handle_btf_decl_tag_attribute (tree * ARG_UNUSED (node), tree name, tree args,
+			       int ARG_UNUSED (flags), bool *no_add_attrs)
+{
+  if (!btf_tag_args_ok (name, args))
+    *no_add_attrs = true;
+
+  return NULL_TREE;
+}
+
+/* Handle the "btf_type_tag" attribute.  */
+
+static tree
+handle_btf_type_tag_attribute (tree *node, tree name, tree args,
+			       int flags, bool *no_add_attrs)
+{
+  if (!btf_tag_args_ok (name, args))
+    {
+      *no_add_attrs = true;
+      return NULL_TREE;
+    }
+
+  if (TREE_CODE (*node) == FUNCTION_TYPE || TREE_CODE (*node) == METHOD_TYPE)
+    {
+      warning (OPT_Wattributes,
+	       "%qE attribute does not apply to functions", name);
+      *no_add_attrs = true;
+      return NULL_TREE;
+    }
+
+  /* Ensure a variant type is always created to hold the type_tag,
+     unless ATTR_FLAG_IN_PLACE is set.  Same logic as in
+     common_handle_aligned_attribute.  */
+  tree decl = NULL_TREE;
+  tree *type = NULL;
+  bool is_type = false;
+
+  if (DECL_P (*node))
+    {
+      decl = *node;
+      type = &TREE_TYPE (decl);
+      is_type = TREE_CODE (*node) == TYPE_DECL;
+    }
+  else if (TYPE_P (*node))
+    type = node, is_type = true;
+
+  if (is_type)
+    {
+      if ((flags & (int) ATTR_FLAG_TYPE_IN_PLACE))
+	/* OK, modify the type in place.  */;
+
+      /* If we have a TYPE_DECL, then copy the type, so that we
+	 don't accidentally modify a builtin type.  See pushdecl.  */
+      else if (decl && TREE_TYPE (decl) != error_mark_node
+	       && DECL_ORIGINAL_TYPE (decl) == NULL_TREE)
+	{
+	  tree tt = TREE_TYPE (decl);
+	  *type = build_variant_type_copy (*type);
+	  DECL_ORIGINAL_TYPE (decl) = tt;
+	  TYPE_NAME (*type) = decl;
+	  TREE_USED (*type) = TREE_USED (decl);
+	  TREE_TYPE (decl) = *type;
+	}
+      else
+	*type = build_variant_type_copy (*type);
+    }
+
+  return NULL_TREE;
+}
+
 /* Handle the "nonstring" variable attribute.  */
 
 static tree
@@ -6282,12 +6410,25 @@ handle_target_clones_attribute (tree *node, tree name, tree ARG_UNUSED (args),
 	    }
 	}
 
-      auto_vec<string_slice> versions = get_clone_attr_versions (args, NULL);
+      int num_defaults = 0;
+      auto_vec<string_slice> versions = get_clone_attr_versions
+					  (args,
+					   &num_defaults,
+					   false);
 
-      if (versions.length () == 1)
+      for (auto v : versions)
+	targetm.check_target_clone_version
+	  (v, &DECL_SOURCE_LOCATION (*node));
+
+      /* Lone target_clones version is always ignored for target attr semantics.
+	 Only ignore under target_version semantics if it is a default
+	 version.  */
+      if (versions.length () == 1
+	  && (TARGET_HAS_FMV_TARGET_ATTRIBUTE || num_defaults == 1))
 	{
-	  warning (OPT_Wattributes,
-		   "single %<target_clones%> attribute is ignored");
+	  if (TARGET_HAS_FMV_TARGET_ATTRIBUTE)
+	    warning (OPT_Wattributes,
+		     "single %<target_clones%> attribute is ignored");
 	  *no_add_attrs = true;
 	}
       else

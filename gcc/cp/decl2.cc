@@ -52,6 +52,7 @@ along with GCC; see the file COPYING3.  If not see
 #include "omp-general.h"
 #include "tree-inline.h"
 #include "escaped_string.h"
+#include "contracts.h"
 
 /* Id for dumping the raw trees.  */
 int raw_dump_id;
@@ -232,7 +233,8 @@ change_return_type (tree new_ret, tree fntype)
 
   if (TREE_CODE (fntype) == FUNCTION_TYPE)
     {
-      newtype = build_function_type (new_ret, args);
+      newtype = build_function_type (new_ret, args,
+				     TYPE_NO_NAMED_ARGS_STDARG_P (fntype));
       newtype = apply_memfn_quals (newtype,
 				   type_memfn_quals (fntype));
     }
@@ -876,7 +878,7 @@ check_classfn (tree ctype, tree function, tree template_parms)
       if (same_type_p (TREE_TYPE (TREE_TYPE (function)),
 		       TREE_TYPE (TREE_TYPE (fndecl)))
 	  && compparms (p1, p2)
-	  && !targetm.target_option.function_versions (function, fndecl)
+	  && !disjoint_version_decls (function, fndecl)
 	  && (!is_template
 	      || comp_template_parms (template_parms,
 				      DECL_TEMPLATE_PARMS (fndecl)))
@@ -1697,7 +1699,8 @@ cp_reconstruct_complex_type (tree type, tree bottom)
   else if (TREE_CODE (type) == FUNCTION_TYPE)
     {
       inner = cp_reconstruct_complex_type (TREE_TYPE (type), bottom);
-      outer = build_function_type (inner, TYPE_ARG_TYPES (type));
+      outer = build_function_type (inner, TYPE_ARG_TYPES (type),
+				   TYPE_NO_NAMED_ARGS_STDARG_P (type));
       outer = apply_memfn_quals (outer, type_memfn_quals (type));
     }
   else if (TREE_CODE (type) == METHOD_TYPE)
@@ -2012,6 +2015,26 @@ cplus_decl_attributes (tree *decl, tree attributes, int flags)
 	if (*decl == pattern)
 	  TREE_UNAVAILABLE (tmpl) = true;
       }
+
+  if (VAR_P (*decl) && CP_DECL_THREAD_LOCAL_P (*decl))
+    {
+      // tls_model attribute can set a stronger TLS access model.
+      tls_model model = DECL_TLS_MODEL (*decl);
+      // Don't upgrade TLS model if TLS model isn't set yet.
+      if (model != TLS_MODEL_NONE)
+	{
+	  tls_model default_model = decl_default_tls_model (*decl);
+	  if (default_model > model)
+	    set_decl_tls_model (*decl, default_model);
+	}
+    }
+
+  /* For target_version semantics, mark any annotated function as versioned
+     so that it gets mangled even when on its own in a TU.  */
+  if (!TARGET_HAS_FMV_TARGET_ATTRIBUTE
+      && TREE_CODE (*decl) == FUNCTION_DECL
+      && get_target_version (*decl).is_valid ())
+    maybe_mark_function_versioned (*decl);
 }
 
 /* Walks through the namespace- or function-scope anonymous union

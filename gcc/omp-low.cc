@@ -3307,7 +3307,8 @@ check_omp_nesting_restrictions (gimple *stmt, omp_context *ctx)
 	    }
 	  else if (gimple_code (stmt) == GIMPLE_OMP_ATOMIC_LOAD
 		   || gimple_code (stmt) == GIMPLE_OMP_ATOMIC_STORE
-		   || gimple_code (stmt) == GIMPLE_OMP_SCAN)
+		   || gimple_code (stmt) == GIMPLE_OMP_SCAN
+		   || gimple_code (stmt) == GIMPLE_OMP_STRUCTURED_BLOCK)
 	    return true;
 	  else if (gimple_code (stmt) == GIMPLE_OMP_FOR
 		   && gimple_omp_for_kind (ctx->stmt) == GF_OMP_FOR_KIND_SIMD)
@@ -3337,7 +3338,8 @@ check_omp_nesting_restrictions (gimple *stmt, omp_context *ctx)
 	       && gimple_code (stmt) != GIMPLE_OMP_PARALLEL
 	       && (gimple_code (stmt) != GIMPLE_OMP_FOR
 		   || gimple_omp_for_kind (stmt) != GF_OMP_FOR_KIND_SIMD)
-	       && gimple_code (stmt) != GIMPLE_OMP_SCAN)
+	       && gimple_code (stmt) != GIMPLE_OMP_SCAN
+	       && gimple_code (stmt) != GIMPLE_OMP_STRUCTURED_BLOCK)
 	{
 	  if (ctx->loop_p)
 	    error_at (gimple_location (stmt),
@@ -14780,6 +14782,8 @@ lower_omp_regimplify_operands_p (tree *tp, int *walk_subtrees,
       lower_omp_regimplify_operands_data *ldata
 	= (lower_omp_regimplify_operands_data *) wi->info;
       tree o = maybe_lookup_decl (t, ldata->ctx);
+      if (o == NULL_TREE)
+	o = maybe_lookup_decl_in_outer_ctx (t, ldata->ctx);
       if (o != t)
 	{
 	  ldata->decls->safe_push (DECL_VALUE_EXPR (*tp));

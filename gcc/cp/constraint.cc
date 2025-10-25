@@ -3170,6 +3170,9 @@ diagnose_trait_expr (location_t loc, tree expr, tree args)
     case CPTK_IS_FUNCTION:
       inform (loc, "%qT is not a function", t1);
       break;
+    case CPTK_IS_IMPLICIT_LIFETIME:
+      inform (decl_loc, "%qT is not an implicit-lifetime type", t1);
+      break;
     case CPTK_IS_INVOCABLE:
       {
 	if (!TREE_VEC_LENGTH (t2))
@@ -3360,7 +3363,7 @@ maybe_diagnose_standard_trait (location_t loc, tree expr)
 	}
     }
 
-  if (TREE_CODE (expr) == TRAIT_EXPR)
+  if (expr && TREE_CODE (expr) == TRAIT_EXPR)
     {
       diagnose_trait_expr (loc, expr, args);
       return true;

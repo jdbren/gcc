@@ -176,8 +176,19 @@ enum gfc_source_form
 
 /* Expression node types.  */
 enum expr_t
-  { EXPR_UNKNOWN = 0, EXPR_OP = 1, EXPR_FUNCTION, EXPR_CONSTANT, EXPR_VARIABLE,
-  EXPR_SUBSTRING, EXPR_STRUCTURE, EXPR_ARRAY, EXPR_NULL, EXPR_COMPCALL, EXPR_PPC
+{
+  EXPR_UNKNOWN = 0,
+  EXPR_OP = 1,
+  EXPR_FUNCTION,
+  EXPR_CONSTANT,
+  EXPR_VARIABLE,
+  EXPR_SUBSTRING,
+  EXPR_STRUCTURE,
+  EXPR_ARRAY,
+  EXPR_NULL,
+  EXPR_COMPCALL,
+  EXPR_PPC,
+  EXPR_CONDITIONAL,
 };
 
 /* Array types.  */
@@ -1022,7 +1033,7 @@ typedef struct
   /* These are the attributes required for parameterized derived
      types.  */
   unsigned pdt_kind:1, pdt_len:1, pdt_type:1, pdt_template:1,
-	   pdt_array:1, pdt_string:1;
+	   pdt_array:1, pdt_string:1, pdt_comp:1;
 
   /* This is omp_{out,in,priv,orig} artificial variable in
      !$OMP DECLARE REDUCTION.  */
@@ -1916,6 +1927,7 @@ typedef struct gfc_typebound_proc
 }
 gfc_typebound_proc;
 
+#define gfc_get_tbp() XCNEW (gfc_typebound_proc)
 
 /* Symbol nodes.  These are important things.  They are what the
    standard refers to as "entities".  The possibly multiple names that
@@ -2808,8 +2820,14 @@ typedef struct gfc_expr
     character;
 
     gfc_constructor_base constructor;
-  }
-  value;
+
+    struct
+    {
+      struct gfc_expr *condition;
+      struct gfc_expr *true_expr;
+      struct gfc_expr *false_expr;
+    } conditional;
+  } value;
 
   /* Used to store PDT expression lists associated with expressions.  */
   gfc_actual_arglist *param_list;
@@ -3143,7 +3161,8 @@ enum gfc_exec_op
   EXEC_OACC_DATA, EXEC_OACC_HOST_DATA, EXEC_OACC_LOOP, EXEC_OACC_UPDATE,
   EXEC_OACC_WAIT, EXEC_OACC_CACHE, EXEC_OACC_ENTER_DATA, EXEC_OACC_EXIT_DATA,
   EXEC_OACC_ATOMIC, EXEC_OACC_DECLARE,
-  EXEC_OMP_CRITICAL, EXEC_OMP_DO, EXEC_OMP_FLUSH, EXEC_OMP_MASTER,
+  EXEC_OMP_CRITICAL, EXEC_OMP_FIRST_OPENMP_EXEC = EXEC_OMP_CRITICAL,
+  EXEC_OMP_DO, EXEC_OMP_FLUSH, EXEC_OMP_MASTER,
   EXEC_OMP_ORDERED, EXEC_OMP_PARALLEL, EXEC_OMP_PARALLEL_DO,
   EXEC_OMP_PARALLEL_SECTIONS, EXEC_OMP_PARALLEL_WORKSHARE,
   EXEC_OMP_SECTIONS, EXEC_OMP_SINGLE, EXEC_OMP_WORKSHARE,
@@ -3174,7 +3193,8 @@ enum gfc_exec_op
   EXEC_OMP_PARALLEL_MASKED_TASKLOOP, EXEC_OMP_PARALLEL_MASKED_TASKLOOP_SIMD,
   EXEC_OMP_MASKED_TASKLOOP, EXEC_OMP_MASKED_TASKLOOP_SIMD, EXEC_OMP_SCOPE,
   EXEC_OMP_UNROLL, EXEC_OMP_TILE, EXEC_OMP_INTEROP, EXEC_OMP_METADIRECTIVE,
-  EXEC_OMP_ERROR, EXEC_OMP_ALLOCATE, EXEC_OMP_ALLOCATORS, EXEC_OMP_DISPATCH
+  EXEC_OMP_ERROR, EXEC_OMP_ALLOCATE, EXEC_OMP_ALLOCATORS, EXEC_OMP_DISPATCH,
+  EXEC_OMP_LAST_OPENMP_EXEC = EXEC_OMP_DISPATCH
 };
 
 /* Enum Definition for locality types.  */
@@ -3444,6 +3464,7 @@ extern hash_map<nofree_string_hash, int> *gfc_vectorized_builtins;
 
 /* Handling Parameterized Derived Types  */
 bool gfc_insert_parameter_exprs (gfc_expr *, gfc_actual_arglist *);
+void gfc_correct_parm_expr (gfc_symbol *, gfc_expr **);
 match gfc_get_pdt_instance (gfc_actual_arglist *, gfc_symbol **,
 			    gfc_actual_arglist **);
 
@@ -3653,6 +3674,8 @@ extern int gfc_character_storage_size;
 #define gfc_logical_4_kind 4
 #define gfc_integer_4_kind 4
 #define gfc_real_4_kind 4
+
+#define gfc_integer_8_kind 8
 
 /* symbol.cc */
 void gfc_clear_new_implicit (void);
@@ -3924,7 +3947,10 @@ bool gfc_is_ptr_fcn (gfc_expr *);
 gfc_expr *gfc_get_expr (void);
 gfc_expr *gfc_get_array_expr (bt type, int kind, locus *);
 gfc_expr *gfc_get_null_expr (locus *);
-gfc_expr *gfc_get_operator_expr (locus *, gfc_intrinsic_op,gfc_expr *, gfc_expr *);
+gfc_expr *gfc_get_operator_expr (locus *, gfc_intrinsic_op, gfc_expr *,
+				 gfc_expr *);
+gfc_expr *gfc_get_conditional_expr (locus *, gfc_expr *, gfc_expr *,
+				    gfc_expr *);
 gfc_expr *gfc_get_structure_constructor_expr (bt, int, locus *);
 gfc_expr *gfc_get_constant_expr (bt, int, locus *);
 gfc_expr *gfc_get_character_expr (int, locus *, const char *, gfc_charlen_t len);
