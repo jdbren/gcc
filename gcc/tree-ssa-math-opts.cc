@@ -3464,6 +3464,10 @@ convert_mult_to_fma (gimple *mul_stmt, tree op1, tree op2,
 					      &else_value, &len, &bias))
 	return false;
 
+      /* The multiplication result must be one of the addition operands.  */
+      if (ops[0] != result && ops[1] != result)
+	return false;
+
       switch (code)
 	{
 	case MINUS_EXPR:
@@ -3802,6 +3806,7 @@ maybe_optimize_guarding_check (vec<gimple *> &mul_stmts, gimple *cond_stmt,
   else
     gimple_cond_make_false (zero_cond);
   update_stmt (zero_cond);
+  reset_flow_sensitive_info_in_bb (bb);
   *cfg_changed = true;
 }
 
@@ -4074,7 +4079,7 @@ build_saturation_binary_arith_call_and_replace (gimple_stmt_iterator *gsi,
 						internal_fn fn, tree lhs,
 						tree op_0, tree op_1)
 {
-  if (direct_internal_fn_supported_p (fn, TREE_TYPE (lhs), OPTIMIZE_FOR_BOTH))
+  if (direct_internal_fn_supported_p (fn, TREE_TYPE (op_0), OPTIMIZE_FOR_BOTH))
     {
       gcall *call = gimple_build_call_internal (fn, 2, op_0, op_1);
       gimple_call_set_lhs (call, lhs);

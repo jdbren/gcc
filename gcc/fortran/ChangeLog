@@ -1,3 +1,129 @@
+2026-02-14  Harald Anlauf  <anlauf@gmx.de>
+
+	Backported from master:
+	2026-02-08  Harald Anlauf  <anlauf@gmx.de>
+
+	PR fortran/123961
+	* check.cc (array_check): Extend check to class array functions.
+	* class.cc (gfc_add_class_array_ref): Fix NULL pointer dereference.
+
+2025-12-16  Jerry DeLisle  <jvdelisle@gcc.gnu.org>
+
+	Backported from master:
+	2025-12-11  Jerry DeLisle  <jvdelisle@gcc.gnu.org>
+
+	PR fortran/107406
+	* parse.cc (check_component): Adjust the error check to
+	require a codimension if the allocatable type has
+	a non-coarray LOCK_TYPE component.
+
+2025-12-09  Harald Anlauf  <anlauf@gmx.de>
+
+	Backported from master:
+	2025-12-05  Harald Anlauf  <anlauf@gmx.de>
+
+	PR fortran/122977
+	* expr.cc (gfc_is_simply_contiguous): For an associate variable
+	check whether the associate target is contiguous.
+	* resolve.cc (resolve_symbol): Skip array type check for an
+	associate variable when	the target has the contiguous attribute.
+
+2025-11-18  Harald Anlauf  <anlauf@gmx.de>
+
+	Backported from master:
+	2025-11-17  Harald Anlauf  <anlauf@gmx.de>
+
+	PR fortran/122709
+	* resolve.cc (resolve_assoc_var): If the associate target is a
+	contiguous pointer, so is the associate variable.
+
+2025-11-01  Harald Anlauf  <anlauf@gmx.de>
+
+	Backported from master:
+	2025-10-25  Harald Anlauf  <anlauf@gmx.de>
+
+	PR fortran/114023
+	* trans-expr.cc (gfc_trans_pointer_assignment): Always set dtype
+	when remapping a pointer.  For unlimited polymorphic LHS use
+	elem_len from RHS.
+	* trans-intrinsic.cc (gfc_conv_is_contiguous_expr): Extend inline
+	generated code for IS_CONTIGUOUS for pointer arguments to detect
+	when span differs from the element size.
+
+2025-11-01  Harald Anlauf  <anlauf@gmx.de>
+
+	Backported from master:
+	2025-10-24  Harald Anlauf  <anlauf@gmx.de>
+
+	PR fortran/122386
+	* dependency.cc (gfc_ref_needs_temporary_p): Revert r16-518.
+	* trans-intrinsic.cc (gfc_conv_intrinsic_transfer): Force temporary
+	for SOURCE not being a simply-contiguous array.
+
+2025-10-25  Harald Anlauf  <anlauf@gmx.de>
+
+	Backported from master:
+	2025-10-09  Harald Anlauf  <anlauf@gmx.de>
+
+	PR fortran/122206
+	* trans-types.cc (gfc_get_function_type): Do not clobber an
+	existing procedure interface.
+
+2025-10-25  Harald Anlauf  <anlauf@gmx.de>
+
+	Backported from master:
+	2025-10-04  Harald Anlauf  <anlauf@gmx.de>
+
+	PR fortran/107968
+	* trans-io.cc (gfc_trans_transfer): Also scalarize I/O of section
+	of an array pointer.
+
+2025-09-28  Harald Anlauf  <anlauf@gmx.de>
+
+	Backported from master:
+	2025-09-11  Harald Anlauf  <anlauf@gmx.de>
+
+	PR fortran/121616
+	* primary.cc (gfc_variable_attr): Properly set dimension attribute
+	from a component ref.
+
+2025-09-28  Harald Anlauf  <anlauf@gmx.de>
+
+	Backported from master:
+	2025-09-25  Harald Anlauf  <anlauf@gmx.de>
+
+	PR fortran/121939
+	* trans-types.cc (gfc_init_types): Set string flag for all
+	character types.
+
+2025-09-28  Harald Anlauf  <anlauf@gmx.de>
+
+	Backported from master:
+	2025-09-21  Harald Anlauf  <anlauf@gmx.de>
+
+	PR fortran/108581
+	* trans-array.cc (gfc_conv_expr_descriptor): Take the dynamic
+	string length into account when deriving the dataptr offset for
+	a deferred-length character array.
+
+2025-09-23  Paul Thomas  <pault@gcc.gnu.org>
+
+	Backported from master:
+	2025-08-13  Paul Thomas  <pault@gcc.gnu.org>
+
+	PR fortran/89092
+	* resolve.cc (was_declared): Add subroutine attribute.
+
+2025-09-09  Harald Anlauf  <anlauf@gmx.de>
+
+	Backported from master:
+	2025-09-03  Harald Anlauf  <anlauf@gmx.de>
+
+	PR fortran/121263
+	* trans-intrinsic.cc (gfc_conv_intrinsic_transfer): For an
+	unlimited polymorphic SOURCE to TRANSFER use saved descriptor
+	if possible.
+
 2025-08-08  Release Manager
 
 	* GCC 15.2.0 released.

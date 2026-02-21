@@ -1630,7 +1630,7 @@ was_declared (gfc_symbol *sym)
   if (a.allocatable || a.dimension || a.dummy || a.external || a.intrinsic
       || a.optional || a.pointer || a.save || a.target || a.volatile_
       || a.value || a.access != ACCESS_UNKNOWN || a.intent != INTENT_UNKNOWN
-      || a.asynchronous || a.codimension)
+      || a.asynchronous || a.codimension || a.subroutine)
     return 1;
 
   return 0;
@@ -10465,6 +10465,10 @@ resolve_assoc_var (gfc_symbol* sym, bool resolve_target)
   /* If the target is a good class object, so is the associate variable.  */
   if (sym->ts.type == BT_CLASS && gfc_expr_attr (target).class_ok)
     sym->attr.class_ok = 1;
+
+  /* If the target is a contiguous pointer, so is the associate variable.  */
+  if (gfc_expr_attr (target).pointer && gfc_expr_attr (target).contiguous)
+    sym->attr.contiguous = 1;
 }
 
 
@@ -17345,6 +17349,7 @@ skip_interfaces:
 
   /* F2008, C530.  */
   if (sym->attr.contiguous
+      && !sym->attr.associate_var
       && (!class_attr.dimension
 	  || (as->type != AS_ASSUMED_SHAPE && as->type != AS_ASSUMED_RANK
 	      && !class_attr.pointer)))

@@ -1,3 +1,19 @@
+2025-12-11  Frank Scheiner  <frank.scheiner@web.de>
+
+	Backported from master:
+	2025-11-25  Frank Scheiner  <frank.scheiner@web.de>
+
+	* affinity-fmt.c: Make char *q a pointer to a const char.
+
+2025-09-25  Tobias Burnus  <tburnus@baylibre.com>
+
+	Backported from master:
+	2025-09-18  Tobias Burnus  <tburnus@baylibre.com>
+		    Sandra Loosemore  <sloosemore@baylibre.com>
+
+	PR middle-end/121922
+	* testsuite/libgomp.c-c++-common/declare-variant-1.c: New test.
+
 2025-08-08  Release Manager
 
 	* GCC 15.2.0 released.

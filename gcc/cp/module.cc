@@ -2789,6 +2789,8 @@ vec<tree, va_heap, vl_embed> *post_load_decls;
 typedef hash_map<tree, auto_vec<tree>> keyed_map_t;
 static keyed_map_t *keyed_table;
 
+static tree get_keyed_decl_scope (tree);
+
 /* Instantiations of temploid friends imported from another module
    need to be attached to the same module as the temploid.  This maps
    these decls to the temploid they are instantiated from, as there is
@@ -2952,6 +2954,7 @@ private:
   vec<tree> back_refs;		/* Back references.  */
   duplicate_hash_map *duplicates;	/* Map from existings to duplicate.  */
   vec<post_process_data> post_decls;	/* Decls to post process.  */
+  vec<tree> post_types;		/* Types to post process.  */
   unsigned unused;		/* Inhibit any interior TREE_USED
 				   marking.  */
 
@@ -3056,11 +3059,22 @@ public:
   {
     return post_decls;
   }
+  /* Return the types to postprocess.  */
+  const vec<tree>& post_process_type ()
+  {
+    return post_types;
+  }
 private:
   /* Register DATA for postprocessing.  */
   void post_process (post_process_data data)
   {
     post_decls.safe_push (data);
+  }
+  /* Register TYPE for postprocessing.  */
+  void post_process_type (tree type)
+  {
+    gcc_checking_assert (TYPE_P (type));
+    post_types.safe_push (type);
   }
 
 private:
@@ -3074,6 +3088,7 @@ trees_in::trees_in (module_state *state)
   duplicates = NULL;
   back_refs.create (500);
   post_decls.create (0);
+  post_types.create (0);
 }
 
 trees_in::~trees_in ()
@@ -3081,6 +3096,7 @@ trees_in::~trees_in ()
   delete (duplicates);
   back_refs.release ();
   post_decls.release ();
+  post_types.release ();
 }
 
 /* Tree stream writer.  */
@@ -4882,8 +4898,13 @@ maybe_add_cmi_prefix (const char *to, size_t *len_p = NULL)
 static void
 create_dirs (char *path)
 {
+  char *base = path;
+  /* Skip past initial slashes of absolute path.  */
+  while (IS_DIR_SEPARATOR (*base))
+    base++;
+
   /* Try and create the missing directories.  */
-  for (char *base = path; *base; base++)
+  for (; *base; base++)
     if (IS_DIR_SEPARATOR (*base))
       {
 	char sep = *base;
@@ -6400,13 +6421,19 @@ trees_out::core_vals (tree t)
 	if (has_warning_spec (t))
 	  u (get_warning_spec (t));
 
-      /* Walk in forward order, as (for instance) REQUIRES_EXPR has a
-         bunch of unscoped parms on its first operand.  It's safer to
-         create those in order.  */
       bool vl = TREE_CODE_CLASS (code) == tcc_vl_exp;
-      for (unsigned limit = (vl ? VL_EXP_OPERAND_LENGTH (t)
-			     : TREE_OPERAND_LENGTH (t)),
-	     ix = unsigned (vl); ix != limit; ix++)
+      unsigned limit = (vl ? VL_EXP_OPERAND_LENGTH (t)
+			: TREE_OPERAND_LENGTH (t));
+      unsigned ix = unsigned (vl);
+      if (code == REQUIRES_EXPR)
+	{
+	  /* The first operand of a REQUIRES_EXPR is a tree chain
+	     of PARM_DECLs.  We need to stream this separately as
+	     otherwise we would only stream the first one.  */
+	  chained_decls (REQUIRES_EXPR_PARMS (t));
+	  ++ix;
+	}
+      for (; ix != limit; ix++)
 	WT (TREE_OPERAND (t, ix));
     }
   else
@@ -6688,6 +6715,7 @@ trees_out::core_vals (tree t)
       WT (((lang_tree_node *)t)->baselink.binfo);
       WT (((lang_tree_node *)t)->baselink.functions);
       WT (((lang_tree_node *)t)->baselink.access_binfo);
+      WT (((lang_tree_node *)t)->baselink.common.chain);
       break;
 
     case CONSTRAINT_INFO:
@@ -6981,9 +7009,15 @@ trees_in::core_vals (tree t)
 	put_warning_spec (t, u ());
 
       bool vl = TREE_CODE_CLASS (code) == tcc_vl_exp;
-      for (unsigned limit = (vl ? VL_EXP_OPERAND_LENGTH (t)
-			     : TREE_OPERAND_LENGTH (t)),
-	     ix = unsigned (vl); ix != limit; ix++)
+      unsigned limit = (vl ? VL_EXP_OPERAND_LENGTH (t)
+			: TREE_OPERAND_LENGTH (t));
+      unsigned ix = unsigned (vl);
+      if (code == REQUIRES_EXPR)
+	{
+	  REQUIRES_EXPR_PARMS (t) = chained_decls ();
+	  ++ix;
+	}
+      for (; ix != limit; ix++)
 	RTU (TREE_OPERAND (t, ix));
     }
 
@@ -7257,6 +7291,7 @@ trees_in::core_vals (tree t)
       RT (((lang_tree_node *)t)->baselink.binfo);
       RTU (((lang_tree_node *)t)->baselink.functions);
       RT (((lang_tree_node *)t)->baselink.access_binfo);
+      RT (((lang_tree_node *)t)->baselink.common.chain);
       break;
 
     case CONSTRAINT_INFO:
@@ -8109,7 +8144,13 @@ trees_in::install_entity (tree decl)
   if (!DECL_LANG_SPECIFIC (not_tmpl)
       || !DECL_MODULE_ENTITY_P (not_tmpl))
     {
-      retrofit_lang_decl (not_tmpl);
+      /* We don't want to use retrofit_lang_decl directly so that we aren't
+	 affected by the language state when we load in.  */
+      if (!DECL_LANG_SPECIFIC (not_tmpl))
+	{
+	  maybe_add_lang_decl_raw (not_tmpl, false);
+	  SET_DECL_LANGUAGE (not_tmpl, lang_cplusplus);
+	}
       DECL_MODULE_ENTITY_P (not_tmpl) = true;
 
       /* Insert into the entity hash (it cannot already be there).  */
@@ -10007,9 +10048,10 @@ trees_out::tree_node (tree t)
 	      break;
 
 	    case PARM_DECL:
-	      /* REQUIRES_EXPRs have a tree list of uncontexted
-		 PARM_DECLS.  It'd be nice if they had a
-		 distinguishing flag to double check.  */
+	      /* REQUIRES_EXPRs have a chain of uncontexted PARM_DECLS,
+		 and an implicit this parm in an NSDMI has no context.  */
+	      gcc_checking_assert (CONSTRAINT_VAR_P (t)
+				   || DECL_NAME (t) == this_identifier);
 	      break;
 	    }
 	  goto by_value;
@@ -10175,10 +10217,23 @@ trees_in::tree_node (bool is_use)
 
 	  case ARRAY_TYPE:
 	    {
+	      tree elt_type = res;
 	      tree domain = tree_node ();
 	      int dep = u ();
 	      if (!get_overrun ())
-		res = build_cplus_array_type (res, domain, dep);
+		{
+		  res = build_cplus_array_type (elt_type, domain, dep);
+		  /* If we're an array of an incomplete imported type,
+		     save it for post-processing so that we can attempt
+		     to complete the type later if it will get a
+		     definition later in the cluster.  */
+		  if (!dep
+		      && !COMPLETE_TYPE_P (elt_type)
+		      && CLASS_TYPE_P (elt_type)
+		      && DECL_LANG_SPECIFIC (TYPE_NAME (elt_type))
+		      && DECL_MODULE_IMPORT_P (TYPE_NAME (elt_type)))
+		    post_process_type (res);
+		}
 	    }
 	    break;
 
@@ -11269,20 +11324,12 @@ trees_out::get_merge_kind (tree decl, depset *dep)
 	    if (DECL_IMPLICIT_TYPEDEF_P (STRIP_TEMPLATE (decl))
 		&& LAMBDA_TYPE_P (TREE_TYPE (decl)))
 	      {
-		if (tree scope = LAMBDA_TYPE_EXTRA_SCOPE (TREE_TYPE (decl)))
-		  {
-		    /* Lambdas attached to fields are keyed to its class.  */
-		    if (TREE_CODE (scope) == FIELD_DECL)
-		      scope = TYPE_NAME (DECL_CONTEXT (scope));
-		    if (DECL_LANG_SPECIFIC (scope)
-			&& DECL_MODULE_KEYED_DECLS_P (scope))
-		      {
-			mk = MK_keyed;
-			break;
-		      }
-		  }
-		/* Lambdas not attached to any mangling scope are TU-local.  */
-		mk = MK_unique;
+		if (get_keyed_decl_scope (decl))
+		  mk = MK_keyed;
+		else
+		  /* Lambdas not attached to any mangling scope are TU-local
+		     and so cannot be deduplicated.  */
+		  mk = MK_unique;
 		break;
 	      }
 
@@ -11583,16 +11630,9 @@ trees_out::key_mergeable (int tag, merge_kind mk, tree decl, tree inner,
 
 	case MK_keyed:
 	  {
-	    gcc_checking_assert (LAMBDA_TYPE_P (TREE_TYPE (inner)));
-	    tree scope = LAMBDA_TYPE_EXTRA_SCOPE (TREE_TYPE (inner));
-	    gcc_checking_assert (TREE_CODE (scope) == VAR_DECL
-				 || TREE_CODE (scope) == FIELD_DECL
-				 || TREE_CODE (scope) == PARM_DECL
-				 || TREE_CODE (scope) == TYPE_DECL
-				 || TREE_CODE (scope) == CONCEPT_DECL);
-	    /* Lambdas attached to fields are keyed to the class.  */
-	    if (TREE_CODE (scope) == FIELD_DECL)
-	      scope = TYPE_NAME (DECL_CONTEXT (scope));
+	    tree scope = get_keyed_decl_scope (inner);
+	    gcc_checking_assert (scope);
+
 	    auto *root = keyed_table->get (scope);
 	    unsigned ix = root->length ();
 	    /* If we don't find it, we'll write a really big number
@@ -12148,7 +12188,15 @@ trees_in::is_matching_decl (tree existing, tree decl, bool is_typedef)
 
   // FIXME: do more precise errors at point of mismatch
   const char *mismatch_msg = nullptr;
-  if (TREE_CODE (d_inner) == FUNCTION_DECL)
+
+  if (VAR_OR_FUNCTION_DECL_P (d_inner)
+      && DECL_EXTERN_C_P (d_inner) != DECL_EXTERN_C_P (e_inner))
+    {
+      mismatch_msg = G_("conflicting language linkage for imported "
+			"declaration %#qD");
+      goto mismatch;
+    }
+  else if (TREE_CODE (d_inner) == FUNCTION_DECL)
     {
       tree e_ret = fndecl_declared_return_type (existing);
       tree d_ret = fndecl_declared_return_type (decl);
@@ -12164,13 +12212,6 @@ trees_in::is_matching_decl (tree existing, tree decl, bool is_typedef)
 
       tree e_type = TREE_TYPE (e_inner);
       tree d_type = TREE_TYPE (d_inner);
-
-      if (DECL_EXTERN_C_P (d_inner) != DECL_EXTERN_C_P (e_inner))
-	{
-	  mismatch_msg = G_("conflicting language linkage for imported "
-			    "declaration %#qD");
-	  goto mismatch;
-	}
 
       for (tree e_args = TYPE_ARG_TYPES (e_type),
 	     d_args = TYPE_ARG_TYPES (d_type);
@@ -12852,12 +12893,13 @@ trees_in::read_var_def (tree decl, tree maybe_template)
 	  if (DECL_EXPLICIT_INSTANTIATION (decl)
 	      && !DECL_EXTERNAL (decl))
 	    setup_explicit_instantiation_definition_linkage (decl);
-	  if (DECL_IMPLICIT_INSTANTIATION (decl)
-	      || (DECL_EXPLICIT_INSTANTIATION (decl)
-		  && !DECL_EXTERNAL (decl))
-	      || (DECL_CLASS_SCOPE_P (decl)
-		  && !DECL_VTABLE_OR_VTT_P (decl)
-		  && !DECL_TEMPLATE_INFO (decl)))
+	  /* Class non-template static members are handled in read_class_def.
+	     But still handle specialisations of member templates.  */
+	  if ((!DECL_CLASS_SCOPE_P (decl)
+	       || primary_template_specialization_p (decl))
+	      && (DECL_IMPLICIT_INSTANTIATION (decl)
+		  || (DECL_EXPLICIT_INSTANTIATION (decl)
+		      && !DECL_EXTERNAL (decl))))
 	    note_vague_linkage_variable (decl);
 	}
       if (!dyn_init)
@@ -13271,6 +13313,10 @@ trees_in::read_class_def (tree defn, tree maybe_template)
 			DECL_ACCESS (d) = tree_cons (type, access, list);
 		    }
 		}
+
+	      if (TREE_CODE (decl) == VAR_DECL
+		  && TREE_CODE (maybe_template) != TEMPLATE_DECL)
+		note_vague_linkage_variable (decl);
 	    }
 	}
 
@@ -16820,7 +16866,13 @@ module_state::read_cluster (unsigned snum)
 	      && DECL_NOT_REALLY_EXTERN (decl))
 	    DECL_EXTERNAL (decl) = false;
 	}
-
+    }
+  for (const tree& type : sec.post_process_type ())
+    {
+      /* Attempt to complete an array type now in case its element type
+	 had a definition streamed later in the cluster.  */
+      gcc_checking_assert (TREE_CODE (type) == ARRAY_TYPE);
+      complete_type (type);
     }
   /* Look, function.cc's interface to cfun does too much for us, we
      just need to restore the old value.  I do not want to go
@@ -20641,7 +20693,7 @@ module_may_redeclare (tree olddecl, tree newdecl)
     // FIXME: Should we be checking this in more places on the scope chain?
     return true;
 
-  module_state *old_mod = (*modules)[0];
+  module_state *old_mod = get_primary ((*modules)[0]);
   module_state *new_mod = old_mod;
 
   tree old_origin = get_originating_module_decl (decl);
@@ -20651,7 +20703,7 @@ module_may_redeclare (tree olddecl, tree newdecl)
   if (DECL_LANG_SPECIFIC (old_inner) && DECL_MODULE_IMPORT_P (old_inner))
     {
       unsigned index = import_entity_index (old_origin);
-      old_mod = import_entity_module (index);
+      old_mod = get_primary (import_entity_module (index));
     }
 
   bool newdecl_attached_p = module_attach_p ();
@@ -20664,7 +20716,7 @@ module_may_redeclare (tree olddecl, tree newdecl)
       if (DECL_LANG_SPECIFIC (new_inner) && DECL_MODULE_IMPORT_P (new_inner))
 	{
 	  unsigned index = import_entity_index (new_origin);
-	  new_mod = import_entity_module (index);
+	  new_mod = get_primary (import_entity_module (index));
 	}
     }
 
@@ -20675,8 +20727,7 @@ module_may_redeclare (tree olddecl, tree newdecl)
 	/* Both are GM entities, OK.  */
 	return true;
 
-      if (new_mod == old_mod
-	  || (new_mod && get_primary (new_mod) == get_primary (old_mod)))
+      if (new_mod == old_mod)
 	/* Both attached to same named module, OK.  */
 	return true;
     }
@@ -20910,9 +20961,21 @@ maybe_key_decl (tree ctx, tree decl)
       && TREE_CODE (ctx) != CONCEPT_DECL)
     return;
 
-  /* For fields, key it to the containing type to handle deduplication
-     correctly.  */
-  if (TREE_CODE (ctx) == FIELD_DECL)
+  /* For members, key it to the containing type to handle deduplication
+     correctly.  For fields, this is necessary as FIELD_DECLs have no
+     dep and so would only be streamed after the lambda type, defeating
+     our ability to merge them.
+
+     Other class-scope key decls might depend on the type of the lambda
+     but be within the same cluster; we need to ensure that we never
+     first see the key decl while streaming the lambda type as merging
+     would then fail when comparing the partially-streamed lambda type
+     of the key decl with the existing (PR c++/122310).
+
+     Perhaps sort_cluster can be adjusted to handle this better, but
+     this is a simple workaround (and might down on the number of
+     entries in keyed_table as a bonus).  */
+  while (DECL_CLASS_SCOPE_P (ctx))
     ctx = TYPE_NAME (DECL_CONTEXT (ctx));
 
   if (!keyed_table)
@@ -20925,6 +20988,30 @@ maybe_key_decl (tree ctx, tree decl)
       DECL_MODULE_KEYED_DECLS_P (ctx) = true;
     }
   vec.safe_push (decl);
+}
+
+/* Find the scope that the lambda DECL is keyed to, if any.  */
+
+static tree
+get_keyed_decl_scope (tree decl)
+{
+  gcc_checking_assert (LAMBDA_TYPE_P (TREE_TYPE (decl)));
+  tree scope = LAMBDA_TYPE_EXTRA_SCOPE (TREE_TYPE (decl));
+  if (!scope)
+    return NULL_TREE;
+
+  gcc_checking_assert (TREE_CODE (scope) == VAR_DECL
+		       || TREE_CODE (scope) == FIELD_DECL
+		       || TREE_CODE (scope) == PARM_DECL
+		       || TREE_CODE (scope) == TYPE_DECL
+		       || TREE_CODE (scope) == CONCEPT_DECL);
+
+  while (DECL_CLASS_SCOPE_P (scope))
+    scope = TYPE_NAME (DECL_CONTEXT (scope));
+
+  gcc_checking_assert (DECL_LANG_SPECIFIC (scope)
+		       && DECL_MODULE_KEYED_DECLS_P (scope));
+  return scope;
 }
 
 /* DECL is an instantiated friend that should be attached to the same

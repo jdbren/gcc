@@ -407,6 +407,7 @@ static const struct aarch64_flag_desc aarch64_tuning_flags[] =
 #include "tuning_models/thunderxt88.h"
 #include "tuning_models/thunderx.h"
 #include "tuning_models/tsv110.h"
+#include "tuning_models/hip12.h"
 #include "tuning_models/xgene1.h"
 #include "tuning_models/emag.h"
 #include "tuning_models/qdf24xx.h"
@@ -5943,7 +5944,7 @@ aarch64_sve_move_pred_via_while (rtx target, machine_mode mode,
   target = aarch64_target_reg (target, mode);
   emit_insn (gen_while (UNSPEC_WHILELO, DImode, mode,
 			target, const0_rtx, limit));
-  return target;
+  return gen_lowpart (VNx16BImode, target);
 }
 
 static rtx
@@ -6088,8 +6089,7 @@ aarch64_expand_sve_const_pred_trn (rtx target, rtx_vector_builder &builder,
      operands but permutes them as though they had mode MODE.  */
   machine_mode mode = aarch64_sve_pred_mode (permute_size).require ();
   target = aarch64_target_reg (target, GET_MODE (a));
-  rtx type_reg = CONST0_RTX (mode);
-  emit_insn (gen_aarch64_sve_trn1_conv (mode, target, a, b, type_reg));
+  emit_insn (gen_aarch64_sve_acle (UNSPEC_TRN1, mode, target, a, b));
   return target;
 }
 
@@ -10108,6 +10108,20 @@ aarch64_use_return_insn_p (void)
     return false;
 
   return known_eq (cfun->machine->frame.frame_size, 0);
+}
+
+/* Return false for locally streaming functions in order to avoid
+   shrink-wrapping them.  Shrink-wrapping is unsafe when the function prologue
+   and epilogue contain streaming state change, because these implicitly change
+   the meaning of poly_int values.  */
+
+bool
+aarch64_use_simple_return_insn_p (void)
+{
+  if (aarch64_cfun_enables_pstate_sm ())
+    return false;
+
+  return true;
 }
 
 /* Generate the epilogue instructions for returning from a function.
@@ -25085,20 +25099,41 @@ aarch64_asm_preferred_eh_data_format (int code ATTRIBUTE_UNUSED, int global)
    return (global ? DW_EH_PE_indirect : 0) | DW_EH_PE_pcrel | type;
 }
 
+/* Return true if function declaration FNDECL needs to be marked as
+   having a variant PCS.  */
+
+static bool
+aarch64_is_variant_pcs (tree fndecl)
+{
+  /* Check for ABIs that preserve more registers than usual.  */
+  arm_pcs pcs = (arm_pcs) fndecl_abi (fndecl).id ();
+  if (pcs == ARM_PCS_SIMD || pcs == ARM_PCS_SVE)
+    return true;
+
+  /* Check for ABIs that allow PSTATE.SM to be 1 on entry.  */
+  tree fntype = TREE_TYPE (fndecl);
+  if (aarch64_fntype_pstate_sm (fntype) != AARCH64_ISA_MODE_SM_OFF)
+    return true;
+
+  /* Check for ABIs that require PSTATE.ZA to be 1 on entry, either because
+     of ZA or ZT0.  */
+  if (aarch64_fntype_pstate_za (fntype) != 0)
+    return true;
+
+  return false;
+}
+
 /* Output .variant_pcs for aarch64_vector_pcs function symbols.  */
 
 static void
 aarch64_asm_output_variant_pcs (FILE *stream, const tree decl, const char* name)
 {
-  if (TREE_CODE (decl) == FUNCTION_DECL)
+  if (TREE_CODE (decl) == FUNCTION_DECL
+      && aarch64_is_variant_pcs (decl))
     {
-      arm_pcs pcs = (arm_pcs) fndecl_abi (decl).id ();
-      if (pcs == ARM_PCS_SIMD || pcs == ARM_PCS_SVE)
-	{
-	  fprintf (stream, "\t.variant_pcs\t");
-	  assemble_name (stream, name);
-	  fprintf (stream, "\n");
-	}
+      fprintf (stream, "\t.variant_pcs\t");
+      assemble_name (stream, name);
+      fprintf (stream, "\n");
     }
 }
 

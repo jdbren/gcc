@@ -464,6 +464,9 @@ build_data_member_initialization (tree t, vec<constructor_elt, va_gc> **vec)
       if (TREE_CODE (aggr) != COMPONENT_REF)
 	/* Normal member initialization.  */
 	member = TREE_OPERAND (member, 1);
+      else if (VAR_P (get_base_address (aggr)))
+	/* Initializing a local variable, don't add anything.  */
+	return true;
       else if (ANON_AGGR_TYPE_P (TREE_TYPE (aggr)))
 	/* Initializing a member of an anonymous union.  */
 	return build_anon_member_initialization (member, init, vec);
@@ -2459,7 +2462,11 @@ cxx_dynamic_cast_fn_p (tree fndecl)
 {
   return (cxx_dialect >= cxx20
 	  && id_equal (DECL_NAME (fndecl), "__dynamic_cast")
-	  && CP_DECL_CONTEXT (fndecl) == abi_node);
+	  && CP_DECL_CONTEXT (fndecl) == abi_node
+	  /* Only consider implementation-detail __dynamic_cast calls that
+	     correspond to a dynamic_cast, and ignore direct calls to
+	     abi::__dynamic_cast.  */
+	  && DECL_ARTIFICIAL (fndecl));
 }
 
 /* Often, we have an expression in the form of address + offset, e.g.
@@ -5746,7 +5753,9 @@ cxx_eval_vec_init_1 (const constexpr_ctx *ctx, tree atype, tree init,
 	  eltinit = (perform_implicit_conversion_flags
 		     (elttype, eltinit, complain,
 		      LOOKUP_IMPLICIT|LOOKUP_NO_NARROWING));
-	  if (CLASS_TYPE_P (elttype) && new_ctx.object)
+	  if (CLASS_TYPE_P (elttype)
+	      && new_ctx.object
+	      && !error_operand_p (eltinit))
 	    /* Clarify what object is being initialized (118285).  */
 	    eltinit = build2 (INIT_EXPR, elttype, new_ctx.object, eltinit);
 	  eltinit = cxx_eval_constant_expression (&new_ctx, eltinit, lval,
@@ -9229,6 +9238,17 @@ cxx_eval_outermost_constant_expr (tree t, bool allow_non_constant,
 	   TARGET_EXPR.  */
 	r = TARGET_EXPR_INITIAL (r);
     }
+
+  /* uid_sensitive_constexpr_evaluation_value restricts warning-dependent
+     constexpr evaluation to avoid unnecessary template instantiation, and is
+     always done with mce_unknown.  But due to gaps in the restriction logic
+     we may still end up taking an evaluation path that in turn requires
+     manifestly constant evaluation, and such evaluation must not be
+     restricted since it likely has semantic consequences.
+     TODO: Remove/replace the mechanism in GCC 17.  */
+  auto uids = make_temp_override (uid_sensitive_constexpr_evaluation_value);
+  if (ctx.manifestly_const_eval == mce_true)
+    uid_sensitive_constexpr_evaluation_value = false;
 
   auto_vec<tree, 16> cleanups;
   global_ctx.cleanups = &cleanups;

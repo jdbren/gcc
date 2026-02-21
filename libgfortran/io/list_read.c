@@ -1262,6 +1262,11 @@ read_character (st_parameter_dt *dtp, int length __attribute__ ((unused)))
 
   if ((c = next_char (dtp)) == EOF)
     goto eof;
+  if (c == ';')
+    {
+      push_char (dtp, c);
+      goto get_string;
+    }
   switch (c)
     {
     CASE_DIGITS:
@@ -1294,6 +1299,13 @@ read_character (st_parameter_dt *dtp, int length __attribute__ ((unused)))
   for (;;)
     {
       c = next_char (dtp);
+
+      if (c == ';')
+	{
+	  push_char (dtp, c);
+	  goto get_string;
+	}
+
       switch (c)
 	{
 	CASE_DIGITS:
@@ -1323,6 +1335,13 @@ read_character (st_parameter_dt *dtp, int length __attribute__ ((unused)))
 
   if ((c = next_char (dtp)) == EOF)
     goto eof;
+
+  if (c == ';')
+    {
+      push_char (dtp, c);
+      goto get_string;
+    }
+
   switch (c)
     {
     CASE_SEPARATORS:
@@ -1346,6 +1365,13 @@ read_character (st_parameter_dt *dtp, int length __attribute__ ((unused)))
     {
       if ((c = next_char (dtp)) == EOF)
 	goto done_eof;
+
+      if (c == ';')
+	{
+	  push_char (dtp, c);
+	  continue;
+	}
+
       switch (c)
 	{
 	case '"':
@@ -2275,6 +2301,8 @@ list_formatted_read_scalar (st_parameter_dt *dtp, bt type, void *p,
 	}
       if (c == ',' && dtp->u.p.current_unit->decimal_status == DECIMAL_COMMA)
 	c = '.';
+      if (c == ';' && dtp->u.p.current_unit->decimal_status == DECIMAL_POINT)
+	unget_char (dtp, c);
       else if (is_separator (c))
 	{
 	  /* Found a null value.  */
@@ -2526,6 +2554,7 @@ finish_list_read (st_parameter_dt *dtp)
       return;
     }
 
+  /* Only perform the following cleanup on external files or the stdin file.  */
   if (!is_internal_unit (dtp))
     {
       int c;
@@ -2533,23 +2562,31 @@ finish_list_read (st_parameter_dt *dtp)
       /* Set the next_char and push_char worker functions.  */
       set_workers (dtp);
 
-      if (likely (dtp->u.p.child_saved_iostat == LIBERROR_OK)
-	      && ((dtp->common.flags & IOPARM_DT_HAS_UDTIO) == 0))
+      /* Make sure there were no errors from a DTIO child read.  */
+      if (likely (dtp->u.p.child_saved_iostat == LIBERROR_OK))
 	{
+	  /* Peek ahead to see where we are in the parent read.  */
 	  c = next_char (dtp);
-	  if (c == EOF)
+	  unget_char (dtp, c);
+
+	  /* If the last read used DTIO, handle end conditions differently.  */
+	  if ((dtp->common.flags & IOPARM_DT_HAS_UDTIO) != 0)
 	    {
-	      free_line (dtp);
-	      hit_eof (dtp);
-	      return;
+	      if ((c == EOF) || (c == ' '))
+		return;
+	    }
+	  else
+	    {
+	      if (c == EOF)
+		{
+		  hit_eof (dtp);
+		  return;
+		}
 	    }
 	  if (c != '\n')
 	    eat_line (dtp);
 	}
     }
-
-  free_line (dtp);
-
 }
 
 /*			NAMELIST INPUT

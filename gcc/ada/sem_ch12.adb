@@ -2044,9 +2044,15 @@ package body Sem_Ch12 is
       is
       begin
          for Index in Gen_Assocs.Assocs'Range loop
-            if Defining_Entity (Gen_Assocs.Assocs (Index).An_Formal) = F then
-               return Index;
-            end if;
+            declare
+               An_F : constant Node_Id := Gen_Assocs.Assocs (Index).An_Formal;
+            begin
+               if Nkind (An_F) not in N_Use_Package_Clause | N_Use_Type_Clause
+                 and then Defining_Entity (An_F) = F
+               then
+                  return Index;
+               end if;
+            end;
          end loop;
 
          raise Program_Error; -- it must be present
@@ -2590,9 +2596,20 @@ package body Sem_Ch12 is
                if Ekind (Etype (Match)) /= E_Void
                  and then Is_Mutably_Tagged_Type (Etype (Match))
                then
+                  --  The declaration of the CW-equivalent type of a mutably
+                  --  tagged type is analyzed when the tagged type is frozen.
+
+                  if Nkind (I_Node) /= N_Formal_Package_Declaration
+                    and then Ekind (Defining_Identifier (Assoc.An_Formal)) /=
+                                                              E_Incomplete_Type
+                  then
+                     Freeze_Before (I_Node, Root_Type (Etype (Match)));
+                  end if;
+
                   Rewrite (Match, New_Occurrence_Of
                     (Class_Wide_Equivalent_Type
                       (Etype (Match)), Sloc (Match)));
+
                   Analyze (Match);
                end if;
 
@@ -17378,7 +17395,6 @@ package body Sem_Ch12 is
          ----------------------------------
 
          procedure Save_References_In_Aggregate (N : Node_Id) is
-            Nam   : Node_Id;
             Qual  : Node_Id   := Empty;
             Typ   : Entity_Id := Empty;
 
@@ -17434,16 +17450,16 @@ package body Sem_Ch12 is
                   end;
                end if;
 
-               --  If the aggregate is an actual in a call, it has been
-               --  resolved in the current context, to some local type. The
+               --  If the aggregate is an actual in a subprogram call, it has
+               --  been resolved in the current context to some local type. The
                --  enclosing call may have been disambiguated by the aggregate,
                --  and this disambiguation might fail at instantiation time
                --  because the type to which the aggregate did resolve is not
                --  preserved. In order to preserve some of this information,
                --  wrap the aggregate in a qualified expression, using the id
                --  of its type. For further disambiguation we qualify the type
-               --  name with its scope (if visible and not hidden by a local
-               --  homograph) because both id's will have corresponding
+               --  name with its scope recursively (if visible and not hidden
+               --  by a local homograph) because both will have corresponding
                --  entities in an instance. This resolves most of the problems
                --  with missing type information on aggregates in instances.
 
@@ -17453,24 +17469,40 @@ package body Sem_Ch12 is
                  and then Present (Typ)
                  and then Comes_From_Source (Typ)
                then
-                  Nam := Make_Identifier (Loc, Chars (Typ));
+                  declare
+                     function Qualify_Name (S, E : Entity_Id) return Node_Id is
+                       (if E = S
+                        then Make_Identifier (Loc, Chars (E))
+                        else Make_Selected_Component (Loc,
+                               Prefix        => Qualify_Name (S, Scope (E)),
+                               Selector_Name =>
+                                 Make_Identifier (Loc, Chars (E))));
+                     --  Return the qualified name of E up to scope S
 
-                  if Is_Immediately_Visible (Scope (Typ))
-                    and then
-                      (not In_Open_Scopes (Scope (Typ))
-                         or else Current_Entity (Scope (Typ)) = Scope (Typ))
-                  then
-                     Nam :=
-                       Make_Selected_Component (Loc,
-                         Prefix        =>
-                           Make_Identifier (Loc, Chars (Scope (Typ))),
-                         Selector_Name => Nam);
-                  end if;
+                     Nam : Node_Id;
+                     S   : Entity_Id;
 
-                  Qual :=
-                    Make_Qualified_Expression (Loc,
-                      Subtype_Mark => Nam,
-                      Expression   => Relocate_Node (N));
+                  begin
+                     S := Scope (Typ);
+                     while not Is_Immediately_Visible (S) loop
+                        S := Scope (S);
+                        exit when Is_Generic_Unit (S);
+                     end loop;
+
+                     if not Is_Generic_Unit (S)
+                       and then (not In_Open_Scopes (S)
+                                  or else Current_Entity (S) = S)
+                     then
+                        Nam := Qualify_Name (S, Typ);
+                     else
+                        Nam := Make_Identifier (Loc, Chars (Typ));
+                     end if;
+
+                     Qual :=
+                       Make_Qualified_Expression (Loc,
+                         Subtype_Mark => Nam,
+                         Expression   => Relocate_Node (N));
+                  end;
                end if;
 
             --  For a full aggregate, if the type is global and a derived

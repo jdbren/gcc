@@ -1718,14 +1718,36 @@ loongarch_symbol_binds_local_p (const_rtx x)
 bool
 loongarch_const_vector_bitimm_set_p (rtx op, machine_mode mode)
 {
-  if (GET_CODE (op) == CONST_VECTOR && op != CONST0_RTX (mode))
+  if (GET_CODE (op) == CONST_VECTOR
+      && (GET_MODE_CLASS (mode) == MODE_VECTOR_FLOAT
+	  || GET_MODE_CLASS (mode) == MODE_VECTOR_INT))
     {
-      unsigned HOST_WIDE_INT val = UINTVAL (CONST_VECTOR_ELT (op, 0));
+      unsigned HOST_WIDE_INT val;
+
+      if (GET_MODE_CLASS (mode) == MODE_VECTOR_FLOAT)
+	{
+	  rtx val_s = CONST_VECTOR_ELT (op, 0);
+	  const REAL_VALUE_TYPE *x = CONST_DOUBLE_REAL_VALUE (val_s);
+	  if (GET_MODE (val_s) == DFmode)
+	    {
+	      long tmp[2];
+	      REAL_VALUE_TO_TARGET_DOUBLE (*x, tmp);
+	      val = (unsigned HOST_WIDE_INT) tmp[1] << 32 | tmp[0];
+	    }
+	  else
+	    {
+	      long tmp;
+	      REAL_VALUE_TO_TARGET_SINGLE (*x, tmp);
+	      val = (unsigned HOST_WIDE_INT) tmp;
+	    }
+	}
+      else
+	val = UINTVAL (CONST_VECTOR_ELT (op, 0));
+
       int vlog2 = exact_log2 (val & GET_MODE_MASK (GET_MODE_INNER (mode)));
 
       if (vlog2 != -1)
 	{
-	  gcc_assert (GET_MODE_CLASS (mode) == MODE_VECTOR_INT);
 	  gcc_assert (vlog2 >= 0 && vlog2 <= GET_MODE_UNIT_BITSIZE (mode) - 1);
 	  return loongarch_const_vector_same_val_p (op, mode);
 	}
@@ -1740,14 +1762,35 @@ loongarch_const_vector_bitimm_set_p (rtx op, machine_mode mode)
 bool
 loongarch_const_vector_bitimm_clr_p (rtx op, machine_mode mode)
 {
-  if (GET_CODE (op) == CONST_VECTOR && op != CONSTM1_RTX (mode))
+  if (GET_CODE (op) == CONST_VECTOR
+      && (GET_MODE_CLASS (mode) == MODE_VECTOR_FLOAT
+	  || GET_MODE_CLASS (mode) == MODE_VECTOR_INT))
     {
-      unsigned HOST_WIDE_INT val = ~UINTVAL (CONST_VECTOR_ELT (op, 0));
+      unsigned HOST_WIDE_INT val;
+      if (GET_MODE_CLASS (mode) == MODE_VECTOR_FLOAT)
+	{
+	  rtx val_s = CONST_VECTOR_ELT (op, 0);
+	  const REAL_VALUE_TYPE *x = CONST_DOUBLE_REAL_VALUE (val_s);
+	  if (GET_MODE (val_s) == DFmode)
+	    {
+	      long tmp[2];
+	      REAL_VALUE_TO_TARGET_DOUBLE (*x, tmp);
+	      val = ~((unsigned HOST_WIDE_INT) tmp[1] << 32 | tmp[0]);
+	    }
+	  else
+	    {
+	      long tmp;
+	      REAL_VALUE_TO_TARGET_SINGLE (*x, tmp);
+	      val = ~((unsigned HOST_WIDE_INT) tmp);
+	    }
+	}
+      else
+	val = ~UINTVAL (CONST_VECTOR_ELT (op, 0));
+
       int vlog2 = exact_log2 (val & GET_MODE_MASK (GET_MODE_INNER (mode)));
 
       if (vlog2 != -1)
 	{
-	  gcc_assert (GET_MODE_CLASS (mode) == MODE_VECTOR_INT);
 	  gcc_assert (vlog2 >= 0 && vlog2 <= GET_MODE_UNIT_BITSIZE (mode) - 1);
 	  return loongarch_const_vector_same_val_p (op, mode);
 	}
@@ -1792,7 +1835,27 @@ loongarch_const_vector_same_bytes_p (rtx op, machine_mode mode)
 
   first = CONST_VECTOR_ELT (op, 0);
   bytes = GET_MODE_UNIT_SIZE (mode);
-  val = INTVAL (first);
+
+  if (GET_MODE_CLASS (mode) == MODE_VECTOR_FLOAT)
+    {
+      rtx val_s = CONST_VECTOR_ELT (op, 0);
+      const REAL_VALUE_TYPE *x = CONST_DOUBLE_REAL_VALUE (val_s);
+      if (GET_MODE (val_s) == DFmode)
+	{
+	  long tmp[2];
+	  REAL_VALUE_TO_TARGET_DOUBLE (*x, tmp);
+	  val = (unsigned HOST_WIDE_INT) tmp[1] << 32 | tmp[0];
+	}
+      else
+	{
+	  long tmp;
+	  REAL_VALUE_TO_TARGET_SINGLE (*x, tmp);
+	  val = (unsigned HOST_WIDE_INT) tmp;
+	}
+    }
+  else
+    val = UINTVAL (first);
+
   first_byte = val & 0xff;
   for (i = 1; i < bytes; i++)
     {
@@ -4390,6 +4453,7 @@ loongarch_vector_costs::add_stmt_cost (int count, vect_cost_for_stmt kind,
 	    break;
 	  }
       else if (TARGET_RECIP_VEC_DIV
+	       && vectype
 	       && gimple_code (stmt_info->stmt) == GIMPLE_ASSIGN)
 	{
 	  machine_mode mode = TYPE_MODE (vectype);
@@ -5436,12 +5500,32 @@ loongarch_expand_conditional_move (rtx *operands)
 	    }
 	}
 
+      auto is_binary_op_0_keep_orig = [](enum rtx_code code)
+	{
+	  switch (code)
+	    {
+	    case PLUS:
+	    case MINUS:
+	    case IOR:
+	    case XOR:
+	    case ROTATE:
+	    case ROTATERT:
+	    case ASHIFT:
+	    case ASHIFTRT:
+	    case LSHIFTRT:
+	      return true;
+	    default:
+	      return false;
+	    }
+	};
+
       /* Check if the optimization conditions are met.  */
       if (value_if_true_insn
 	  && value_if_false_insn
-	  /* Make sure that value_if_false and var are the same.  */
-	  && BINARY_P (value_if_true_insn_src
-		       = SET_SRC (single_set (value_if_true_insn)))
+	  /* Make sure that the orig value OP 0 keep orig.  */
+	  && (value_if_true_insn_src
+	      = SET_SRC (single_set (value_if_true_insn)))
+	  && is_binary_op_0_keep_orig ( GET_CODE (value_if_true_insn_src))
 	  /* Make sure that both value_if_true and value_if_false
 	     has the same var.  */
 	  && rtx_equal_p (XEXP (value_if_true_insn_src, 0),
@@ -6398,7 +6482,28 @@ loongarch_print_operand (FILE *file, rtx op, int letter)
       if (CONST_VECTOR_P (op))
 	{
 	  machine_mode mode = GET_MODE_INNER (GET_MODE (op));
-	  unsigned HOST_WIDE_INT val = UINTVAL (CONST_VECTOR_ELT (op, 0));
+	  rtx val_s = CONST_VECTOR_ELT (op, 0);
+	  unsigned HOST_WIDE_INT val;
+
+	  if (GET_MODE_CLASS (mode) == MODE_FLOAT)
+	    {
+	      const REAL_VALUE_TYPE *x = CONST_DOUBLE_REAL_VALUE (val_s);
+	      if (GET_MODE (val_s) == DFmode)
+		{
+		  long tmp[2];
+		  REAL_VALUE_TO_TARGET_DOUBLE (*x, tmp);
+		  val = (unsigned HOST_WIDE_INT) (tmp[1] << 32 | tmp[0]);
+		}
+	      else
+		{
+		  long tmp;
+		  REAL_VALUE_TO_TARGET_SINGLE (*x, tmp);
+		  val = (unsigned HOST_WIDE_INT) tmp;
+		}
+	    }
+	  else
+	    val = UINTVAL (val_s);
+
 	  int vlog2 = exact_log2 (val & GET_MODE_MASK (mode));
 	  if (vlog2 != -1)
 	    fprintf (file, "%d", vlog2);
@@ -8883,57 +8988,13 @@ loongarch_expand_vec_perm_1 (rtx operands[])
   /* Number of elements in the vector.  */
   w = GET_MODE_NUNITS (mode);
 
-  rtx round_data[MAX_VECT_LEN];
-  rtx round_reg, round_data_rtx;
-
-  if (mode != E_V32QImode)
+  /* If we are using xvshuf.*, clamp the selector to avoid unpredictable
+     output.  */
+  if (maskmode != V8SImode && maskmode != V4DImode)
     {
-      for (int i = 0; i < w; i += 1)
-	{
-	  round_data[i] = GEN_INT (0x1f);
-	}
-
-      if (mode == E_V4DFmode)
-	{
-	  round_data_rtx = gen_rtx_CONST_VECTOR (E_V4DImode,
-						 gen_rtvec_v (w, round_data));
-	  round_reg = gen_reg_rtx (E_V4DImode);
-	}
-      else if (mode == E_V8SFmode)
-	{
-
-	  round_data_rtx = gen_rtx_CONST_VECTOR (E_V8SImode,
-						 gen_rtvec_v (w, round_data));
-	  round_reg = gen_reg_rtx (E_V8SImode);
-	}
-      else
-	{
-	  round_data_rtx = gen_rtx_CONST_VECTOR (mode,
-						 gen_rtvec_v (w, round_data));
-	  round_reg = gen_reg_rtx (mode);
-	}
-
-      emit_move_insn (round_reg, round_data_rtx);
-      switch (mode)
-	{
-	case E_V32QImode:
-	  emit_insn (gen_andv32qi3 (mask, mask, round_reg));
-	  break;
-	case E_V16HImode:
-	  emit_insn (gen_andv16hi3 (mask, mask, round_reg));
-	  break;
-	case E_V8SImode:
-	case E_V8SFmode:
-	  emit_insn (gen_andv8si3 (mask, mask, round_reg));
-	  break;
-	case E_V4DImode:
-	case E_V4DFmode:
-	  emit_insn (gen_andv4di3 (mask, mask, round_reg));
-	  break;
-	default:
-	  gcc_unreachable ();
-	  break;
-	}
+      rtx t = gen_const_vec_duplicate (maskmode, GEN_INT (0x1f));
+      mask = expand_binop (maskmode, and_optab, mask, t, NULL_RTX, false,
+			   OPTAB_DIRECT);
     }
 
   if (mode == V4DImode || mode == V4DFmode)
@@ -10146,30 +10207,14 @@ loongarch_expand_vector_init_same (rtx target, rtx vals, unsigned nvar)
 	}
     }
 
-  if (imode == GET_MODE (same))
-    temp = same;
-  else if (GET_MODE_SIZE (imode) >= UNITS_PER_WORD)
+  if (GET_CODE (same) == MEM && GET_MODE (same) != imode)
     {
-      if (GET_CODE (same) == MEM)
-	{
-	  rtx reg_tmp = gen_reg_rtx (GET_MODE (same));
-	  loongarch_emit_move (reg_tmp, same);
-	  temp = simplify_gen_subreg (imode, reg_tmp, GET_MODE (reg_tmp), 0);
-	}
-      else
-	temp = simplify_gen_subreg (imode, same, GET_MODE (same), 0);
+      rtx reg_tmp = gen_reg_rtx (GET_MODE (same));
+      loongarch_emit_move (reg_tmp, same);
+      temp = lowpart_subreg (imode, reg_tmp, GET_MODE (reg_tmp));
     }
   else
-    {
-      if (GET_CODE (same) == MEM)
-	{
-	  rtx reg_tmp = gen_reg_rtx (GET_MODE (same));
-	  loongarch_emit_move (reg_tmp, same);
-	  temp = lowpart_subreg (imode, reg_tmp, GET_MODE (reg_tmp));
-	}
-      else
-	temp = lowpart_subreg (imode, same, GET_MODE (same));
-    }
+    temp = same;
 
   temp = force_reg (imode, temp);
 
@@ -11152,6 +11197,81 @@ loongarch_c_mode_for_suffix (char suffix)
   return VOIDmode;
 }
 
+/* Implement TARGET_COMPUTE_PRESSURE_CLASSES.  */
+
+static int
+loongarch_compute_pressure_classes (reg_class *classes)
+{
+  int i = 0;
+  classes[i++] = GENERAL_REGS;
+  classes[i++] = FP_REGS;
+  classes[i++] = FCC_REGS;
+  return i;
+}
+
+/* Implement TARGET_CAN_INLINE_P.  Determine whether inlining the function
+   CALLER into the function CALLEE is safe.  Inlining should be rejected if
+   there is no always_inline attribute and the target options differ except
+   for differences in ISA extensions or performance tuning options like the
+   code model, TLS dialect, etc.  */
+
+static bool
+loongarch_can_inline_p (tree caller, tree callee)
+{
+  tree callee_tree = DECL_FUNCTION_SPECIFIC_TARGET (callee);
+  tree caller_tree = DECL_FUNCTION_SPECIFIC_TARGET (caller);
+
+  if (!callee_tree)
+    callee_tree = target_option_default_node;
+
+  if (!caller_tree)
+    caller_tree = target_option_default_node;
+
+  /* If both caller and callee have attributes, assume that if the
+     pointer is different, the two functions have different target
+     options since build_target_option_node uses a hash table for the
+     options.  */
+  if (callee_tree == caller_tree)
+    return true;
+
+  struct cl_target_option *callee_opts = TREE_TARGET_OPTION (callee_tree);
+  struct cl_target_option *caller_opts = TREE_TARGET_OPTION (caller_tree);
+
+  /* Callee and caller should have the same target options.  */
+  int callee_target_flags = callee_opts->x_target_flags;
+  int caller_target_flags = caller_opts->x_target_flags;
+
+  if (callee_target_flags != caller_target_flags)
+    return false;
+
+  /* If callee enables the isa extension that the caller does not enable,
+     inlining is disabled.  */
+  if (~caller_opts->x_la_isa_evolution
+      & callee_opts->x_la_isa_evolution)
+    return false;
+
+  /* If simd extensions are enabled for the callee but not for the caller,
+     inlining is disabled.  */
+  if ((caller_opts->x_la_opt_simd == ISA_EXT_NONE
+       && callee_opts->x_la_opt_simd != ISA_EXT_NONE)
+      || (caller_opts->x_la_opt_simd == ISA_EXT_SIMD_LSX
+	  && callee_opts->x_la_opt_simd == ISA_EXT_SIMD_LASX))
+    return false;
+
+  bool always_inline
+    = lookup_attribute ("always_inline", DECL_ATTRIBUTES (callee));
+
+  /* If the architectural features match up and the callee is always_inline
+     then the other attributes don't matter.  */
+  if (always_inline)
+    return true;
+
+  if (caller_opts->x_la_opt_cmodel != callee_opts->x_la_opt_cmodel)
+    return false;
+
+  return true;
+}
+
 /* Initialize the GCC target structure.  */
 #undef TARGET_ASM_ALIGNED_HI_OP
 #define TARGET_ASM_ALIGNED_HI_OP "\t.half\t"
@@ -11425,6 +11545,12 @@ loongarch_c_mode_for_suffix (char suffix)
 
 #undef TARGET_C_MODE_FOR_SUFFIX
 #define TARGET_C_MODE_FOR_SUFFIX loongarch_c_mode_for_suffix
+
+#undef TARGET_COMPUTE_PRESSURE_CLASSES
+#define TARGET_COMPUTE_PRESSURE_CLASSES loongarch_compute_pressure_classes
+
+#undef TARGET_CAN_INLINE_P
+#define TARGET_CAN_INLINE_P loongarch_can_inline_p
 
 struct gcc_target targetm = TARGET_INITIALIZER;
 
