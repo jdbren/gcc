@@ -2,19 +2,17 @@
 #undef TARGET_LILAC
 #define TARGET_LILAC 1
 
-/* Default arguments you want when running your
-   i686-myos-gcc/x86_64-myos-gcc toolchain */
 #undef LIB_SPEC
 #define LIB_SPEC "-lc" /* link against C standard library */
 
-/* Files that are linked before user code.
-   The %s tells GCC to look for these files in the library directory. */
-#undef STARTFILE_SPEC
-#define STARTFILE_SPEC "crt0.o%s crti.o%s crtbegin.o%s"
+#undef  STARTFILE_SPEC
+#define STARTFILE_SPEC \
+   "%{shared:; pg|p|profile:%{static-pie:grcrt1.o%s;:gcrt1.o%s}; static:crt1.o%s; static-pie:rcrt1.o%s; pie:Scrt1.o%s; :crt1.o%s} crti.o%s %{static:crtbeginT.o%s; shared|static-pie|pie:crtbeginS.o%s; :crtbegin.o%s}"
 
 /* Files that are linked after user code. */
 #undef ENDFILE_SPEC
-#define ENDFILE_SPEC "crtend.o%s crtn.o%s"
+#define ENDFILE_SPEC \
+   "%{static:crtend.o%s; shared|static-pie|" PIE_SPEC ":crtendS.o%s; :crtend.o%s} " "crtn.o%s"
 
 /* Additional predefined macros. */
 #undef TARGET_OS_CPP_BUILTINS
