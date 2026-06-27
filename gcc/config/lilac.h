@@ -14,6 +14,13 @@
 #define ENDFILE_SPEC \
    "%{static:crtend.o%s; shared|static-pie|" PIE_SPEC ":crtendS.o%s; :crtend.o%s} " "crtn.o%s"
 
+#define GNU_USER_DYNAMIC_LINKER64 "/lib/ld-lilac.so.1"
+#define GNU_USER_LINK_EMULATION64 "elf_x86_64_lilac"
+#define GNU_USER_DYNAMIC_LINKER32 "/lib/ld-lilac.so.1"
+#define GNU_USER_LINK_EMULATION32 "elf_i386_lilac"
+#define GNU_USER_DYNAMIC_LINKERX32 "/lib/ld-lilac.so.1"
+#define GNU_USER_LINK_EMULATIONX32 "elf_i386_lilac"
+
 /* Additional predefined macros. */
 #undef TARGET_OS_CPP_BUILTINS
 #define TARGET_OS_CPP_BUILTINS()      \
