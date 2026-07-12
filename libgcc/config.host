@@ -403,12 +403,12 @@ esac
 
 case ${host} in
 i[34567]86-*-lilac*)
-	extra_parts="$extra_parts crti.o crtbegin.o crtbeginS.o crtbeginT.o crtend.o crtendS.o crtn.o"
+	extra_parts="$extra_parts crtbegin.o crtbeginS.o crtbeginT.o crtend.o crtendS.o"
 	tmake_file="$tmake_file i386/t-crtstuff t-crtstuff-pic t-libgcc-pic t-eh-dw2-dip"
 	tmake_file="$tmake_file t-slibgcc t-slibgcc-gld t-slibgcc-elf-ver t-slibgcc-libgcc"
 	;;
 x86_64-*-lilac*)
-	extra_parts="$extra_parts crti.o crtbegin.o crtbeginS.o crtbeginT.o crtend.o crtendS.o crtn.o"
+	extra_parts="$extra_parts crtbegin.o crtbeginS.o crtbeginT.o crtend.o crtendS.o"
 	tmake_file="$tmake_file i386/t-crtstuff t-crtstuff-pic t-libgcc-pic t-eh-dw2-dip"
 	tmake_file="$tmake_file t-slibgcc t-slibgcc-gld t-slibgcc-elf-ver t-slibgcc-libgcc"
 	;;
